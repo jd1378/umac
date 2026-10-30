@@ -124,6 +124,12 @@ pub struct OnScreen {
 }
 
 /// All on-screen windows, front to back.
+/// Owner of the frontmost normal window; the window server lists windows front to back.
+/// Accessibility's focused app occasionally lags or misreports, so key routing checks both.
+pub fn front_app_pid() -> Option<i32> {
+    on_screen().into_iter().find(|w| w.layer == 0 && w.width >= 40.0 && w.height >= 40.0).map(|w| w.pid)
+}
+
 pub fn on_screen() -> Vec<OnScreen> {
     let Some(list) = copy_window_info(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID)
     else {
