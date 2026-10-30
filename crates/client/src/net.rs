@@ -267,6 +267,15 @@ pub async fn run_open(
                             ui.send(UiEvent::Closed(w));
                         }
                     }
+                    HostMsg::Clipboard { text } => {
+                        if cfg.clipboard_to_pc && text.len() <= umac_proto::MAX_CLIPBOARD_BYTES {
+                            tracing::debug!(bytes = text.len(), "Mac clipboard received");
+                            ui.send(UiEvent::Clipboard(text));
+                        }
+                    }
+                    HostMsg::ClipboardRequest { nonce } => {
+                        ui.send(UiEvent::ClipboardRequest(nonce));
+                    }
                     other => tracing::debug!(?other, "ignored host message"),
                 }
             }

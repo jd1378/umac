@@ -3,6 +3,7 @@ pub mod capture;
 pub mod capture_test;
 pub mod ffi;
 pub mod input;
+pub mod pasteboard;
 pub mod permissions;
 pub mod server;
 pub mod setup;

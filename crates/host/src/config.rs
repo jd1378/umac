@@ -43,6 +43,8 @@ pub struct Settings {
     pub fec_percent: u8,
     pub default_bitrate_kbps: u32,
     pub max_bitrate_kbps: u32,
+    /// Log filter (tracing `EnvFilter` syntax) when `RUST_LOG` is not set, e.g. "umac_host=debug".
+    pub log: String,
 }
 
 impl Default for Settings {
@@ -53,6 +55,7 @@ impl Default for Settings {
             fec_percent: 15,
             default_bitrate_kbps: 25_000,
             max_bitrate_kbps: 100_000,
+            log: "info".into(),
         }
     }
 }

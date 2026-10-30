@@ -14,6 +14,7 @@ use core_graphics::geometry::{CGPoint, CGSize};
 use umac_proto::WindowId;
 
 use super::ffi::*;
+use crate::clipboard::MenuItem;
 
 /// Owned AX element.
 struct Element(AXUIElementRef);
@@ -47,6 +48,91 @@ fn point(el: AXUIElementRef) -> Option<(f64, f64)> {
 
 fn role(el: AXUIElementRef) -> String {
     attr(el, "AXRole").and_then(|v| v.downcast::<CFString>()).map(|s| s.to_string()).unwrap_or_default()
+}
+
+fn menu_item(el: AXUIElementRef) -> MenuItem {
+    MenuItem {
+        title: attr(el, "AXTitle").and_then(|v| v.downcast::<CFString>()).map(|s| s.to_string()).unwrap_or_default(),
+        cmd_char: attr(el, "AXMenuItemCmdChar").and_then(|v| v.downcast::<CFString>()).map(|s| s.to_string()),
+        modifiers: attr(el, "AXMenuItemCmdModifiers")
+            .and_then(|v| v.downcast::<core_foundation::number::CFNumber>())
+            .and_then(|n| n.to_i64()),
+    }
+}
+
+fn children(el: AXUIElementRef) -> Vec<CFType> {
+    attr(el, "AXChildren")
+        .map(|c| unsafe { CFArray::<CFType>::wrap_under_get_rule(c.as_CFTypeRef() as _) }.iter().map(|c| c.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Titles of the app's menu-bar items whose shortcut is Cmd+V (Edit > Paste and friends).
+pub fn paste_titles(pid: i32) -> Vec<String> {
+    let app = Element(unsafe { AXUIElementCreateApplication(pid) });
+    let Some(bar) = attr(app.0, "AXMenuBar") else { return Vec::new() };
+    let mut out = Vec::new();
+    // Menu bar > bar items > menus > items; submenus are not needed for Paste.
+    for top in children(bar.as_CFTypeRef()) {
+        for menu in children(top.as_CFTypeRef()) {
+            for el in children(menu.as_CFTypeRef()) {
+                let item = menu_item(el.as_CFTypeRef());
+                if item.has_paste_shortcut() && !item.title.is_empty() {
+                    out.push(item.title);
+                }
+            }
+        }
+    }
+    tracing::debug!(pid, ?out, "paste titles");
+    out
+}
+
+/// The menu item under a global point, or `None` when no menu item is there.
+pub fn menu_item_at(x: f64, y: f64) -> Option<MenuItem> {
+    let system = Element(unsafe { AXUIElementCreateSystemWide() });
+    let mut hit: AXUIElementRef = ptr::null();
+    if unsafe { AXUIElementCopyElementAtPosition(system.0, x as f32, y as f32, &mut hit) } != 0 || hit.is_null() {
+        return None;
+    }
+    let mut el = unsafe { CFType::wrap_under_create_rule(hit) };
+    // The hit may be the item's title text or image; menu items are a level or two up.
+    for _ in 0..4 {
+        if role(el.as_CFTypeRef()) == "AXMenuItem" {
+            let item = menu_item(el.as_CFTypeRef());
+            tracing::debug!(?item, "menu item under pointer");
+            return Some(item);
+        }
+        el = attr(el.as_CFTypeRef(), "AXParent")?;
+    }
+    None
+}
+
+fn size_of(el: AXUIElementRef) -> Option<(f64, f64)> {
+    let v = attr(el, "AXSize")?;
+    let mut s = CGSize::new(0.0, 0.0);
+    unsafe { AXValueGetValue(v.as_CFTypeRef(), kAXValueCGSizeType, (&mut s as *mut CGSize).cast::<c_void>()) }
+        .then_some((s.width, s.height))
+}
+
+/// Logs every item of the menu under a global point with its shortcut and frame, for
+/// diagnosing which items count as Paste. Debug level only.
+pub fn log_menu_items(x: f64, y: f64) {
+    let system = Element(unsafe { AXUIElementCreateSystemWide() });
+    let mut hit: AXUIElementRef = ptr::null();
+    if unsafe { AXUIElementCopyElementAtPosition(system.0, x as f32, y as f32, &mut hit) } != 0 || hit.is_null() {
+        return;
+    }
+    let mut el = unsafe { CFType::wrap_under_create_rule(hit) };
+    for _ in 0..5 {
+        if role(el.as_CFTypeRef()) == "AXMenu" {
+            break;
+        }
+        let Some(parent) = attr(el.as_CFTypeRef(), "AXParent") else { return };
+        el = parent;
+    }
+    for c in children(el.as_CFTypeRef()) {
+        let r = c.as_CFTypeRef();
+        tracing::debug!(item = ?menu_item(r), pos = ?point(r), size = ?size_of(r), "menu item");
+    }
 }
 
 /// Tallest title bar we are willing to crop, in points. Anything deeper is real content.

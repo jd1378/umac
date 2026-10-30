@@ -19,6 +19,9 @@ pub const DEFAULT_PORT: u16 = 47_810;
 /// Upper bound for one control/input frame. Cursor images are the largest legit payload.
 pub const MAX_FRAME_LEN: usize = 1 << 20;
 
+/// Largest clipboard text either side sends; bigger copies are skipped, not truncated.
+pub const MAX_CLIPBOARD_BYTES: usize = 900 * 1024;
+
 /// Host-assigned window identifier (the macOS `CGWindowID`).
 pub type WindowId = u32;
 
@@ -118,6 +121,11 @@ pub enum HostMsg {
     WindowClosed { window: WindowId },
     Pong { nonce: u64 },
     Error { window: Option<WindowId>, message: String },
+    /// The Mac clipboard changed (text only).
+    Clipboard { text: String },
+    /// A paste is about to happen on the Mac (e.g. a context-menu Paste item was clicked);
+    /// the client answers with `InputEvent::SetClipboard` carrying the same nonce.
+    ClipboardRequest { nonce: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +148,9 @@ pub enum InputEvent {
     Key { window: WindowId, keycode: u16, pressed: bool },
     /// Client lost focus: release every key and button the host still holds down.
     ReleaseAll,
+    /// Puts text on the Mac clipboard before the input events that follow it (a paste).
+    /// `nonce` answers a `HostMsg::ClipboardRequest`; `text: None` means the client declined.
+    SetClipboard { nonce: Option<u64>, text: Option<String> },
 }
 
 #[derive(Debug, thiserror::Error)]

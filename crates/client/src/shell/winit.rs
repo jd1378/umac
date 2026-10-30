@@ -36,7 +36,7 @@ impl Shell {
     }
 
     pub fn run(self, core: Core) -> anyhow::Result<Option<String>> {
-        let mut app = App { core, windows: HashMap::new(), by_remote: HashMap::new() };
+        let mut app = App { core, windows: HashMap::new(), by_remote: HashMap::new(), clipboard_warned: false };
         self.event_loop.run_app(&mut app).context("event loop")?;
         Ok(app.core.error.take())
     }
@@ -46,6 +46,7 @@ struct App {
     core: Core,
     windows: HashMap<LocalId, (WindowId, Arc<Window>)>,
     by_remote: HashMap<WindowId, LocalId>,
+    clipboard_warned: bool,
 }
 
 impl App {
@@ -122,6 +123,13 @@ impl ApplicationHandler<UiEvent> for App {
                 }
                 el.exit();
             }
+            UiEvent::Clipboard(_) => {
+                if !self.clipboard_warned {
+                    self.clipboard_warned = true;
+                    tracing::info!("clipboard sync needs the Wayland backend; ignoring Mac copies");
+                }
+            }
+            UiEvent::ClipboardRequest(nonce) => self.core.clipboard_request(nonce),
         }
     }
 
@@ -169,6 +177,10 @@ impl ApplicationHandler<UiEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // No clipboard access in this shell: answer pending pastes with nothing.
+        if self.core.wants_clipboard() {
+            self.core.clipboard_read(None);
+        }
         let next = self.core.flush_resizes(Instant::now());
         el.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }

@@ -154,6 +154,8 @@ unsafe extern "C" {
     pub fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
     pub static kAXTrustedCheckOptionPrompt: CFStringRef;
     pub fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+    pub fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+    pub fn AXUIElementCopyElementAtPosition(el: AXUIElementRef, x: f32, y: f32, out: *mut AXUIElementRef) -> AXError;
     pub fn AXUIElementCopyAttributeValue(el: AXUIElementRef, attr: CFStringRef, out: *mut CFTypeRef) -> AXError;
     pub fn AXUIElementSetAttributeValue(el: AXUIElementRef, attr: CFStringRef, value: CFTypeRef) -> AXError;
     pub fn AXUIElementPerformAction(el: AXUIElementRef, action: CFStringRef) -> AXError;

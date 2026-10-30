@@ -16,12 +16,32 @@ pub struct Config {
     pub max_fps: u16,
     /// Ctrl acts as Cmd and Super acts as Control, matching Linux/Windows shortcut habits.
     pub swap_ctrl_cmd: bool,
+    /// Copies made on the Mac land on this computer's clipboard.
+    pub clipboard_to_pc: bool,
+    /// When this computer's clipboard is sent to the Mac.
+    pub clipboard_to_mac: ClipboardToMac,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { bitrate_kbps: 25_000, max_fps: 60, swap_ctrl_cmd: true }
+        Self {
+            bitrate_kbps: 25_000,
+            max_fps: 60,
+            swap_ctrl_cmd: true,
+            clipboard_to_pc: true,
+            clipboard_to_mac: ClipboardToMac::OnPaste,
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardToMac {
+    Off,
+    /// Only when pasting on the Mac (Cmd+V or a Paste menu item): shares just what you paste.
+    OnPaste,
+    /// Also whenever a streamed window gains focus.
+    Always,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -11,6 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use umac_proto::{ClientMsg, InputEvent, MouseButton, WindowId, WindowInfo, WindowKind};
 
 use crate::{
+    clipboard::PasteFlow,
     config::Config,
     decode::Nv12Frame,
     net::NetCmd,
@@ -42,6 +43,7 @@ pub struct Core {
     gpu: Option<Gpu>,
     remotes: HashMap<WindowId, Remote>,
     opened_any: bool,
+    paste: PasteFlow,
     pub error: Option<String>,
 }
 
@@ -66,12 +68,13 @@ pub struct Changed {
 impl Core {
     pub fn new(cfg: Config, net: UnboundedSender<NetCmd>) -> Self {
         Self {
-            cfg,
+            cfg: cfg.clone(),
             net,
             instance: wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle()),
             gpu: None,
             remotes: HashMap::new(),
             opened_any: false,
+            paste: PasteFlow::new(cfg.clipboard_to_mac),
             error: None,
         }
     }
@@ -87,6 +90,34 @@ impl Core {
 
     fn send(&self, cmd: NetCmd) {
         let _ = self.net.send(cmd);
+    }
+
+    /// All input goes through here so a pending paste keeps it in order.
+    fn input(&mut self, ev: InputEvent) {
+        for ev in self.paste.input(ev) {
+            self.send(NetCmd::Input(ev));
+        }
+    }
+
+    pub fn clipboard_to_pc(&self) -> bool {
+        self.cfg.clipboard_to_pc
+    }
+
+    /// True while the shell should read the local clipboard and report it to `clipboard_read`.
+    pub fn wants_clipboard(&self) -> bool {
+        self.paste.wants_read()
+    }
+
+    pub fn clipboard_read(&mut self, text: Option<String>) {
+        for ev in self.paste.read_done(text) {
+            self.send(NetCmd::Input(ev));
+        }
+    }
+
+    pub fn clipboard_request(&mut self, nonce: u64) {
+        for ev in self.paste.request(nonce) {
+            self.send(NetCmd::Input(ev));
+        }
     }
 
     pub fn contains(&self, window: WindowId) -> bool {
@@ -233,20 +264,20 @@ impl Core {
         let Some(r) = self.remotes.get_mut(&window) else { return };
         r.cursor = (x, y);
         if let Some((x, y)) = surface_pos(r) {
-            self.send(NetCmd::Input(InputEvent::MouseMove { window, x, y }));
+            self.input(InputEvent::MouseMove { window, x, y });
         }
     }
 
     pub fn button(&mut self, window: WindowId, button: MouseButton, pressed: bool) {
         if let Some((x, y)) = self.remotes.get(&window).and_then(surface_pos) {
-            self.send(NetCmd::Input(InputEvent::MouseButton { window, x, y, button, pressed }));
+            self.input(InputEvent::MouseButton { window, x, y, button, pressed });
         }
     }
 
     /// Positive `dy` scrolls up (wheel away from the user).
     pub fn scroll(&mut self, window: WindowId, dx: f32, dy: f32, precise: bool) {
         if self.contains(window) {
-            self.send(NetCmd::Input(InputEvent::Scroll { window, dx, dy, precise }));
+            self.input(InputEvent::Scroll { window, dx, dy, precise });
         }
     }
 
@@ -265,7 +296,7 @@ impl Core {
     /// Keys always go to the normal window; the Mac routes them to an open menu itself.
     pub fn key(&mut self, window: WindowId, keycode: u16, pressed: bool) {
         if let Some(window) = self.root(window) {
-            self.send(NetCmd::Input(InputEvent::Key { window, keycode, pressed }));
+            self.input(InputEvent::Key { window, keycode, pressed });
         }
     }
 
@@ -276,8 +307,9 @@ impl Core {
         }
         if focused {
             self.send(NetCmd::Control(ClientMsg::Focus { window }));
+            self.paste.focused();
         } else {
-            self.send(NetCmd::Input(InputEvent::ReleaseAll));
+            self.input(InputEvent::ReleaseAll);
         }
     }
 }

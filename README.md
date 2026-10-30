@@ -26,3 +26,20 @@ and ffmpeg with VA-API (`ffmpeg-devel`, `mesa-va-drivers-freeworld`). On Wayland
 native popups for Mac menus; `umac open --backend winit` selects the fallback shell.
 
 Linux tip: raise `net.core.rmem_max` to 8 MiB or more so keyframe bursts are not dropped.
+
+## Clipboard
+
+Text only, up to about 900 KB.
+
+- Mac to PC: every copy made on the Mac lands on the PC clipboard. Wayland lets a client set
+  the clipboard only while it has keyboard focus, so a copy that arrives while no umac window
+  is focused is applied when one gets focus. Disable with `"clipboard_to_pc": false`.
+- PC to Mac: `"clipboard_to_mac"` is `"on_paste"` by default. The PC clipboard is sent only
+  when you paste into a Mac window: Cmd+V (Ctrl+V with `swap_ctrl_cmd`) or a Paste item in a
+  Mac menu. `"always"` also sends it whenever a umac window gains focus; `"off"` never sends it.
+
+Both live in `~/.config/umac/config.json`, for example:
+
+    { "clipboard_to_pc": true, "clipboard_to_mac": "on_paste" }
+
+Clipboard sync needs the Wayland backend; `--backend winit` does not sync.

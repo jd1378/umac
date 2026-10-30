@@ -12,10 +12,13 @@ use std::{
 };
 
 use anyhow::{Context, anyhow, bail};
-use tokio::{sync::mpsc, time::timeout};
+use tokio::{
+    sync::{broadcast, mpsc},
+    time::timeout,
+};
 use umac_proto::{
-    ClientMsg, Codec, ColorFormat, Hello, HelloReply, HostMsg, InputEvent, PROTOCOL_VERSION, WindowId, WindowInfo,
-    WindowKind,
+    ClientMsg, Codec, ColorFormat, Hello, HelloReply, HostMsg, InputEvent, MAX_CLIPBOARD_BYTES, PROTOCOL_VERSION,
+    WindowId, WindowInfo, WindowKind,
 };
 use umac_transport::{
     Fingerprint, Identity,
@@ -26,15 +29,15 @@ use umac_transport::{
 
 use super::{
     capture::{Rect, display_at, find_window},
-    input::{self, Command, Target, Targets},
-    permissions,
+    input::{self, ClipboardLink, Command, Reply, Target, Targets},
+    pasteboard, permissions,
     stream::{StreamParams, WindowStream},
     windows::{self, Geometry, OnScreen},
     ax::AxWindow,
 };
 use crate::{
     auth::AuthStore,
-    config,
+    clipboard, config,
     config::Settings,
     encode::EncodedFrame,
     input_state::Placement,
@@ -56,6 +59,9 @@ struct Shared {
     input: std_mpsc::Sender<Command>,
     /// Window that last received input or focus; new popups attach to it.
     active: Arc<Mutex<Option<WindowId>>>,
+    /// New Mac clipboard text, fanned out to every session.
+    clipboard: broadcast::Sender<String>,
+    clip: ClipboardLink,
     host_name: String,
 }
 
@@ -95,10 +101,15 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     });
 
     let targets = Targets::default();
+    let clip = ClipboardLink::default();
+    let (clipboard_tx, _) = broadcast::channel(4);
+    tokio::spawn(watch_pasteboard(clip.clone(), clipboard_tx.clone()));
     let shared = Arc::new(Shared {
-        input: input::spawn(targets.clone()),
+        input: input::spawn(targets.clone(), clip.clone()),
+        clip,
         targets,
         active: Arc::default(),
+        clipboard: clipboard_tx,
         auth: AuthStore::new(&config::support_dir()),
         host_name: host_name(),
         settings,
@@ -114,6 +125,44 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         });
     }
     Ok(())
+}
+
+/// Sends Mac copies to connected clients. umac is the only input source on a headless Mac,
+/// so the pasteboard is checked shortly after injected input (when copies happen) plus a
+/// slow fallback. Only the change count is polled; contents are read once per real change.
+async fn watch_pasteboard(clip: ClipboardLink, tx: broadcast::Sender<String>) {
+    let mut last_seen = pasteboard::change_count();
+    let mut last_check = Instant::now();
+    loop {
+        let focused = clip.focus.lock().unwrap().any();
+        let at = clipboard::next_check(*clip.last_input.lock().unwrap(), last_check, focused);
+        tokio::select! {
+            _ = async {
+                match at {
+                    Some(at) => tokio::time::sleep_until(at.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+            // New input moves the schedule; recompute it.
+            _ = clip.kick.notified() => continue,
+        }
+        last_check = Instant::now();
+        let count = pasteboard::change_count();
+        let own = clip.own_write.load(std::sync::atomic::Ordering::Relaxed);
+        let send = tx.receiver_count() > 0 && clipboard::should_send(count, last_seen, own);
+        last_seen = count;
+        if !send {
+            continue;
+        }
+        match pasteboard::read_text() {
+            Some(text) if text.len() > MAX_CLIPBOARD_BYTES => tracing::info!(bytes = text.len(), "Mac clipboard too large to sync"),
+            Some(text) => {
+                tracing::debug!(bytes = text.len(), "Mac clipboard changed");
+                let _ = tx.send(text);
+            }
+            None => tracing::debug!("Mac clipboard changed (no text)"),
+        }
+    }
 }
 
 fn host_name() -> String {
@@ -150,11 +199,14 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
 
     let (frames_tx, frames_rx) = mpsc::channel::<(WindowId, EncodedFrame)>(FRAME_QUEUE);
     let sender = tokio::spawn(send_frames(conn.clone(), frames_rx, shared.settings.fec_percent));
-    let input_task = tokio::spawn(read_input(conn.clone(), shared.input.clone(), shared.active.clone()));
+    static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+    let (reply_tx, reply_rx) = mpsc::unbounded_channel::<HostMsg>();
+    let input_task = tokio::spawn(read_input(conn.clone(), shared.clone(), id, reply_tx));
 
     let mut session =
-        Session { shared: shared.clone(), codec, streams: HashMap::new(), dismissed: HashSet::new(), frames_tx };
-    let result = session.control_loop(&mut send, recv).await;
+        Session { id, shared: shared.clone(), codec, streams: HashMap::new(), dismissed: HashSet::new(), frames_tx };
+    let result = session.control_loop(&mut send, recv, reply_rx).await;
 
     let windows: Vec<WindowId> = session.streams.keys().copied().collect();
     drop(session);
@@ -163,7 +215,8 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
             t.remove(&w);
         }
     }
-    let _ = shared.input.send(Command::Input(InputEvent::ReleaseAll));
+    shared.clip.with_focus(|f| f.unfocus(id));
+    let _ = shared.input.send(Command::ReleaseAll);
     input_task.abort();
     sender.abort();
     // A client closing the connection is a normal end, not an error.
@@ -221,15 +274,20 @@ async fn send_frames(conn: quinn::Connection, mut rx: mpsc::Receiver<(WindowId, 
     }
 }
 
-async fn read_input(conn: quinn::Connection, input: std_mpsc::Sender<Command>, active: Arc<Mutex<Option<WindowId>>>) {
+async fn read_input(conn: quinn::Connection, shared: Arc<Shared>, session: u64, reply: Reply) {
     while let Ok(mut recv) = conn.accept_uni().await {
-        let (input, active) = (input.clone(), active.clone());
+        let (shared, reply) = (shared.clone(), reply.clone());
         tokio::spawn(async move {
             while let Ok(Some(ev)) = read_msg::<_, InputEvent>(&mut recv).await {
-                if let InputEvent::MouseButton { window, pressed: true, .. } | InputEvent::Key { window, pressed: true, .. } = ev {
-                    *active.lock().unwrap() = Some(window);
+                match ev {
+                    InputEvent::MouseButton { window, pressed: true, .. } | InputEvent::Key { window, pressed: true, .. } => {
+                        *shared.active.lock().unwrap() = Some(window);
+                    }
+                    // Sent when the client window loses focus.
+                    InputEvent::ReleaseAll => shared.clip.with_focus(|f| f.unfocus(session)),
+                    _ => {}
                 }
-                if input.send(Command::Input(ev)).is_err() {
+                if shared.input.send(Command::Input(ev, reply.clone())).is_err() {
                     return;
                 }
             }
@@ -248,6 +306,7 @@ struct ActiveStream {
 }
 
 struct Session {
+    id: u64,
     shared: Arc<Shared>,
     codec: Codec,
     streams: HashMap<WindowId, ActiveStream>,
@@ -259,7 +318,13 @@ struct Session {
 type Ctl = quinn::SendStream;
 
 impl Session {
-    async fn control_loop(&mut self, send: &mut Ctl, mut recv: quinn::RecvStream) -> anyhow::Result<()> {
+    async fn control_loop(
+        &mut self,
+        send: &mut Ctl,
+        mut recv: quinn::RecvStream,
+        mut replies: mpsc::UnboundedReceiver<HostMsg>,
+    ) -> anyhow::Result<()> {
+        let mut clipboard = self.shared.clipboard.subscribe();
         let mut poll = tokio::time::interval(POLL);
         let mut popup_poll = tokio::time::interval(POPUP_POLL);
         popup_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -290,6 +355,20 @@ impl Session {
                         break Err(e);
                     }
                 }
+                Some(msg) = replies.recv() => {
+                    if let Err(e) = write_msg(send, &msg).await {
+                        break Err(e.into());
+                    }
+                }
+                text = clipboard.recv() => match text {
+                    Ok(text) => {
+                        if let Err(e) = write_msg(send, &HostMsg::Clipboard { text }).await {
+                            break Err(e.into());
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {}
+                },
                 _ = popup_poll.tick() => {
                     if let Err(e) = self.poll_popups(send).await {
                         break Err(e);
@@ -336,6 +415,7 @@ impl Session {
                 *self.shared.active.lock().unwrap() = Some(window);
                 if self.streams.get(&window).is_some_and(|s| s.popup_of.is_none()) {
                     let _ = self.shared.input.send(Command::Focus(window));
+                    self.shared.clip.with_focus(|f| f.focus(self.id, window));
                 }
             }
             ClientMsg::Resize { window, width, height } => {
@@ -398,12 +478,13 @@ impl Session {
 
     fn set_target(&self, info: &WindowInfo, g: &Geometry, inset: f64) {
         if let Ok(mut t) = self.shared.targets.write() {
-            t.insert(info.id, Target { pid: info.pid, placement: g.placement(info.scale as f64, inset) });
+            t.insert(info.id, Target { pid: info.pid, placement: g.placement(info.scale as f64, inset), popup: false });
         }
     }
 
     fn remove(&mut self, window: WindowId) {
         if self.streams.remove(&window).is_some() {
+            self.shared.clip.with_focus(|f| f.window_gone(self.id, window));
             if let Ok(mut t) = self.shared.targets.write() {
                 t.remove(&window);
             }
@@ -549,6 +630,10 @@ impl Session {
             window = id, parent, layer = w.layer, offset = ?info.offset, size = ?stream.size,
             find_ms, start_ms = seen.elapsed().as_millis() as u64, "popup started"
         );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let center = (w.x + w.width / 2.0, w.y + w.height / 2.0);
+            tokio::task::spawn_blocking(move || super::ax::log_menu_items(center.0, center.1));
+        }
         let geometry = Geometry { x: w.x, y: w.y, width: w.width, height: w.height, title: String::new(), on_screen: true };
         self.set_popup_target(&info, &geometry);
         self.streams.insert(id, ActiveStream { stream, info: info.clone(), geometry, inset: 0.0, popup_of: Some(parent) });
@@ -560,7 +645,7 @@ impl Session {
     fn set_popup_target(&self, info: &WindowInfo, g: &Geometry) {
         if let Ok(mut t) = self.shared.targets.write() {
             let placement = Placement { x: g.x, y: g.y, width: g.width, height: g.height, scale: info.scale as f64 };
-            t.insert(info.id, Target { pid: info.pid, placement });
+            t.insert(info.id, Target { pid: info.pid, placement, popup: true });
         }
     }
 

@@ -182,6 +182,10 @@ pub struct Placement {
 }
 
 impl Placement {
+    pub fn contains(self, p: (f64, f64)) -> bool {
+        p.0 >= self.x && p.1 >= self.y && p.0 < self.x + self.width && p.1 < self.y + self.height
+    }
+
     /// Maps a surface pixel position to a global point, clamped inside the window so a
     /// stray coordinate never lands on another window.
     pub fn to_global(self, px: f32, py: f32) -> (f64, f64) {

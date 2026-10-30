@@ -5,22 +5,42 @@
 //! Popups take no grab: a click outside lands on the parent, is forwarded to the Mac, and the
 //! Mac closes the menu itself, which the host reports as `WindowClosed`.
 
-use std::{collections::HashMap, ptr::NonNull, time::Instant};
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+    ptr::NonNull,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
+    data_device_manager::{
+        DataDeviceManagerState, WritePipe,
+        data_device::{DataDevice, DataDeviceHandler},
+        data_offer::{DataOfferHandler, DragOffer},
+        data_source::{CopyPasteSource, DataSourceHandler},
+    },
     delegate_registry,
     output::{OutputHandler, OutputState},
     reexports::{
-        calloop::{EventLoop, channel},
+        calloop::{
+            EventLoop, LoopHandle, channel,
+            timer::{TimeoutAction, Timer},
+        },
         calloop_wayland_source::WaylandSource,
         client::{
             Connection, Proxy, QueueHandle,
             backend::ObjectId,
             globals::registry_queue_init,
-            protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
+            protocol::{
+                wl_data_device::WlDataDevice,
+                wl_data_device_manager::DndAction,
+                wl_data_source::WlDataSource,
+                wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface,
+            },
         },
         protocols::xdg::shell::client::xdg_positioner::{Anchor, ConstraintAdjustment, Gravity},
     },
@@ -44,12 +64,33 @@ use smithay_client_toolkit::{
 use umac_proto::{MouseButton, WindowId, WindowInfo, WindowKind};
 
 use crate::{
+    clipboard::sendable,
     core::{self, Core, LINE_PX, MAX_POPUPS},
     keymap,
     ui::{UiEvent, UiSender},
 };
 
 const APP_ID: &str = "dev.umac.client";
+/// Text types we offer and accept, most preferred first.
+const TEXT_MIMES: [&str; 4] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING"];
+/// How long a paste waits for another app to hand over the clipboard.
+const READ_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Clipboard (Wayland selection) state.
+struct Clip {
+    manager: Option<DataDeviceManagerState>,
+    device: Option<DataDevice>,
+    /// Latest input serial on our surfaces; setting the selection needs one.
+    serial: Option<u32>,
+    /// Our current selection and its text, while we own it.
+    own: Option<(CopyPasteSource, Arc<str>)>,
+    /// Mac copy that arrived without keyboard focus; set on the next focus.
+    pending: Option<String>,
+    /// Bumped per read so a late result after a timeout is ignored.
+    read_gen: u64,
+    reading: bool,
+    results: channel::Sender<(u64, Option<String>)>,
+}
 
 pub struct Shell {
     conn: Connection,
@@ -78,8 +119,23 @@ impl Shell {
         let Self { conn, mut event_loop, tx, rx, globals, queue } = self;
         drop(tx);
         let qh = queue.handle();
+        let (results_tx, results_rx) = channel::channel::<(u64, Option<String>)>();
+        let manager = DataDeviceManagerState::bind(&globals, &qh)
+            .inspect_err(|e| tracing::warn!("no clipboard support from the compositor: {e}"))
+            .ok();
         let mut state = State {
             core,
+            loop_handle: event_loop.handle(),
+            clip: Clip {
+                manager,
+                device: None,
+                serial: None,
+                own: None,
+                pending: None,
+                read_gen: 0,
+                reading: false,
+                results: results_tx,
+            },
             conn: conn.clone(),
             qh: qh.clone(),
             registry: RegistryState::new(&globals),
@@ -104,10 +160,19 @@ impl Shell {
                 }
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        event_loop
+            .handle()
+            .insert_source(results_rx, |ev, _, state: &mut State| {
+                if let channel::Event::Msg((generation, text)) = ev {
+                    state.read_finished(generation, text);
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         while !state.exit {
             let now = Instant::now();
             let timeout = state.core.flush_resizes(now).map(|t| t.saturating_duration_since(now));
             event_loop.dispatch(timeout, &mut state)?;
+            state.service_clipboard();
         }
         state.close_all();
         Ok(state.core.error.take())
@@ -145,6 +210,8 @@ struct Node {
 /// connection its raw display pointer came from.
 struct State {
     core: Core,
+    loop_handle: LoopHandle<'static, State>,
+    clip: Clip,
     conn: Connection,
     qh: QueueHandle<State>,
     registry: RegistryState,
@@ -220,6 +287,8 @@ impl State {
                 }
                 self.exit = true;
             }
+            UiEvent::Clipboard(text) => self.set_selection(text),
+            UiEvent::ClipboardRequest(nonce) => self.core.clipboard_request(nonce),
         }
     }
 
@@ -388,7 +457,10 @@ impl PointerHandler for State {
                 }
                 PointerEventKind::Leave { .. } => {}
                 PointerEventKind::Motion { .. } => self.core.pointer_moved(id, x, y),
-                PointerEventKind::Press { button, .. } => self.core.button(id, mouse_button(button), true),
+                PointerEventKind::Press { button, serial, .. } => {
+                    self.clip.serial = Some(serial);
+                    self.core.button(id, mouse_button(button), true);
+                }
                 PointerEventKind::Release { button, .. } => self.core.button(id, mouse_button(button), false),
                 PointerEventKind::Axis { horizontal, vertical, source, .. } => {
                     let continuous = matches!(
@@ -417,13 +489,17 @@ impl KeyboardHandler for State {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         surface: &wl_surface::WlSurface,
-        _: u32,
+        serial: u32,
         _: &[u32],
         _: &[Keysym],
     ) {
         if let Some(id) = self.id_of(surface) {
             self.kb_focus = Some(id);
+            self.clip.serial = Some(serial);
             self.core.focus(id, true);
+            if let Some(text) = self.clip.pending.take() {
+                self.set_selection(text);
+            }
         }
     }
 
@@ -436,7 +512,8 @@ impl KeyboardHandler for State {
         }
     }
 
-    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
+    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, serial: u32, event: KeyEvent) {
+        self.clip.serial = Some(serial);
         self.key(event.raw_code, true);
     }
 
@@ -475,7 +552,13 @@ impl SeatHandler for State {
         &mut self.seats
     }
 
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        if self.clip.device.is_none()
+            && let Some(m) = &self.clip.manager
+        {
+            self.clip.device = Some(m.get_data_device(qh, &seat));
+        }
+    }
 
     fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
         match capability {
@@ -507,6 +590,119 @@ impl SeatHandler for State {
     }
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl State {
+    /// Puts Mac clipboard text on the local clipboard. Wayland only lets a client with
+    /// keyboard focus set the selection, so without focus it waits for the next one.
+    fn set_selection(&mut self, text: String) {
+        let (Some(manager), Some(device)) = (&self.clip.manager, &self.clip.device) else { return };
+        let (Some(serial), Some(_)) = (self.clip.serial, self.kb_focus) else {
+            self.clip.pending = Some(text);
+            return;
+        };
+        let source = manager.create_copy_paste_source(&self.qh, TEXT_MIMES);
+        source.set_selection(device, serial);
+        tracing::debug!(bytes = text.len(), "local clipboard set from the Mac");
+        self.clip.own = Some((source, text.into()));
+    }
+
+    /// Starts a clipboard read when the core needs one (a paste is waiting).
+    fn service_clipboard(&mut self) {
+        if !self.core.wants_clipboard() || self.clip.reading {
+            return;
+        }
+        if let Some((_, text)) = &self.clip.own {
+            let text = text.to_string();
+            self.core.clipboard_read(Some(text));
+            return;
+        }
+        let offer = self.clip.device.as_ref().and_then(|d| d.data().selection_offer());
+        let Some(offer) = offer else {
+            self.core.clipboard_read(None);
+            return;
+        };
+        let mime = offer.with_mime_types(|types| TEXT_MIMES.iter().find(|m| types.iter().any(|t| t == *m)).map(|m| m.to_string()));
+        let pipe = match mime.map(|m| offer.receive(m)) {
+            Some(Ok(pipe)) => pipe,
+            _ => {
+                self.core.clipboard_read(None);
+                return;
+            }
+        };
+        self.clip.read_gen += 1;
+        self.clip.reading = true;
+        let (generation, results) = (self.clip.read_gen, self.clip.results.clone());
+        // The source app writes at its own pace; a blocking read on a helper thread keeps the
+        // event loop free. The timeout below gives up without it.
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let limit = umac_proto::MAX_CLIPBOARD_BYTES as u64 + 1;
+            let text = std::fs::File::from(std::os::fd::OwnedFd::from(pipe))
+                .take(limit)
+                .read_to_end(&mut buf)
+                .ok()
+                .and_then(|_| String::from_utf8(buf).ok());
+            let _ = results.send((generation, text));
+        });
+        let timer = Timer::from_duration(READ_TIMEOUT);
+        let _ = self.loop_handle.insert_source(timer, move |_, _, state| {
+            if state.clip.reading && state.clip.read_gen == generation {
+                tracing::info!("clipboard owner did not answer in time; pasting without it");
+                state.read_finished(generation, None);
+            }
+            TimeoutAction::Drop
+        });
+    }
+
+    fn read_finished(&mut self, generation: u64, text: Option<String>) {
+        if !self.clip.reading || generation != self.clip.read_gen {
+            return;
+        }
+        self.clip.reading = false;
+        self.core.clipboard_read(sendable(text));
+    }
+}
+
+impl DataDeviceHandler for State {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64, _: &wl_surface::WlSurface) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+}
+
+impl DataOfferHandler for State {
+    fn source_actions(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
+    fn selected_action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
+}
+
+impl DataSourceHandler for State {
+    fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: Option<String>) {}
+
+    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource, mime: String, fd: WritePipe) {
+        let Some((own, text)) = &self.clip.own else { return };
+        if own.inner() != source || !TEXT_MIMES.contains(&mime.as_str()) {
+            return;
+        }
+        // A helper thread, so a slow reader never blocks the event loop.
+        let text = text.clone();
+        std::thread::spawn(move || {
+            let mut file = std::fs::File::from(std::os::fd::OwnedFd::from(fd));
+            let _ = file.write_all(text.as_bytes());
+        });
+    }
+
+    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+        // Another app took the clipboard.
+        if self.clip.own.as_ref().is_some_and(|(s, _)| s.inner() == source) {
+            self.clip.own = None;
+        }
+    }
+
+    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: DndAction) {}
 }
 
 impl CompositorHandler for State {

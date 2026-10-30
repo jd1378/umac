@@ -12,6 +12,10 @@ pub enum UiEvent {
     Changed(WindowInfo),
     Closed(WindowId),
     Shutdown(String),
+    /// The Mac clipboard changed: put this text on the local clipboard.
+    Clipboard(String),
+    /// The host needs our clipboard for a paste; answer through `Core::clipboard_read`.
+    ClipboardRequest(u64),
 }
 
 /// Wakes the shell's event loop with an event. `send` returns false once the loop is gone.

@@ -3,7 +3,11 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock, mpsc},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicIsize, AtomicU64, Ordering},
+        mpsc,
+    },
     time::Instant,
 };
 
@@ -12,26 +16,53 @@ use core_graphics::{
     event_source::{CGEventSource, CGEventSourceStateID},
     geometry::CGPoint,
 };
-use umac_proto::{InputEvent, WindowId};
+use tokio::sync::{Notify, mpsc::UnboundedSender};
+use umac_proto::{HostMsg, InputEvent, MAX_CLIPBOARD_BYTES, WindowId};
 
-use super::ax::AxWindow;
-use crate::input_state::{ButtonKey, InputState, KeyAction, Placement};
+use super::{ax, ax::AxWindow, pasteboard};
+use crate::{
+    clipboard::{FocusTracker, PasteGate, is_paste_item},
+    input_state::{ButtonKey, InputState, KeyAction, Placement},
+};
 
 /// Where each streamed window currently sits on the Mac; kept fresh by the session poller.
 #[derive(Debug, Clone, Copy)]
 pub struct Target {
     pub pid: i32,
     pub placement: Placement,
+    pub popup: bool,
 }
 
 pub type Targets = Arc<RwLock<HashMap<WindowId, Target>>>;
 
+/// Control-stream messages back to the session that sent an input event.
+pub type Reply = UnboundedSender<HostMsg>;
+
 pub enum Command {
-    Input(InputEvent),
+    Input(InputEvent, Reply),
     Focus(WindowId),
+    ReleaseAll,
 }
 
-pub fn spawn(targets: Targets) -> mpsc::Sender<Command> {
+/// Shared with the pasteboard watcher: our own writes (not echoed back) and when input was
+/// last injected (copies usually follow it).
+#[derive(Clone, Default)]
+pub struct ClipboardLink {
+    pub own_write: Arc<AtomicIsize>,
+    pub last_input: Arc<Mutex<Option<Instant>>>,
+    pub focus: Arc<Mutex<FocusTracker>>,
+    pub kick: Arc<Notify>,
+}
+
+impl ClipboardLink {
+    /// Updates focus state and wakes the watcher so its fallback starts or stops.
+    pub fn with_focus(&self, f: impl FnOnce(&mut FocusTracker)) {
+        f(&mut self.focus.lock().unwrap());
+        self.kick.notify_one();
+    }
+}
+
+pub fn spawn(targets: Targets, clip: ClipboardLink) -> mpsc::Sender<Command> {
     let (tx, rx) = mpsc::channel::<Command>();
     std::thread::Builder::new()
         .name("umac-input".into())
@@ -40,11 +71,37 @@ pub fn spawn(targets: Targets) -> mpsc::Sender<Command> {
                 tracing::error!("cannot create CGEventSource; input disabled");
                 return;
             };
-            let mut inj = Injector { source, targets, state: InputState::default(), last_pos: HashMap::new() };
-            for cmd in rx {
+            let mut inj = Injector {
+                source,
+                targets,
+                state: InputState::default(),
+                last_pos: HashMap::new(),
+                gate: PasteGate::default(),
+                clip,
+                paste_titles: HashMap::new(),
+            };
+            loop {
+                let cmd = match inj.gate.deadline() {
+                    Some(d) => match rx.recv_timeout(d.saturating_duration_since(Instant::now())) {
+                        Ok(c) => Some(c),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    },
+                    None => match rx.recv() {
+                        Ok(c) => Some(c),
+                        Err(_) => break,
+                    },
+                };
                 match cmd {
-                    Command::Input(ev) => inj.handle(ev),
-                    Command::Focus(w) => inj.focus(w),
+                    Some(Command::Input(ev, reply)) => inj.dispatch(ev, &reply),
+                    Some(Command::Focus(w)) => inj.focus(w),
+                    Some(Command::ReleaseAll) => inj.dispatch_local(InputEvent::ReleaseAll),
+                    None => {
+                        if let Some(held) = inj.gate.expire(Instant::now()) {
+                            tracing::warn!("client did not send its clipboard in time; pasting without it");
+                            inj.replay(held);
+                        }
+                    }
                 }
             }
             inj.release_all();
@@ -58,7 +115,15 @@ struct Injector {
     targets: Targets,
     state: InputState,
     last_pos: HashMap<WindowId, (f64, f64)>,
+    gate: PasteGate<InputEvent>,
+    clip: ClipboardLink,
+    /// Menu-bar Paste titles per app; walking the menu bar costs tens of milliseconds.
+    paste_titles: HashMap<i32, (Instant, Vec<String>)>,
 }
+
+const PASTE_TITLES_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
 
 fn button_types(b: ButtonKey) -> (CGEventType, CGEventType, CGEventType, CGMouseButton) {
     match b.cg_number() {
@@ -87,6 +152,92 @@ impl Injector {
             ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, c);
         }
         ev.post(CGEventTapLocation::HID);
+    }
+
+    /// Routes one client event: holds it behind a pending paste, starts a paste hold when it
+    /// clicks a Paste menu item, or injects it.
+    fn dispatch(&mut self, ev: InputEvent, reply: &Reply) {
+        if self.gate.is_waiting() {
+            if let InputEvent::SetClipboard { nonce: Some(n), text } = &ev
+                && self.gate.waits_for(*n)
+            {
+                self.set_clipboard(text.as_deref());
+                let held = self.gate.release();
+                self.replay(held);
+            } else if let Some(held) = self.gate.push(ev) {
+                self.replay(held);
+            }
+            return;
+        }
+        if self.clicks_paste_item(&ev) {
+            let nonce = NEXT_NONCE.fetch_add(1, Ordering::Relaxed);
+            if reply.send(HostMsg::ClipboardRequest { nonce }).is_ok() {
+                self.gate.hold(nonce, ev, Instant::now());
+                return;
+            }
+        }
+        self.dispatch_local(ev);
+    }
+
+    fn replay(&mut self, events: Vec<InputEvent>) {
+        for ev in events {
+            self.dispatch_local(ev);
+        }
+    }
+
+    fn dispatch_local(&mut self, ev: InputEvent) {
+        match ev {
+            // A late answer to a paste that already went ahead: too late to matter.
+            InputEvent::SetClipboard { nonce: Some(_), .. } => {}
+            InputEvent::SetClipboard { nonce: None, text } => self.set_clipboard(text.as_deref()),
+            ev => {
+                // Copies are caused by keys and clicks; pointer motion and scrolling are not.
+                let may_copy = matches!(ev, InputEvent::Key { .. } | InputEvent::MouseButton { .. });
+                self.handle(ev);
+                if may_copy {
+                    *self.clip.last_input.lock().unwrap() = Some(Instant::now());
+                    self.clip.kick.notify_one();
+                }
+            }
+        }
+    }
+
+    fn set_clipboard(&mut self, text: Option<&str>) {
+        let Some(text) = text else { return };
+        if text.len() > MAX_CLIPBOARD_BYTES {
+            tracing::warn!(bytes = text.len(), "client clipboard too large; ignored");
+            return;
+        }
+        let count = pasteboard::write_text(text);
+        self.clip.own_write.store(count, Ordering::Relaxed);
+        tracing::debug!(bytes = text.len(), "pasteboard set from client");
+    }
+
+    /// A button release over a popup on a menu item whose shortcut is Cmd+V. Menu items act
+    /// on release, so this is the moment to fetch the client's clipboard first.
+    fn clicks_paste_item(&mut self, ev: &InputEvent) -> bool {
+        let InputEvent::MouseButton { window, x, y, pressed: false, .. } = *ev else { return false };
+        let Some(t) = self.target(window) else { return false };
+        let pos = t.placement.to_global(x, y);
+        let Some(popup) = self.targets.read().ok().and_then(|ts| ts.values().find(|t| t.popup && t.placement.contains(pos)).copied())
+        else {
+            return false;
+        };
+        let now = Instant::now();
+        let Some(item) = ax::menu_item_at(pos.0, pos.1) else { return false };
+        let titles = match self.paste_titles.get(&popup.pid) {
+            Some((at, t)) if now.duration_since(*at) < PASTE_TITLES_TTL => t,
+            _ => {
+                let t = ax::paste_titles(popup.pid);
+                &self.paste_titles.entry(popup.pid).insert_entry((now, t)).into_mut().1
+            }
+        };
+        let paste = is_paste_item(&item, titles);
+        tracing::debug!(paste, ms = now.elapsed().as_millis() as u64, "classified menu click");
+        if paste {
+            tracing::info!(window, "Paste menu item clicked; fetching the client clipboard first");
+        }
+        paste
     }
 
     fn handle(&mut self, ev: InputEvent) {
@@ -133,6 +284,7 @@ impl Injector {
             }
             InputEvent::Key { keycode, pressed, .. } => self.key(keycode, pressed),
             InputEvent::ReleaseAll => self.release_all(),
+            InputEvent::SetClipboard { .. } => {}
         }
     }
 
