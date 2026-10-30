@@ -54,7 +54,7 @@ With `"swap_ctrl_cmd": true` (default) Ctrl acts as Cmd and Super as Control. Wi
 
 | Linux | Mac |
 |---|---|
-| Ctrl+Backspace / Ctrl+Delete | Option+Delete / Option+Forward Delete (delete word) |
+| Ctrl+Backspace / Ctrl+Delete | Option+Delete / Option+Forward Delete (delete word); in terminals Ctrl+W / Esc D |
 | Ctrl+Left / Ctrl+Right (with Shift) | Option+Left / Option+Right (move or select by word) |
 | Home / End (with Shift) | Cmd+Left / Cmd+Right (line start / end) |
 | Ctrl+Home / Ctrl+End | Cmd+Up / Cmd+Down (document start / end) |

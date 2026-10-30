@@ -4,7 +4,8 @@
 //! terminals Ctrl acts as Cmd when `swap_ctrl_cmd` is on, and a few text editing chords are
 //! rewritten (Ctrl+Backspace deletes a word with Option on the Mac, Home/End move within the
 //! line with Cmd). Terminals keep Ctrl as Control so Ctrl+C interrupts, and use Ctrl+Shift+C/V
-//! for copy and paste like Linux terminals do.
+//! for copy and paste like Linux terminals do. Word deletion in terminals uses shell keys
+//! (Ctrl+W, Meta-D), since Terminal.app sends Option as Meta only when told to.
 #![allow(non_upper_case_globals)]
 
 use std::collections::{BTreeSet, HashMap};
@@ -104,7 +105,9 @@ impl Translator {
         self.sent = want;
     }
 
-    fn rule(&self, key: u16, m: Mods, profile: Profile) -> Option<(u16, BTreeSet<u16>)> {
+    /// Rewrites a press: the key to send, the modifiers to hold, and an optional key tapped
+    /// first with no modifiers (Escape, the shell's Meta prefix).
+    fn rule(&self, key: u16, m: Mods, profile: Profile) -> Option<(u16, BTreeSet<u16>, Option<u16>)> {
         let shift = |set: &mut BTreeSet<u16>| {
             if m.shift {
                 set.insert(kVK_Shift);
@@ -120,10 +123,17 @@ impl Translator {
         if profile == Profile::Native || m.alt || m.super_ {
             return None;
         }
+        if profile == Profile::Terminal && m.ctrl && !m.shift {
+            match key {
+                kVK_Delete => return Some((kVK_ANSI_W, with(&[kVK_Control], false), None)),
+                kVK_ForwardDelete => return Some((kVK_ANSI_D, BTreeSet::new(), Some(kVK_Escape))),
+                _ => {}
+            }
+        }
         let editing = match (key, m.ctrl) {
-            (kVK_Delete, true) => Some((kVK_Delete, with(&[kVK_Option], false))),
-            (kVK_ForwardDelete, true) => Some((kVK_ForwardDelete, with(&[kVK_Option], false))),
-            (kVK_LeftArrow | kVK_RightArrow, true) => Some((key, with(&[kVK_Option], true))),
+            (kVK_Delete, true) => Some((kVK_Delete, with(&[kVK_Option], false), None)),
+            (kVK_ForwardDelete, true) => Some((kVK_ForwardDelete, with(&[kVK_Option], false), None)),
+            (kVK_LeftArrow | kVK_RightArrow, true) => Some((key, with(&[kVK_Option], true), None)),
             _ => None,
         };
         if editing.is_some() {
@@ -131,16 +141,16 @@ impl Translator {
         }
         match profile {
             Profile::Terminal => match (key, m.ctrl, m.shift) {
-                (kVK_ANSI_C | kVK_ANSI_V, true, true) => Some((key, with(&[kVK_Command], false))),
-                (kVK_Home, false, _) => Some((kVK_ANSI_A, with(&[kVK_Control], false))),
-                (kVK_End, false, _) => Some((kVK_ANSI_E, with(&[kVK_Control], false))),
+                (kVK_ANSI_C | kVK_ANSI_V, true, true) => Some((key, with(&[kVK_Command], false), None)),
+                (kVK_Home, false, _) => Some((kVK_ANSI_A, with(&[kVK_Control], false), None)),
+                (kVK_End, false, _) => Some((kVK_ANSI_E, with(&[kVK_Control], false), None)),
                 _ => None,
             },
             Profile::Apps => match (key, m.ctrl) {
-                (kVK_Home, false) => Some((kVK_LeftArrow, with(&[kVK_Command], true))),
-                (kVK_End, false) => Some((kVK_RightArrow, with(&[kVK_Command], true))),
-                (kVK_Home, true) => Some((kVK_UpArrow, with(&[kVK_Command], true))),
-                (kVK_End, true) => Some((kVK_DownArrow, with(&[kVK_Command], true))),
+                (kVK_Home, false) => Some((kVK_LeftArrow, with(&[kVK_Command], true), None)),
+                (kVK_End, false) => Some((kVK_RightArrow, with(&[kVK_Command], true), None)),
+                (kVK_Home, true) => Some((kVK_UpArrow, with(&[kVK_Command], true), None)),
+                (kVK_End, true) => Some((kVK_DownArrow, with(&[kVK_Command], true), None)),
                 _ => None,
             },
             Profile::Native => None,
@@ -164,7 +174,18 @@ impl Translator {
             return out;
         }
         if pressed {
-            if let Some((sent_key, mods)) = self.rule(key, self.mods(), profile) {
+            if let Some((sent_key, mods, prefix)) = self.rule(key, self.mods(), profile) {
+                if let Some(p) = prefix {
+                    // A two-key sequence is tapped, not held: the Mac would repeat only the
+                    // second key and type it over and over.
+                    self.set_mods(BTreeSet::new(), &mut out);
+                    out.extend([(p, true), (p, false)]);
+                    self.set_mods(mods, &mut out);
+                    out.extend([(sent_key, true), (sent_key, false)]);
+                    let want = self.natural(profile);
+                    self.set_mods(want, &mut out);
+                    return out;
+                }
                 self.set_mods(mods, &mut out);
                 self.active.insert(key, sent_key);
                 out.push((sent_key, true));
@@ -252,6 +273,26 @@ mod tests {
         assert_eq!(out, vec![(kVK_Control, true), (kVK_ANSI_C, true), (kVK_ANSI_C, false)]);
         let out = run(&mut t, &[(kVK_Shift, true), (kVK_ANSI_V, true)], Profile::Terminal);
         assert_eq!(out, vec![(kVK_Shift, true), (kVK_Shift, false), (kVK_Control, false), (kVK_Command, true), (kVK_ANSI_V, true)]);
+    }
+
+    #[test]
+    fn terminal_word_deletion_uses_shell_keys() {
+        let mut t = Translator::new(true);
+        let out = run(&mut t, &[(kVK_Control, true), (kVK_Delete, true), (kVK_Delete, false)], Profile::Terminal);
+        assert_eq!(out, vec![(kVK_Control, true), (kVK_ANSI_W, true), (kVK_ANSI_W, false)]);
+        let out = run(&mut t, &[(kVK_ForwardDelete, true), (kVK_ForwardDelete, false)], Profile::Terminal);
+        assert_eq!(
+            out,
+            vec![
+                (kVK_Control, false),
+                (kVK_Escape, true),
+                (kVK_Escape, false),
+                (kVK_ANSI_D, true),
+                (kVK_ANSI_D, false),
+                (kVK_Control, true),
+                (kVK_ForwardDelete, false),
+            ]
+        );
     }
 
     #[test]
