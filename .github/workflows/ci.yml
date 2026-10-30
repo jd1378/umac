@@ -78,7 +78,7 @@ jobs:
             flags: ""
           - name: all features
             flags: --all-features
-    runs-on: macos-15
+    runs-on: macos-26
     env:
       # Runners are VMs without the hardware video encoders.
       UMAC_SKIP_HW_TESTS: "1"
