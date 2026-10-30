@@ -611,11 +611,14 @@ impl Decoder {
                     image_barrier(self.dpb, color_range(0, self.shape.slots as u32))
                         .old_layout(vk::ImageLayout::UNDEFINED)
                         .new_layout(vk::ImageLayout::VIDEO_DECODE_DPB_KHR)
-                        .dst_access_mask(vk::AccessFlags::empty()),
+                        .dst_access_mask(DECODE_ACCESS),
                 ];
                 if let Some((img, _, _)) = self.output {
                     barriers.push(
-                        image_barrier(img, color_range(0, 1)).old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::VIDEO_DECODE_DST_KHR),
+                        image_barrier(img, color_range(0, 1))
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::VIDEO_DECODE_DST_KHR)
+                            .dst_access_mask(DECODE_ACCESS),
                     );
                 }
                 raw.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &barriers);
@@ -768,6 +771,10 @@ fn color_range(layer: u32, count: u32) -> vk::ImageSubresourceRange {
 fn plane_range(layer: u32) -> vk::ImageSubresourceRange {
     color_range(layer, 1)
 }
+
+/// The decode's own reads and writes have no legacy access bits (only synchronization2 names
+/// them), so the layout transitions before the first decode make all memory access wait.
+const DECODE_ACCESS: vk::AccessFlags = vk::AccessFlags::from_raw(vk::AccessFlags::MEMORY_READ.as_raw() | vk::AccessFlags::MEMORY_WRITE.as_raw());
 
 fn image_barrier(image: vk::Image, range: vk::ImageSubresourceRange) -> vk::ImageMemoryBarrier<'static> {
     vk::ImageMemoryBarrier::default()
