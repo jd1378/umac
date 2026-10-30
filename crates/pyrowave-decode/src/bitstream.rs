@@ -6,7 +6,8 @@ use crate::layout::{Chroma, Layout};
 
 const HEADER_BYTES: usize = 8;
 const SEQUENCE_MASK: u8 = 7;
-/// Marks a block that did not arrive (decoded as zero coefficients).
+/// Marks a block absent from a frame: the decoder keeps its previous coefficients. Blocks
+/// the sender wants zeroed arrive as empty blocks (no 8x8 groups).
 pub const MISSING: u32 = u32::MAX;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -50,8 +51,10 @@ impl Frame {
     }
 }
 
-enum Item<'a> {
-    Start { sequence: u8, total_blocks: u32 },
+/// One validated element of a packet.
+pub enum Item<'a> {
+    /// Start of frame; `header` is its raw 8 bytes.
+    Start { sequence: u8, total_blocks: u32, header: [u8; HEADER_BYTES] },
     Block { sequence: u8, index: u32, bytes: &'a [u8] },
 }
 
@@ -90,6 +93,65 @@ pub fn block_content_bytes(block: &[u8]) -> Option<usize> {
     Some(offset + significant.div_ceil(8))
 }
 
+/// Splits and validates one packet against `layout`. Either every element is valid or the
+/// packet is rejected as a whole.
+pub fn parse_items<'a>(layout: &Layout, mut data: &'a [u8]) -> Result<Vec<Item<'a>>, Error> {
+    let mut items = Vec::new();
+    while !data.is_empty() {
+        if data.len() < HEADER_BYTES {
+            return Err(Error::Trailing(data.len()));
+        }
+        let w0 = u32_at(data, 0);
+        let w1 = u32_at(data, 4);
+        let sequence = ((w0 >> 28) & 7) as u8;
+        if w0 >> 31 != 0 {
+            let (w, h) = ((w0 & 0x3fff) + 1, ((w0 >> 14) & 0x3fff) + 1);
+            if (w, h) != (layout.width, layout.height) {
+                return Err(Error::Dimensions(w, h, layout.width, layout.height));
+            }
+            let code = (w1 >> 24) & 3;
+            if code != 0 {
+                return Err(Error::ExtendedCode(code));
+            }
+            let chroma = if (w1 >> 26) & 1 == 1 { Chroma::Yuv444 } else { Chroma::Yuv420 };
+            if chroma != layout.chroma {
+                return Err(Error::ChromaMismatch);
+            }
+            let total_blocks = w1 & 0xff_ffff;
+            if total_blocks > layout.block_count {
+                return Err(Error::TotalBlocks(total_blocks, layout.block_count));
+            }
+            let mut header = [0u8; HEADER_BYTES];
+            header.copy_from_slice(&data[..HEADER_BYTES]);
+            items.push(Item::Start { sequence, total_blocks, header });
+            data = &data[HEADER_BYTES..];
+            continue;
+        }
+        let words = (w0 >> 16) & 0xfff;
+        if words < 2 {
+            return Err(Error::TooFewWords(words));
+        }
+        let declared = words as usize * 4;
+        if declared > data.len() {
+            return Err(Error::Truncated { declared, left: data.len() });
+        }
+        let index = w1 >> 8;
+        if index >= layout.block_count {
+            return Err(Error::BlockIndex(index, layout.block_count));
+        }
+        let bytes = &data[..declared];
+        match block_content_bytes(bytes) {
+            Some(needed) if needed <= declared => {}
+            Some(needed) => return Err(Error::Overrun { needed, declared }),
+            None => return Err(Error::Overrun { needed: declared + 1, declared }),
+        }
+        // An empty ballot zeroes the block (sent for regions that became flat).
+        items.push(Item::Block { sequence, index, bytes });
+        data = &data[declared..];
+    }
+    Ok(items)
+}
+
 pub struct Assembler {
     layout: Layout,
     max_frame_words: usize,
@@ -120,61 +182,8 @@ impl Assembler {
         &self.layout
     }
 
-    fn parse<'a>(&self, mut data: &'a [u8]) -> Result<Vec<Item<'a>>, Error> {
-        let mut items = Vec::new();
-        while !data.is_empty() {
-            if data.len() < HEADER_BYTES {
-                return Err(Error::Trailing(data.len()));
-            }
-            let w0 = u32_at(data, 0);
-            let w1 = u32_at(data, 4);
-            let sequence = ((w0 >> 28) & 7) as u8;
-            if w0 >> 31 != 0 {
-                let (w, h) = ((w0 & 0x3fff) + 1, ((w0 >> 14) & 0x3fff) + 1);
-                if (w, h) != (self.layout.width, self.layout.height) {
-                    return Err(Error::Dimensions(w, h, self.layout.width, self.layout.height));
-                }
-                let code = (w1 >> 24) & 3;
-                if code != 0 {
-                    return Err(Error::ExtendedCode(code));
-                }
-                let chroma = if (w1 >> 26) & 1 == 1 { Chroma::Yuv444 } else { Chroma::Yuv420 };
-                if chroma != self.layout.chroma {
-                    return Err(Error::ChromaMismatch);
-                }
-                let total_blocks = w1 & 0xff_ffff;
-                if total_blocks > self.layout.block_count {
-                    return Err(Error::TotalBlocks(total_blocks, self.layout.block_count));
-                }
-                items.push(Item::Start { sequence, total_blocks });
-                data = &data[HEADER_BYTES..];
-                continue;
-            }
-            let words = (w0 >> 16) & 0xfff;
-            if words < 2 {
-                return Err(Error::TooFewWords(words));
-            }
-            let declared = words as usize * 4;
-            if declared > data.len() {
-                return Err(Error::Truncated { declared, left: data.len() });
-            }
-            let index = w1 >> 8;
-            if index >= self.layout.block_count {
-                return Err(Error::BlockIndex(index, self.layout.block_count));
-            }
-            let bytes = &data[..declared];
-            match block_content_bytes(bytes) {
-                Some(needed) if needed <= declared => {}
-                Some(needed) => return Err(Error::Overrun { needed, declared }),
-                None => return Err(Error::Overrun { needed: declared + 1, declared }),
-            }
-            // A block with an empty ballot is not supposed to be sent; it carries nothing.
-            if w0 & 0xffff != 0 {
-                items.push(Item::Block { sequence, index, bytes });
-            }
-            data = &data[declared..];
-        }
-        Ok(items)
+    fn parse<'a>(&self, data: &'a [u8]) -> Result<Vec<Item<'a>>, Error> {
+        parse_items(&self.layout, data)
     }
 
     /// Frame for `sequence`, starting a new one (and retiring the current) when it is newer.
@@ -212,7 +221,7 @@ impl Assembler {
         }
         for item in items {
             match item {
-                Item::Start { sequence, total_blocks } => {
+                Item::Start { sequence, total_blocks, .. } => {
                     if let Some(f) = self.frame_for(sequence) {
                         f.total_blocks = Some(total_blocks);
                     }
@@ -239,7 +248,7 @@ impl Assembler {
     }
 
     /// The next frame to decode: one superseded by a newer sequence, else the current frame
-    /// when complete or when `force` (timeout). Missing blocks decode as zeros.
+    /// when complete or when `force` (timeout). Missing blocks keep their previous coefficients.
     pub fn take_frame(&mut self, force: bool) -> Option<Frame> {
         let frame = match self.finished.take() {
             Some(f) => f,

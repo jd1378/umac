@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use umac_proto::{
     ClientMsg, Codec, Hello, HelloReply, HostMsg, InputEvent, PROTOCOL_VERSION, WindowId, WindowInfo,
-    keys::{kVK_ANSI_Comma, kVK_ANSI_N, kVK_ANSI_O, kVK_ANSI_Q, kVK_ANSI_S, kVK_ANSI_W, kVK_Command, kVK_Escape},
+    keys::*,
 };
 use umac_transport::{
     Identity, client_endpoint,
@@ -91,6 +91,44 @@ async fn main() -> anyhow::Result<()> {
     };
     // Single steps, for careful cleanup: `focus <id>` or `key <id> esc|cmd-s|cmd-w|cmd-q|cmd-n|cmd-o|cmd-comma`.
     let rest: Vec<String> = std::env::args().skip(2).collect();
+    // `type <id> <text>`: lower case letters, space, return, `-`, `/` and `.`, one key every
+    // 120 ms (typing test).
+    if app == "type" {
+        let window: WindowId = rest.first().ok_or_else(|| anyhow::anyhow!("window id missing"))?.parse()?;
+        write_msg(&mut send, &ClientMsg::Focus { window }).await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let letters = [
+            kVK_ANSI_A, kVK_ANSI_B, kVK_ANSI_C, kVK_ANSI_D, kVK_ANSI_E, kVK_ANSI_F, kVK_ANSI_G, kVK_ANSI_H, kVK_ANSI_I, kVK_ANSI_J, kVK_ANSI_K, kVK_ANSI_L, kVK_ANSI_M,
+            kVK_ANSI_N, kVK_ANSI_O, kVK_ANSI_P, kVK_ANSI_Q, kVK_ANSI_R, kVK_ANSI_S, kVK_ANSI_T, kVK_ANSI_U, kVK_ANSI_V, kVK_ANSI_W, kVK_ANSI_X, kVK_ANSI_Y, kVK_ANSI_Z,
+        ];
+        for c in rest.get(1).map(String::as_str).unwrap_or("").chars() {
+            let key = match c {
+                'a'..='z' => letters[(c as u8 - b'a') as usize],
+                ' ' => kVK_Space,
+                '\n' => kVK_Return,
+                '-' => kVK_ANSI_Minus,
+                '/' => kVK_ANSI_Slash,
+                '.' => kVK_ANSI_Period,
+                _ => continue,
+            };
+            chord(&mut input, window, key, false).await?;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        let _ = input.finish();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        return Ok(());
+    }
+    // `close <id>`: press the window's close button through Accessibility (no keyboard).
+    if app == "close" {
+        let window: WindowId = rest.first().ok_or_else(|| anyhow::anyhow!("window id missing"))?.parse()?;
+        // The host only closes windows this session streams.
+        write_msg(&mut send, &ClientMsg::Subscribe { window, max_fps: 1, bitrate_kbps: 1000 }).await?;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        write_msg(&mut send, &ClientMsg::CloseWindow { window }).await?;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        println!("close {window} sent");
+        return Ok(());
+    }
     if app == "focus" || app == "key" {
         let window: WindowId = rest.first().ok_or_else(|| anyhow::anyhow!("window id missing"))?.parse()?;
         if app == "focus" {

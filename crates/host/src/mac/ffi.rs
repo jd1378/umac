@@ -127,13 +127,9 @@ unsafe extern "C" {
         attributes: CFDictionaryRef,
         out: *mut CVPixelBufferRef,
     ) -> i32;
-    #[cfg(test)]
     pub fn CVPixelBufferLockBaseAddress(buffer: CVPixelBufferRef, flags: u64) -> i32;
-    #[cfg(test)]
     pub fn CVPixelBufferUnlockBaseAddress(buffer: CVPixelBufferRef, flags: u64) -> i32;
-    #[cfg(test)]
     pub fn CVPixelBufferGetBaseAddressOfPlane(buffer: CVPixelBufferRef, plane: usize) -> *mut u8;
-    #[cfg(test)]
     pub fn CVPixelBufferGetBytesPerRowOfPlane(buffer: CVPixelBufferRef, plane: usize) -> usize;
     #[cfg(test)]
     pub static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
@@ -142,8 +138,15 @@ unsafe extern "C" {
     pub static kCVImageBufferYCbCrMatrix_ITU_R_709_2: CFStringRef;
 }
 
+#[link(name = "ScreenCaptureKit", kind = "framework")]
+unsafe extern "C" {
+    /// Sample attachment key: the regions that changed since the previous frame.
+    pub static SCStreamFrameInfoDirtyRects: CFStringRef;
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
+    pub fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut core_graphics::geometry::CGRect) -> bool;
     pub fn CGPreflightScreenCaptureAccess() -> bool;
     pub fn CGRequestScreenCaptureAccess() -> bool;
 }

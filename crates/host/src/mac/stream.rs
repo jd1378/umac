@@ -38,6 +38,8 @@ pub struct StreamParams {
     pub pyro_bpp_milli: u32,
     /// PyroWave rate cap in bytes per frame for a changing window.
     pub pyro_cap_bytes: u32,
+    /// Send only the blocks touching changed regions.
+    pub pyro_changed_only: bool,
     /// Largest datagram the connection carries, for PyroWave packet sizes.
     pub max_datagram: u32,
 }
@@ -69,8 +71,11 @@ struct Shared {
 }
 
 impl Shared {
-    fn captured(&self, buffer: *mut c_void, now: u64) {
+    fn captured(&self, buffer: *mut c_void, now: u64, dirty: Option<Vec<[f64; 4]>>) {
         self.refined.store(false, Ordering::Relaxed);
+        if let Ok(mut d) = self.knobs.dirty.lock() {
+            *d = dirty;
+        }
         self.submit(buffer, now);
     }
 
@@ -79,6 +84,7 @@ impl Shared {
         knobs.bpp_milli.store(params.pyro_bpp_milli, Ordering::Relaxed);
         knobs.target_milli.store(params.pyro_bpp_milli, Ordering::Relaxed);
         knobs.cap_bytes.store(params.pyro_cap_bytes, Ordering::Relaxed);
+        knobs.changed_only.store(params.pyro_changed_only, Ordering::Relaxed);
         knobs.packet_boundary.store(packet_boundary(params.max_datagram), Ordering::Relaxed);
         Arc::new(Self {
             params,
@@ -170,7 +176,7 @@ impl WindowStream {
     pub fn start(window: &SCWindow, params: StreamParams, inset: f64, on_encoded: OnEncoded) -> anyhow::Result<Self> {
         let shared = Shared::new(params, on_encoded);
         let s = shared.clone();
-        let (capture, size) = WindowCapture::start(window, params.fps, inset, Box::new(move |buf, t| s.captured(buf, t)))?;
+        let (capture, size) = WindowCapture::start(window, params.fps, inset, Box::new(move |buf, t, dirty| s.captured(buf, t, dirty)))?;
         Ok(Self { capture, shared, size })
     }
 
@@ -178,7 +184,7 @@ impl WindowStream {
     pub fn start_region(display: &SCDisplay, rect: Rect, params: StreamParams, on_encoded: OnEncoded) -> anyhow::Result<Self> {
         let shared = Shared::new(params, on_encoded);
         let s = shared.clone();
-        let (capture, size) = WindowCapture::start_region(display, rect, params.fps, Box::new(move |buf, t| s.captured(buf, t)))?;
+        let (capture, size) = WindowCapture::start_region(display, rect, params.fps, Box::new(move |buf, t, dirty| s.captured(buf, t, dirty)))?;
         Ok(Self { capture, shared, size })
     }
 
@@ -186,7 +192,7 @@ impl WindowStream {
     pub fn start_display(display: &SCDisplay, params: StreamParams, on_encoded: OnEncoded) -> anyhow::Result<Self> {
         let shared = Shared::new(params, on_encoded);
         let s = shared.clone();
-        let (capture, size) = WindowCapture::start_display(display, params.fps, Box::new(move |buf, t| s.captured(buf, t)))?;
+        let (capture, size) = WindowCapture::start_display(display, params.fps, Box::new(move |buf, t, dirty| s.captured(buf, t, dirty)))?;
         Ok(Self { capture, shared, size })
     }
 

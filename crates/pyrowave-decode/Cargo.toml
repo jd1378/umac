@@ -5,10 +5,16 @@ edition.workspace = true
 license.workspace = true
 description = "Rust and wgpu reimplementation of the PyroWave (bitstream v1) decoder"
 
+[features]
+default = ["gpu"]
+# The wgpu decoder. Without it the crate is the bitstream parser and the subset helpers the
+# sender uses.
+gpu = ["dep:wgpu", "dep:bytemuck"]
+
 [dependencies]
-bytemuck = "=1.25.2"
+bytemuck = { version = "=1.25.2", optional = true }
 thiserror = "=2.0.21"
-wgpu = "=30.0.1"
+wgpu = { version = "=30.0.1", optional = true }
 
 [dev-dependencies]
 pollster = "=1.0.1"

@@ -271,7 +271,7 @@ impl GpuDecoder {
         (&self.luma.texture, &self.chroma.texture)
     }
 
-    /// Records the decode of `frame` into `encoder`. Missing blocks decode as zeros.
+    /// Records the decode of `frame` into `encoder`. Absent blocks keep their previous coefficients (zeros after creation).
     pub fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, frame: &Frame) {
         // A few spare words: the shader's bounds checks never read them, but a binding must be non-empty.
         let needed = (frame.words.len() as u64 + 4) * 4;

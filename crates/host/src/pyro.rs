@@ -7,6 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use umac_pyrowave_decode::select::Rect;
+
 /// Most datagrams one encoder packet may be split over; more means a broken packet size.
 const MAX_PIECES: usize = 8;
 
@@ -43,6 +45,74 @@ pub const MIN_BPP: f64 = 0.5;
 
 pub fn frame_bytes(width: u32, height: u32, bpp: f64) -> usize {
     (width as f64 * height as f64 * bpp / 8.0) as usize
+}
+
+/// Changed regions from ScreenCaptureKit (`[x, y, w, h]`, surface pixels) as rectangles
+/// clipped to the surface. `None` (send everything) when a rect lies clearly outside the
+/// surface, which would mean the coordinates are not what this assumes.
+pub fn dirty_to_surface(raw: &[[f64; 4]], width: u32, height: u32) -> Option<Vec<Rect>> {
+    let (w, h) = (width as f64, height as f64);
+    let mut out = Vec::with_capacity(raw.len());
+    for &[x, y, rw, rh] in raw {
+        if !(x.is_finite() && y.is_finite() && rw.is_finite() && rh.is_finite()) || x < -2.0 || y < -2.0 || x + rw > w + 2.0 || y + rh > h + 2.0 {
+            return None;
+        }
+        let r = Rect { x0: x.floor().max(0.0) as i64, y0: y.floor().max(0.0) as i64, x1: (x + rw).ceil().min(w) as i64, y1: (y + rh).ceil().min(h) as i64 };
+        if r.x1 > r.x0 && r.y1 > r.y0 {
+            out.push(r);
+        }
+    }
+    Some(out)
+}
+
+/// Luma pixels per side of the tiles compared by [`changed_tiles`].
+pub const TILE: usize = 16;
+
+/// One NV12 frame as CPU readable planes: luma and interleaved CbCr, with their row strides.
+pub struct Nv12<'a> {
+    pub y: &'a [u8],
+    pub y_stride: usize,
+    pub uv: &'a [u8],
+    pub uv_stride: usize,
+}
+
+/// Regions that differ between two frames of `width` x `height`, as `TILE` sized tiles merged
+/// into runs along each tile row. Captured pixels of unchanged content are byte identical, so
+/// this is exact; it replaces ScreenCaptureKit's dirty rects where those cover the whole frame
+/// (window captures report every frame as fully dirty).
+pub fn changed_tiles(prev: &Nv12, cur: &Nv12, width: usize, height: usize) -> Vec<Rect> {
+    let mut out = Vec::new();
+    let differs = |tx: usize, ty: usize| {
+        let (x0, x1) = (tx * TILE, ((tx + 1) * TILE).min(width));
+        let (y0, y1) = (ty * TILE, ((ty + 1) * TILE).min(height));
+        let luma = (y0..y1).any(|y| prev.y[y * prev.y_stride + x0..y * prev.y_stride + x1] != cur.y[y * cur.y_stride + x0..y * cur.y_stride + x1]);
+        luma || (y0 / 2..y1.div_ceil(2)).any(|y| {
+            let (a, b) = (x0 & !1, x1.next_multiple_of(2).min(width.next_multiple_of(2)));
+            prev.uv[y * prev.uv_stride + a..y * prev.uv_stride + b] != cur.uv[y * cur.uv_stride + a..y * cur.uv_stride + b]
+        })
+    };
+    for ty in 0..height.div_ceil(TILE) {
+        let mut run: Option<usize> = None;
+        for tx in 0..=width.div_ceil(TILE) {
+            let changed = tx < width.div_ceil(TILE) && differs(tx, ty);
+            match (changed, run) {
+                (true, None) => run = Some(tx),
+                (false, Some(start)) => {
+                    let y1 = ((ty + 1) * TILE).min(height);
+                    out.push(Rect { x0: (start * TILE) as i64, y0: (ty * TILE) as i64, x1: ((tx * TILE).min(width)) as i64, y1: y1 as i64 });
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Share of the frame the rects cover (overlaps counted twice, which only overestimates).
+pub fn coverage(rects: &[Rect], width: u32, height: u32) -> f64 {
+    let area: i64 = rects.iter().map(|r| (r.x1 - r.x0) * (r.y1 - r.y0)).sum();
+    area as f64 / (width as f64 * height as f64).max(1.0)
 }
 
 /// Quality of the one-off frame sent when a window stops changing; static content then looks
@@ -165,5 +235,33 @@ mod tests {
         assert_eq!(budget(1920, 1080, 1.5, 3.0, cap, true), frame_bytes(1920, 1080, REFINE_BPP));
         // Tiny windows never drop below the floor.
         assert_eq!(budget(40, 40, 0.5, 3.0, cap, false), 4096);
+    }
+
+    #[test]
+    fn dirty_rects_clip_and_reject_outliers() {
+        let r = dirty_to_surface(&[[10.2, 5.0, 20.0, 3.5], [0.0, 0.0, 0.0, 4.0], [1910.0, 1070.0, 11.0, 11.0]], 1920, 1080).unwrap();
+        assert_eq!(r, vec![Rect { x0: 10, y0: 5, x1: 31, y1: 9 }, Rect { x0: 1910, y0: 1070, x1: 1920, y1: 1080 }]);
+        assert!(dirty_to_surface(&[[0.0, 0.0, 3840.0, 2160.0]], 1920, 1080).is_none());
+        assert_eq!(dirty_to_surface(&[], 10, 10), Some(vec![]));
+    }
+
+    #[test]
+    fn changed_tiles_finds_exactly_the_edited_tiles() {
+        let (w, h) = (100usize, 40usize);
+        let (ys, uvs) = (112usize, 112usize);
+        let prev_y = vec![10u8; ys * h];
+        let prev_uv = vec![128u8; uvs * h / 2];
+        let mut cur_y = prev_y.clone();
+        let mut cur_uv = prev_uv.clone();
+        // Two luma pixels in tiles (1, 0) and (2, 0), and one chroma sample in tile (5, 2).
+        cur_y[3 * ys + 20] = 11;
+        cur_y[5 * ys + 40] = 11;
+        cur_uv[17 * uvs + 82] = 1;
+        let frame = |y: &'static [u8], uv: &'static [u8]| Nv12 { y, y_stride: ys, uv, uv_stride: uvs };
+        let (py, puv, cy, cuv) = (prev_y.leak(), prev_uv.leak(), cur_y.leak(), cur_uv.leak());
+        let r = changed_tiles(&frame(py, puv), &frame(cy, cuv), w, h);
+        assert_eq!(r, vec![Rect { x0: 16, y0: 0, x1: 48, y1: 16 }, Rect { x0: 80, y0: 32, x1: 96, y1: 40 }]);
+        assert!(changed_tiles(&frame(py, puv), &frame(py, puv), w, h).is_empty());
+        assert!((coverage(&r, 100, 40) - (32.0 * 16.0 + 16.0 * 8.0) / 4000.0).abs() < 1e-9);
     }
 }

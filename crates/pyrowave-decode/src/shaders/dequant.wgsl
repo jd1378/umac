@@ -3,7 +3,8 @@
 // Copyright (c) 2025 Hans-Kristian Arntzen
 // SPDX-License-Identifier: MIT
 // Changes: WGSL without subgroup operations (prefix sums in workgroup memory), every payload
-// read bounded to the block's own words, output to a linear f32 buffer.
+// read bounded to the block's own words, output to a linear f32 buffer, absent blocks keep
+// their previous coefficients.
 
 struct Params {
     block_count: u32,
@@ -175,9 +176,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         }
     }
 
+    // An absent block keeps the coefficients of the previous frame (the sender only sends
+    // what changed, and a lost block is better stale than zeroed).
     for (var k = 0u; k < 8u; k++) {
         let p = origin + vec2<u32>(k >> 1u, k & 1u);
-        if (p.x < info.band_width && p.y < info.band_height) {
+        if (off != MISSING && p.x < info.band_width && p.y < info.band_height) {
             coef[info.coef_offset + p.y * info.band_width + p.x] = values[k] * scale;
         }
     }

@@ -154,3 +154,65 @@ fn missing_blocks_still_decode() {
     println!("partial frame luma psnr {p:.1}");
     assert!(p > 15.0);
 }
+
+/// Decodes frame A fully, then a changed frame as the sender would send it: only the blocks
+/// touching the dirty rects. The result must match decoding the whole changed frame; without
+/// the synthesis spread a change next to a block edge leaves a seam.
+/// B: A with a text-line sized stripe pattern (96..176 x 60..72, chroma tinted under it) and an
+/// inverted cursor sized patch (250..262 x 118..136). C: A with an 8x8 patch at 120..128, right
+/// at a level 0 block edge. Both encoded by PyroWave's Metal encoder at 21600 bytes.
+#[test]
+fn changed_region_subset_matches_full_frame() {
+    use umac_pyrowave_decode::select::{Rect, area, rebuild};
+    let Some((device, queue)) = gpu() else { return };
+    let layout = Layout::new(320, 180, Chroma::Yuv420).unwrap();
+    let a = frames(&std::fs::read(testdata("320x180.420.b21600.pkts")).unwrap()).remove(0);
+    let decode = |dec: &mut GpuDecoder, packets: &[Vec<u8>]| {
+        let mut asm = Assembler::new(layout.clone(), default_frame_cap(&layout));
+        for p in packets {
+            asm.push_packet(p).unwrap();
+        }
+        dec.decode(&device, &queue, &asm.take_frame(false).expect("complete"));
+        let (yt, ct) = dec.textures();
+        [read_texture(&device, &queue, yt, 1), read_texture(&device, &queue, ct, 2)].concat()
+    };
+    let cases: [(&str, &[Rect]); 2] = [
+        ("B", &[Rect { x0: 96, y0: 60, x1: 176, y1: 72 }, Rect { x0: 250, y0: 118, x1: 262, y1: 136 }]),
+        ("C", &[Rect { x0: 120, y0: 120, x1: 128, y1: 128 }]),
+    ];
+    for (name, dirty) in cases {
+        let changed = frames(&std::fs::read(testdata(&format!("320x180.420.b21600.{name}.pkts"))).unwrap()).remove(0);
+        let subset = |spread: bool| -> Vec<Vec<u8>> {
+            let keep: Vec<bool> = (0..layout.block_count).map(|i| dirty.iter().any(|d| d.intersects(&area(&layout, i, spread).unwrap()))).collect();
+            let data = changed.concat();
+            let mut ranges = Vec::new();
+            let mut at = 0;
+            for p in &changed {
+                ranges.push(at..at + p.len());
+                at += p.len();
+            }
+            let r = rebuild(&layout, &data, &ranges, &keep, 1400).unwrap();
+            println!("{name} spread={spread}: {} of {} blocks, {} of {} bytes", r.kept, r.total, r.data.len(), data.len());
+            r.packets.iter().map(|p| r.data[p.clone()].to_vec()).collect()
+        };
+        let full = decode(&mut GpuDecoder::new(&device, &queue, layout.clone()).unwrap(), &changed);
+        let run = |spread: bool| {
+            let mut dec = GpuDecoder::new(&device, &queue, layout.clone()).unwrap();
+            decode(&mut dec, &a);
+            decode(&mut dec, &subset(spread))
+        };
+        let (good, seams) = (run(true), run(false));
+        let max = |x: &[u8]| x.iter().zip(&full).map(|(&p, &q)| p.abs_diff(q)).max().unwrap();
+        println!(
+            "{name}: with spread max diff {} psnr {:.1}; without max diff {} psnr {:.1}",
+            max(&good),
+            psnr(&good, &full),
+            max(&seams),
+            psnr(&seams, &full)
+        );
+        assert!(psnr(&good, &full) > 40.0, "{name}");
+        if name == "C" {
+            assert!(psnr(&seams, &full) < psnr(&good, &full) - 3.0, "the synthesis spread should matter");
+        }
+    }
+}

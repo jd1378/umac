@@ -13,9 +13,11 @@ use umac_proto::WindowId;
 
 use crate::clock;
 
-/// Called on the capture queue with a borrowed `CVPixelBufferRef` (NV12, BT.709 limited)
-/// and its capture time. The buffer is only valid during the call unless retained.
-pub type FrameCallback = Box<dyn Fn(*mut c_void, u64) + Send + Sync>;
+/// Called on the capture queue with a borrowed `CVPixelBufferRef` (NV12, BT.709 limited),
+/// its capture time and the regions that changed since the previous frame (`[x, y, w, h]` as
+/// ScreenCaptureKit reports them; `None` when it does not say). The buffer is only valid
+/// during the call unless retained.
+pub type FrameCallback = Box<dyn Fn(*mut c_void, u64, Option<Vec<[f64; 4]>>) + Send + Sync>;
 
 /// Global rectangle in points.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -122,6 +124,44 @@ fn apply_region(config: &mut SCStreamConfiguration, rect: Rect, display: (f64, f
     size
 }
 
+/// The `SCStreamFrameInfoDirtyRects` attachment as `[x, y, w, h]` rectangles. ScreenCaptureKit
+/// stores them as CGRect dictionaries, which the crate's reader does not decode.
+fn dirty_rects(sample: *mut c_void) -> Option<Vec<[f64; 4]>> {
+    use core_foundation::{
+        array::CFArray,
+        base::{CFType, TCFType},
+        dictionary::CFDictionary,
+        string::CFString,
+    };
+    use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+
+    use super::ffi::{CGRectMakeWithDictionaryRepresentation, CMSampleBufferGetSampleAttachmentsArray, SCStreamFrameInfoDirtyRects};
+    // SAFETY: `sample` is the live sample buffer of this callback; the returned array and
+    // its elements are borrowed (get rule) and only read here.
+    unsafe {
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, 0);
+        if attachments.is_null() {
+            return None;
+        }
+        let attachments: CFArray<CFType> = CFArray::wrap_under_get_rule(attachments);
+        let first = attachments.get(0)?;
+        let info = first.downcast::<CFDictionary>()?;
+        let info: CFDictionary<CFString, CFType> = CFDictionary::wrap_under_get_rule(info.as_concrete_TypeRef());
+        let list = info.find(CFString::wrap_under_get_rule(SCStreamFrameInfoDirtyRects))?.downcast::<CFArray>()?;
+        let list: CFArray<CFType> = CFArray::wrap_under_get_rule(list.as_concrete_TypeRef());
+        let mut out = Vec::with_capacity(list.len() as usize);
+        for item in list.iter() {
+            let Some(dict) = item.downcast::<CFDictionary>() else { continue };
+            let mut r = CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(0.0, 0.0));
+            if CGRectMakeWithDictionaryRepresentation(dict.as_concrete_TypeRef(), &mut r) {
+                out.push([r.origin.x, r.origin.y, r.size.width, r.size.height]);
+            }
+        }
+        // A delivered frame with no changed region would be odd; send it whole then.
+        (!out.is_empty()).then_some(out)
+    }
+}
+
 fn open_stream(filter: &SCContentFilter, config: &SCStreamConfiguration, on_frame: FrameCallback) -> anyhow::Result<SCStream> {
     let mut stream = SCStream::new(filter, config).map_err(|e| anyhow!("creating stream: {e}"))?;
     stream
@@ -143,7 +183,8 @@ fn open_stream(filter: &SCContentFilter, config: &SCStreamConfiguration, on_fram
                     if let Some(t) = shown {
                         note_display_offset(arrival as i64 - t as i64);
                     }
-                    on_frame(buffer, shown.unwrap_or(arrival));
+                    let dirty = dirty_rects(sample.as_ptr());
+                    on_frame(buffer, shown.unwrap_or(arrival), dirty);
                 }
             },
             SCStreamOutputType::Screen,

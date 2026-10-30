@@ -3332,6 +3332,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "umac-proto",
+ "umac-pyrowave-decode",
  "umac-transport",
 ]
 

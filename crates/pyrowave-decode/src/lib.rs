@@ -5,10 +5,13 @@
 //! The shaders are ported from PyroWave by Hans-Kristian Arntzen (MIT), see `NOTICE`.
 
 pub mod bitstream;
+#[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod layout;
+pub mod select;
 
 pub use bitstream::{Assembler, Error, Frame};
+#[cfg(feature = "gpu")]
 pub use gpu::GpuDecoder;
 pub use layout::{Chroma, Layout};
 

@@ -17,6 +17,10 @@ use std::{
 };
 
 use anyhow::{anyhow, bail};
+use umac_pyrowave_decode::{
+    Chroma, Layout,
+    select::{self, Selector},
+};
 
 use super::ffi::CVPixelBufferRef;
 use crate::{
@@ -160,6 +164,14 @@ pub struct Knobs {
     pub oversized: AtomicU64,
     /// Encode call durations in microseconds (submit to packets ready), drained by the session.
     pub encode_us: Mutex<Vec<u32>>,
+    /// Send only blocks touching changed regions.
+    pub changed_only: std::sync::atomic::AtomicBool,
+    /// Changed regions of the frame being submitted, as ScreenCaptureKit reported them.
+    pub dirty: Mutex<Option<Vec<[f64; 4]>>>,
+    /// Blocks sent and blocks in the frames, and bytes sent, since the session last drained them.
+    pub kept_blocks: AtomicU64,
+    pub total_blocks: AtomicU64,
+    pub sent_bytes: AtomicU64,
 }
 
 pub struct PyroEncoder {
@@ -168,6 +180,63 @@ pub struct PyroEncoder {
     sink: FrameSink,
     knobs: Arc<Knobs>,
     packets: Vec<sys::pyrowave_packet>,
+    layout: Layout,
+    selector: Selector,
+    /// The receiver has a complete picture (a full frame went out since this encoder started).
+    sent_full: bool,
+    /// The previous captured frame, to find changed tiles when ScreenCaptureKit reports the
+    /// whole frame as dirty.
+    previous: Option<Retained>,
+}
+
+/// A retained CVPixelBuffer.
+struct Retained(CVPixelBufferRef);
+
+impl Drop for Retained {
+    fn drop(&mut self) {
+        // SAFETY: retained in `retain`.
+        unsafe { super::ffi::CVPixelBufferRelease(self.0) }
+    }
+}
+
+fn retain(buffer: CVPixelBufferRef) -> Retained {
+    // SAFETY: `buffer` is a live CVPixelBuffer (caller).
+    Retained(unsafe { super::ffi::CVPixelBufferRetain(buffer) })
+}
+
+/// Changed tiles between two NV12 buffers of the same size, read on the CPU.
+fn diff_frames(prev: CVPixelBufferRef, cur: CVPixelBufferRef, width: u32, height: u32) -> Option<Vec<umac_pyrowave_decode::select::Rect>> {
+    use super::ffi::{CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferUnlockBaseAddress};
+    const READ_ONLY: u64 = 1;
+    let (w, h) = (width as usize, height as usize);
+    // SAFETY: both buffers are live NV12 CVPixelBuffers of `width` x `height` (the encoder only
+    // compares frames of its own size); they stay locked read-only while the slices exist.
+    unsafe {
+        if CVPixelBufferLockBaseAddress(prev, READ_ONLY) != 0 {
+            return None;
+        }
+        if CVPixelBufferLockBaseAddress(cur, READ_ONLY) != 0 {
+            CVPixelBufferUnlockBaseAddress(prev, READ_ONLY);
+            return None;
+        }
+        let plane = |b: CVPixelBufferRef, p: usize, rows: usize| -> Option<(&[u8], usize)> {
+            let base = CVPixelBufferGetBaseAddressOfPlane(b, p);
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(b, p);
+            (!base.is_null() && stride >= w).then(|| (std::slice::from_raw_parts(base as *const u8, stride * rows), stride))
+        };
+        let frames = (|| {
+            let (py, pys) = plane(prev, 0, h)?;
+            let (puv, puvs) = plane(prev, 1, h / 2)?;
+            let (cy, cys) = plane(cur, 0, h)?;
+            let (cuv, cuvs) = plane(cur, 1, h / 2)?;
+            let a = pyro::Nv12 { y: py, y_stride: pys, uv: puv, uv_stride: puvs };
+            let b = pyro::Nv12 { y: cy, y_stride: cys, uv: cuv, uv_stride: cuvs };
+            Some(pyro::changed_tiles(&a, &b, w, h))
+        })();
+        CVPixelBufferUnlockBaseAddress(cur, READ_ONLY);
+        CVPixelBufferUnlockBaseAddress(prev, READ_ONLY);
+        frames
+    }
 }
 
 // SAFETY: the encoder handle is only used through `&mut self`, one thread at a time.
@@ -187,7 +256,9 @@ impl PyroEncoder {
         let mut enc = std::ptr::null_mut();
         // SAFETY: valid info (device lives forever) and out pointer.
         check(unsafe { sys::pyrowave_encoder_create(&info, &mut enc) }, "creating the PyroWave encoder")?;
-        Ok(Self { enc, cfg, sink, knobs, packets: Vec::new() })
+        let layout = Layout::new(cfg.width, cfg.height, Chroma::Yuv420).map_err(|e| anyhow!("PyroWave layout: {e}"))?;
+        let selector = Selector::new(&layout);
+        Ok(Self { enc, cfg, sink, knobs, packets: Vec::new(), layout, selector, sent_full: false, previous: None })
     }
 }
 
@@ -203,8 +274,9 @@ impl Encoder for PyroEncoder {
         self.cfg
     }
 
-    /// Intra-only: every frame decodes on its own, so `force_keyframe` has nothing to do.
-    fn encode(&mut self, frame: *mut c_void, capture_us: u64, _force_keyframe: bool) -> anyhow::Result<()> {
+    /// Intra-only, but the receiver keeps blocks that are not sent, so `force_keyframe` (like
+    /// a refine frame or the first frame) sends every block.
+    fn encode(&mut self, frame: *mut c_void, capture_us: u64, force_keyframe: bool) -> anyhow::Result<()> {
         // SAFETY: `frame` is a live CVPixelBuffer for the duration of this call (caller).
         let surface = unsafe { CVPixelBufferGetIOSurface(frame) };
         if surface.is_null() {
@@ -245,9 +317,6 @@ impl Encoder for PyroEncoder {
                 bail!("encoder reported a packet outside its buffer");
             };
             end = end.max(stop);
-            if p.size > boundary {
-                self.knobs.oversized.fetch_add(1, Ordering::Relaxed);
-            }
             ranges.push(p.offset..stop);
         }
         if let Ok(mut v) = self.knobs.encode_us.lock()
@@ -256,6 +325,28 @@ impl Encoder for PyroEncoder {
             v.push(started.elapsed().as_micros() as u32);
         }
         data.truncate(end);
+        let dirty = self.knobs.dirty.lock().ok().and_then(|mut d| d.take());
+        let (w, h) = (self.cfg.width, self.cfg.height);
+        let rects = match dirty.as_deref().and_then(|d| pyro::dirty_to_surface(d, w, h)) {
+            Some(r) if pyro::coverage(&r, w, h) < 0.5 => Some(r),
+            _ => self.previous.as_ref().and_then(|p| diff_frames(p.0, frame, w, h)),
+        };
+        self.previous = Some(retain(frame));
+        let full = refine || force_keyframe || !self.sent_full || !self.knobs.changed_only.load(Ordering::Relaxed);
+        let keep = self.selector.keep(rects.as_deref(), full);
+        match select::rebuild(&self.layout, &data, &ranges, &keep, boundary) {
+            Ok(r) => {
+                tracing::debug!(kept = r.kept, total = r.total, bytes = r.data.len(), encoded = data.len(), full, rects = rects.as_ref().map(Vec::len), sck_rects = dirty.as_ref().map(Vec::len), "PyroWave frame");
+                self.knobs.kept_blocks.fetch_add(r.kept as u64, Ordering::Relaxed);
+                self.knobs.total_blocks.fetch_add(r.total as u64, Ordering::Relaxed);
+                self.knobs.sent_bytes.fetch_add(r.data.len() as u64, Ordering::Relaxed);
+                self.sent_full |= keep.iter().all(|&k| k);
+                (data, ranges) = (r.data, r.packets);
+            }
+            Err(e) => tracing::warn!("PyroWave subset failed, sending the whole frame: {e}"),
+        }
+        let oversized = ranges.iter().filter(|r| r.len() > boundary).count() as u64;
+        self.knobs.oversized.fetch_add(oversized, Ordering::Relaxed);
         let pyro = PyroFrame { packets: ranges, width: self.cfg.width as u16, height: self.cfg.height as u16, chroma_444: false };
         (self.sink)(EncodedFrame { data, keyframe: true, capture_us, encoded_us, pyro: Some(pyro) });
         Ok(())

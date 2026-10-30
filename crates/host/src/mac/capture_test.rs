@@ -38,7 +38,7 @@ pub fn run(spec: &str, seconds: u64, out: &Path, codec: Codec, bitrate_kbps: u32
     let (f, s) = (file.clone(), stats.clone());
     let stream = WindowStream::start(
         &window,
-        StreamParams { window: id, codec, fps, bitrate_kbps, pyro_bpp_milli: (crate::config::Settings::load().pyrowave_bpp * 1000.0) as u32, pyro_cap_bytes: (crate::config::Settings::load().pyrowave_max_mbps * 1e6 / 8.0 / fps.max(1) as f64) as u32, max_datagram: 1400 },
+        StreamParams { window: id, codec, fps, bitrate_kbps, pyro_bpp_milli: (crate::config::Settings::load().pyrowave_bpp * 1000.0) as u32, pyro_cap_bytes: (crate::config::Settings::load().pyrowave_max_mbps * 1e6 / 8.0 / fps.max(1) as f64) as u32, pyro_changed_only: true, max_datagram: 1400 },
         0.0,
         Arc::new(move |_, frame| {
             let lat = clock::now_us().saturating_sub(frame.capture_us);

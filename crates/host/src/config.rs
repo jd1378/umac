@@ -52,6 +52,8 @@ pub struct Settings {
     pub pyrowave_bpp: f64,
     /// Rate cap per changing PyroWave stream in Mbit/s (about 1.6 bpp at 1080p60 for 200).
     pub pyrowave_max_mbps: f64,
+    /// Send only the PyroWave blocks touching changed regions (off: every block, for A/B).
+    pub pyrowave_changed_only: bool,
     /// Codec preference, most preferred first; the first one the client also supports wins.
     pub codecs: Vec<Codec>,
 }
@@ -67,6 +69,7 @@ impl Default for Settings {
             log: "info".into(),
             pyrowave_bpp: 3.0,
             pyrowave_max_mbps: 200.0,
+            pyrowave_changed_only: true,
             codecs: vec![Codec::PyroWave, Codec::Hevc, Codec::H264],
         }
     }

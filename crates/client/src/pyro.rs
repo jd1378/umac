@@ -1,6 +1,6 @@
 //! PyroWave receive side: joins datagram pieces into encoder packets, validates them into
 //! frames, decides when a frame is ready, and counts loss for `VideoFeedback`. No keyframes:
-//! a frame is decoded with whatever arrived and missing blocks blur locally.
+//! a frame is decoded with whatever arrived; missing blocks keep their previous content.
 
 use std::time::{Duration, Instant};
 

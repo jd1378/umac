@@ -605,7 +605,18 @@ impl Session {
                 times.sort_unstable();
                 let pct = |p: f64| times[((times.len() - 1) as f64 * p) as usize] as f64 / 1000.0;
                 let split = k.oversized.swap(0, Ordering::Relaxed);
-                tracing::info!(window, frames = times.len(), p50 = format_args!("{:.2}", pct(0.5)), p95 = format_args!("{:.2}", pct(0.95)), split, "PyroWave encode ms");
+                let (kept, total) = (k.kept_blocks.swap(0, Ordering::Relaxed), k.total_blocks.swap(0, Ordering::Relaxed).max(1));
+                let kb_per_frame = k.sent_bytes.swap(0, Ordering::Relaxed) as f64 / 1024.0 / times.len() as f64;
+                tracing::info!(
+                    window,
+                    frames = times.len(),
+                    p50 = format_args!("{:.2}", pct(0.5)),
+                    p95 = format_args!("{:.2}", pct(0.95)),
+                    split,
+                    blocks_sent = format_args!("{:.1}%", 100.0 * kept as f64 / total as f64),
+                    kb_per_frame = format_args!("{kb_per_frame:.1}"),
+                    "PyroWave encode ms"
+                );
             } else if let Ok(mut v) = k.encode_us.lock() {
                 v.extend(times);
             }
@@ -763,6 +774,7 @@ impl Session {
             bitrate_kbps: self.shared.settings.clamp_bitrate(bitrate_kbps),
             pyro_bpp_milli: self.pyro_params().0,
             pyro_cap_bytes: self.pyro_cap_bytes(max_fps as u32),
+            pyro_changed_only: self.shared.settings.pyrowave_changed_only,
             max_datagram: self.pyro_params().1,
         };
         self.start_window(params, WindowKind::Normal, None, false, send).await.map(|_| ())
@@ -1005,6 +1017,7 @@ impl Session {
             bitrate_kbps: self.shared.settings.clamp_bitrate(bitrate_kbps),
             pyro_bpp_milli: self.pyro_params().0,
             pyro_cap_bytes: self.pyro_cap_bytes(max_fps as u32),
+            pyro_changed_only: self.shared.settings.pyrowave_changed_only,
             max_datagram: self.pyro_params().1,
         };
         let tx = self.frames_tx.clone();
