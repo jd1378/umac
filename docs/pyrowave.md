@@ -4,7 +4,7 @@
 treated as untrusted until the following are done.
 
 Static audit of upstream commit `7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b` (read only,
-nothing built or run). Upstream issue drafts live in `../pyrowave_issues/`.
+nothing built or run). The findings were drafted as upstream issues.
 
 Findings that block integration:
 

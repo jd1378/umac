@@ -1,147 +1,150 @@
 # umac
 
-Streams individual macOS windows to a Linux PC, each as its own native window, with
-hardware HEVC encode (VideoToolbox) and decode (VA-API) over a pinned-certificate QUIC link.
+Use apps from a headless Mac on your Linux desktop. Each Mac window opens as its own native
+window on Linux, with hardware video encoding on the Mac (VideoToolbox HEVC) and hardware
+decoding on the PC (VA-API, zero-copy into Vulkan), over an encrypted, certificate-pinned
+QUIC link on your LAN.
 
-- `crates/proto`: wire types.
-- `crates/transport`: QUIC endpoints, cert pinning, framing, FEC video datagrams.
-- `crates/host`: `umac-host` for the Mac (capture, encode, input, setup wizard).
-- `crates/client`: `umac` for Linux (decode, one window per remote window, input).
+- Separate windows, not a remote desktop: menus, dropdowns, dialogs and sheets appear where
+  they belong; new windows and the window the Mac focuses open automatically.
+- Whole-desktop mode when you want it (`umac desktop`).
+- Clipboard sync, Mac cursor shapes, key repeat, Linux-style shortcuts.
+- A tray icon for the common actions; one background process owns every window.
+- About 19 ms (p50) from the Mac compositing a frame to your screen, at 1080p over Wi-Fi.
 
-## Setup
+## Requirements
 
-On the Mac, as the user logged in on its screen:
+- **Mac:** Apple Silicon, macOS 15 or newer (developed on macOS 27). A display or an HDMI
+  dummy plug if it runs headless.
+- **PC:** Linux with a Wayland desktop (developed on Fedora with KDE Plasma) and a GPU with
+  VA-API HEVC decoding.
+- Both on the same network; UDP port 47810 must reach the Mac.
 
-    umac-host setup
+## 1. Install on the Mac
 
-Follow the prompts (grant Screen Recording and Accessibility via Screen Sharing), then copy
-the printed `umac://...` pairing string. On the PC:
+On the Mac, as the user logged in on its screen (over Screen Sharing, or SSH as that user):
 
-    umac pair 'umac://...'
-    umac list
-    umac open --app Safari
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/jd1378/umac/main/scripts/install-mac.sh)"
+```
 
-The Linux client needs `libxkbcommon` at build and run time (Fedora: `libxkbcommon-devel`)
-and ffmpeg with VA-API (`ffmpeg-devel`, `mesa-va-drivers-freeworld`). On Wayland it uses
-native popups for Mac menus; `umac open --backend winit` selects the fallback shell.
+[scripts/install-mac.sh](scripts/install-mac.sh) (read it first if you like):
 
-Linux tip: raise `net.core.rmem_max` to 8 MiB or more so keyframe bursts are not dropped.
+1. checks for Apple's Command Line Tools and offers to install Rust (rustup) if missing,
+2. downloads this repository and builds `umac-host`,
+3. runs `umac-host setup`, which installs the agent as a LaunchAgent and signs it locally so
+   macOS keeps its permissions across updates.
 
-## Daemon and tray
+The wizard asks you to allow **Screen & System Audio Recording** and **Accessibility** for
+`umac-host` in System Settings > Privacy & Security (do this over Screen Sharing), and checks
+auto-login and sleep settings. At the end it prints a pairing link like
+`umac://192.0.2.10:47810?fp=...&token=...`, valid for 10 minutes and usable once.
 
-One `umac daemon` process per user owns every stream window, the tray and the connection to
-each Mac. `umac` on its own starts it in the background when a Mac is paired (pairing starts
-it too). `umac open`, `launch`, `desktop`, `list` and `displays` talk to it over a private
-socket (`$XDG_RUNTIME_DIR/umac/daemon.sock`, same user only) and start it when needed, so a
-Mac window is never shown twice: asking for one that is already open brings it to the front.
-`umac status` lists the windows shown, `umac quit` stops the daemon and closes them all.
-The daemon needs a Wayland session; `--no-daemon` on `open`, `launch`, `desktop`, `list`
-and `displays` runs that one command in its own process instead (debugging, X11), ending
-with its last window.
+Run the same command again to update. `umac-host pair` prints a new pairing link,
+`umac-host status` shows the agent's state, `umac-host uninstall` removes it.
 
-Left click on the tray opens Apps; the right-click menu has Apps, Open a terminal window,
-Show Desktop, Show task manager, Show settings (Mac System Settings), Paired hosts and Exit, which closes every window and stops
-the daemon. Failures show as desktop notifications. On macOS 27 the Apps launcher is an
-overlay that cannot be streamed, so Apps shows a Finder window on /Applications instead.
+## 2. Install on Linux
 
-Closing a window here closes it on the Mac too, with its close button, so an unsaved
-document asks first (the prompt opens here as a dialog) and the window goes away once the
-Mac closed it. `"close_on_mac": false` only stops streaming instead. Popups and desktops
-are only stopped.
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/jd1378/umac/main/scripts/install-linux.sh)"
+```
 
-Paired hosts lists every paired Mac as `name (address)`; the checked one is what the tray and
-any command without `--host` use (`"selected_host"` in config.json). The icon's line color
-follows the KDE color scheme (`"tray_icon_color": "auto" | "black" | "white"`).
+[scripts/install-linux.sh](scripts/install-linux.sh) asks before anything that needs sudo:
 
-    umac autostart enable    # start the tray at login (~/.config/autostart/umac.desktop)
-    umac autostart status
-    umac autostart disable
+1. installs build dependencies (ffmpeg with headers, libva, libxkbcommon, clang) with dnf,
+   apt or pacman; on Fedora, ffmpeg and hardware HEVC decoding come from
+   [RPM Fusion](https://rpmfusion.org) (`ffmpeg-devel`, `mesa-va-drivers-freeworld`),
+2. offers to install Rust (rustup) if missing,
+3. builds `umac` from this repository into `~/.local/bin/umac`,
+4. offers to raise `net.core.rmem_max` so keyframe bursts are not dropped.
 
-The tray uses the StatusNotifierItem D-Bus protocol (KDE, and GNOME with the AppIndicator
-extension).
+Run it again to update.
 
-## New windows and dialogs
+## 3. Pair
 
-When a streamed app opens a window by itself it opens on the PC too (`"follow_new_windows":
-true`, default). New documents become their own windows; dialogs, sheets, file panels and
-settings windows stay above the window they belong to. Closing one of these on the PC only
-stops streaming it; dismiss it on the Mac side (its buttons, Escape) to close it there.
+```sh
+umac pair 'umac://192.0.2.10:47810?fp=...&token=...'
+```
 
-The window the Mac focuses opens on the PC too when it is not shown yet (`"follow_focus":
-true`, default): an app you start from a streamed window (double-clicking it in Finder), a
-window you switch to with Cmd+Tab, or a password prompt or alert that pops up by itself.
-Windows of apps already shown follow the dialog rules above; others open as their own
-windows. Closing such a window on the PC keeps it closed while it stays focused on the Mac;
-it opens again once focus moves away and comes back. Overlays, the menu bar, the Dock and
-the window that was focused when you connected are left alone.
+The link pins the Mac's certificate fingerprint, so the client only talks to that Mac, and the
+Mac only accepts clients it paired. Pairing starts the tray.
 
-## Clipboard
+## Use
 
-Text only, up to about 900 KB.
+- `umac` starts the tray if it is not running. Left click: Apps. Right click: Apps, Open a
+  terminal window, Show Desktop, Show task manager, Show settings, Paired hosts, Exit.
+- `umac autostart enable` starts it at login.
+- `umac list` shows the Mac's windows; `umac open --app Safari` or `--window <id>` opens them
+  here. `umac launch terminal|finder|activity-monitor|settings` opens something new.
+- `umac desktop` shows a whole Mac display (F11 for fullscreen).
+- `umac status`, `umac close --window <id>`, `umac quit`.
 
-- Mac to PC: every copy made on the Mac lands on the PC clipboard. Wayland lets a client set
-  the clipboard only while it has keyboard focus, so a copy that arrives while no umac window
-  is focused is applied when one gets focus. Disable with `"clipboard_to_pc": false`.
-- PC to Mac: `"clipboard_to_mac"` is `"on_paste"` by default. The PC clipboard is sent only
-  when you paste into a Mac window: Cmd+V (Ctrl+V with `swap_ctrl_cmd`) or a Paste item in a
-  Mac menu. `"always"` also sends it whenever a umac window gains focus; `"off"` never sends it.
+Closing a window here closes it on the Mac too (an unsaved document asks first).
+Ctrl+Alt+Shift+S shows live latency in window titles; `umac latency` measures it.
 
-Both live in `~/.config/umac/config.json`, for example:
+### Keyboard
 
-    { "clipboard_to_pc": true, "clipboard_to_mac": "on_paste" }
+Ctrl acts as Cmd, so Ctrl+C, Ctrl+V and Ctrl+T work as on Linux. Linux text editing keys are
+translated (Ctrl+Backspace, Ctrl+Arrows, Home/End). In Mac terminals Ctrl stays Control
+(Ctrl+C interrupts) and Ctrl+Shift+C / Ctrl+Shift+V copy and paste. KDE keeps some
+combinations for itself (Super, Alt+Tab).
 
-Clipboard sync needs the Wayland backend; `--backend winit` does not sync.
+### Clipboard
 
-## Keyboard
+Copies on the Mac land on the Linux clipboard. Your Linux clipboard goes to the Mac only when
+you paste into a Mac window (Cmd+V or a Paste menu item), never in the background.
 
-Keys are sent by position, so the Mac's own keyboard layout applies. Mouse wheel notches
-scroll `"scroll_lines"` lines each (default 3), times your desktop's scroll speed; touchpads
-scroll smoothly in pixels. Held keys repeat on
-the Mac at its own repeat rate (System Settings > Keyboard).
+## Settings
 
-With `"swap_ctrl_cmd": true` (default) Ctrl acts as Cmd and Super as Control. With
-`"linux_shortcuts": true` (default) Linux text editing habits are translated:
+`~/.config/umac/config.json` (every key optional):
 
-| Linux | Mac |
-|---|---|
-| Ctrl+Backspace / Ctrl+Delete | Option+Delete / Option+Forward Delete (delete word); in terminals Ctrl+W / Esc D |
-| Ctrl+Left / Ctrl+Right (with Shift) | Option+Left / Option+Right (move or select by word) |
-| Home / End (with Shift) | Cmd+Left / Cmd+Right (line start / end) |
-| Ctrl+Home / Ctrl+End | Cmd+Up / Cmd+Down (document start / end) |
+| Key | Default | Meaning |
+|---|---|---|
+| `bitrate_kbps` | 25000 | Video bitrate per window (desktops scale with resolution) |
+| `max_fps` | 60 | Frame rate cap |
+| `swap_ctrl_cmd` | true | Ctrl acts as Cmd, Super as Control |
+| `linux_shortcuts` | true | Translate Linux editing keys and terminal keys |
+| `scroll_lines` | 3 | Lines per mouse wheel notch (times your desktop scroll speed) |
+| `clipboard_to_pc` | true | Mac copies reach the Linux clipboard |
+| `clipboard_to_mac` | `on_paste` | `off`, `on_paste` or `always` (on window focus) |
+| `follow_new_windows` | true | Open dialogs and new windows of streamed apps |
+| `follow_focus` | true | Open the window the Mac focuses (launched apps, alerts) |
+| `close_on_mac` | true | Closing a window here closes it on the Mac |
+| `tray_icon_color` | `auto` | `auto`, `black` or `white` |
+| `show_stats` | false | Log per-window latency stages |
 
-In Mac terminals (Terminal, iTerm2, kitty, Alacritty, WezTerm, Ghostty, Warp) Ctrl stays
-Control so Ctrl+C interrupts, Ctrl+Shift+C / Ctrl+Shift+V copy and paste, and Home / End
-send Ctrl+A / Ctrl+E.
+## Security
 
-## Latency
+- Every connection is QUIC (TLS 1.3) with pinned self-signed certificates on both sides; a
+  client must pair with a one-time token before the Mac accepts it.
+- The Mac agent has Screen Recording and Accessibility, so a paired client can see and control
+  the Mac. Pair only your own machines; `umac-host unpair <fingerprint>` removes one.
+- Launch actions are a fixed list (Terminal, Finder, Activity Monitor, System Settings);
+  clients cannot run commands on the Mac.
+- The client daemon's control socket is only reachable by your user.
+- Every dependency is pinned to an exact version and `Cargo.lock` is committed; builds use
+  `--locked`. [deny.toml](deny.toml) documents the accepted advisories.
 
-`umac latency [--seconds 10]` streams the main display for a while and prints a per-stage
-table; `--stats` on `open`, `desktop` and `launch` (or `"show_stats": true`) logs the same
-stages every 2 s. Ctrl+Alt+Shift+S toggles a live readout (glass-to-glass p50 and fps) in the
-window titles; that S is not sent to the Mac.
+## Troubleshooting
 
-Glass to glass runs from the Mac display refresh a frame belongs to (ScreenCaptureKit's
-display time) to when the compositor reports it on screen (Wayland presentation-time; the
-winit backend uses the submit time). The host and client clocks are synced with probes over
-the control stream; the table prints the remaining uncertainty (half the best round trip).
-To measure with steady frames, move the Mac pointer over a desktop stream, e.g.
-`cargo run -p umac-host --example wiggle -- 15` in parallel.
-
-## Dependencies
-
-Every dependency is pinned to an exact version (`=x.y.z`) and `Cargo.lock` is committed, so
-nothing updates by accident. Build with `--locked`. To update a crate, change its pin
-deliberately, run `cargo update -p <crate>`, and review the lockfile diff.
+- **Black or tiny windows after a Mac reboot:** a headless Mac may fall back to a low
+  resolution; use a display or an HDMI dummy plug.
+- **Nothing captured:** run `umac-host status` on the Mac; re-run the install command to
+  re-check permissions.
+- **Logs:** Mac `~/Library/Logs/umac/agent.log`, Linux `~/.local/state/umac/daemon.log`.
 
 ## Development
 
-`scripts/deploy-host.sh` builds the host on the Mac and installs it through `umac-host setup`.
-It takes the Mac and its accounts from the environment:
+Crates: `proto` (wire types), `transport` (QUIC, pinning, FEC video datagrams), `host`
+(`umac-host`, macOS), `client` (`umac`, Linux).
+
+`scripts/deploy-host.sh` builds and installs the host on a Mac over SSH:
 
     UMAC_MAC=mac.local UMAC_BUILD_USER=builder UMAC_GUI_USER=me scripts/deploy-host.sh
 
 `UMAC_SSH_KEY` optionally selects a private key. `scripts/gen-tray-masks.sh` regenerates the
 tray icon masks from `crates/client/assets/tray.svg` (needs Inkscape and ImageMagick).
+PyroWave is reserved as a codec but not integrated; see [docs/pyrowave.md](docs/pyrowave.md).
 
 ## License
 
