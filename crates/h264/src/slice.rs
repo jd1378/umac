@@ -6,11 +6,19 @@ use crate::{
     params::{Pps, Sps},
 };
 
-/// Memory management control operations that are supported (others are rejected).
+/// Memory management control operations (8.2.5.4), except 5 (reset all), which is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mmco {
     /// Mark a short-term picture unused: `difference_of_pic_nums_minus1`.
     ForgetShortTerm(u32),
+    /// Mark a long-term picture unused: `long_term_pic_num`.
+    ForgetLongTerm(u32),
+    /// Turn a short-term picture into long-term: `difference_of_pic_nums_minus1`, `long_term_frame_idx`.
+    ShortToLong(u32, u32),
+    /// `max_long_term_frame_idx_plus1`; long-term pictures above it become unused.
+    MaxLongTermIdx(u32),
+    /// Mark the current picture long-term: `long_term_frame_idx`.
+    CurrentToLong(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +32,8 @@ pub struct SliceHeader {
     pub delta_poc_bottom: i32,
     /// Adaptive marking; `None` means the sliding window.
     pub mmcos: Option<Vec<Mmco>>,
+    /// IDR picture marked as long-term reference (LongTermFrameIdx 0).
+    pub idr_long_term: bool,
 }
 
 /// At most this many list modification or marking operations per slice.
@@ -80,13 +90,11 @@ impl SliceHeader {
                 skip_pred_weight_table(&mut r, num_ref_idx_l0_active)?;
             }
         }
-        let mut mmcos = None;
+        let (mut mmcos, mut idr_long_term) = (None, false);
         if nal_ref_idc != 0 {
             if idr {
                 r.flag()?;
-                if r.flag()? {
-                    return Err(Error::Unsupported("long-term reference pictures"));
-                }
+                idr_long_term = r.flag()?;
             } else if r.flag()? {
                 let mut ops = Vec::new();
                 loop {
@@ -96,13 +104,17 @@ impl SliceHeader {
                     match r.ue_max(6, "memory_management_control_operation")? {
                         0 => break,
                         1 => ops.push(Mmco::ForgetShortTerm(r.ue_max(1 << 16, "difference_of_pic_nums")?)),
-                        _ => return Err(Error::Unsupported("marking operations other than forgetting a short-term picture")),
+                        2 => ops.push(Mmco::ForgetLongTerm(r.ue_max(1 << 16, "long_term_pic_num")?)),
+                        3 => ops.push(Mmco::ShortToLong(r.ue_max(1 << 16, "difference_of_pic_nums")?, r.ue_max(15, "long_term_frame_idx")?)),
+                        4 => ops.push(Mmco::MaxLongTermIdx(r.ue_max(16, "max_long_term_frame_idx")?)),
+                        6 => ops.push(Mmco::CurrentToLong(r.ue_max(15, "long_term_frame_idx")?)),
+                        _ => return Err(Error::Unsupported("memory_management_control_operation 5")),
                     }
                 }
                 mmcos = Some(ops);
             }
         }
-        Ok(Self { first_mb, intra, pps_id, frame_num, idr_pic_id, poc_lsb, delta_poc_bottom, mmcos })
+        Ok(Self { first_mb, intra, pps_id, frame_num, idr_pic_id, poc_lsb, delta_poc_bottom, mmcos, idr_long_term })
     }
 }
 

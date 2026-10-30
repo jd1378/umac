@@ -36,7 +36,9 @@ pub const MAX_SLICES: usize = 256;
 pub struct Reference {
     /// DPB slot holding the decoded picture.
     pub slot: u8,
+    /// FrameNum for short-term pictures, LongTermFrameIdx for long-term ones.
     pub frame_num: u32,
+    pub long_term: bool,
     pub poc: [i32; 2],
 }
 
@@ -66,6 +68,8 @@ pub struct DecodeJob {
 struct RefPic {
     slot: u8,
     frame_num: u32,
+    /// LongTermFrameIdx when marked long-term.
+    long_term: Option<u32>,
     poc: [i32; 2],
 }
 
@@ -82,6 +86,8 @@ pub struct Parser {
     prev_frame_num: u32,
     prev_frame_num_offset: u32,
     prev_ref_frame_num: u32,
+    /// MaxLongTermFrameIdx; `None` means "no long-term frame indices".
+    max_long_term_idx: Option<u32>,
 }
 
 impl Parser {
@@ -179,12 +185,16 @@ impl Parser {
             return Err(Error::Invalid("frame_num gap (lost reference picture)"));
         }
         let poc = self.poc(&sps, &h, idr, nal_ref_idc);
-        let references: Vec<Reference> = self.refs.iter().map(|r| Reference { slot: r.slot, frame_num: r.frame_num, poc: r.poc }).collect();
+        let references: Vec<Reference> = self
+            .refs
+            .iter()
+            .map(|r| Reference { slot: r.slot, frame_num: r.long_term.unwrap_or(r.frame_num), long_term: r.long_term.is_some(), poc: r.poc })
+            .collect();
         let slots = sps.max_num_ref_frames.max(1) + 1;
         let slot = (0..slots).find(|s| !self.refs.iter().any(|r| r.slot == *s)).ok_or(Error::Invalid("no free DPB slot"))?;
 
         if nal_ref_idc != 0 {
-            self.mark(&sps, &h, slot, poc)?;
+            self.mark(&sps, &h, idr, slot, poc)?;
             self.prev_ref_poc_lsb = h.poc_lsb;
             self.prev_ref_poc_msb = poc[0] - h.poc_lsb as i32;
             self.prev_ref_frame_num = h.frame_num;
@@ -247,34 +257,72 @@ impl Parser {
     }
 
     /// Reference picture marking after decoding a reference picture (8.2.5).
-    fn mark(&mut self, sps: &Sps, h: &SliceHeader, slot: u8, poc: [i32; 2]) -> Result<(), Error> {
-        let max_frame_num = 1i64 << sps.log2_max_frame_num;
-        let pic_num = |frame_num: u32| -> i64 {
-            if frame_num > h.frame_num { frame_num as i64 - max_frame_num } else { frame_num as i64 }
-        };
-        match &h.mmcos {
-            None => {
-                if self.refs.len() >= sps.max_num_ref_frames.max(1) as usize
-                    && let Some(oldest) = (0..self.refs.len()).min_by_key(|&i| pic_num(self.refs[i].frame_num))
-                {
-                    self.refs.remove(oldest);
-                }
+    fn mark(&mut self, sps: &Sps, h: &SliceHeader, idr: bool, slot: u8, poc: [i32; 2]) -> Result<(), Error> {
+        let max_refs = sps.max_num_ref_frames.max(1) as usize;
+        let mut current_long_term = None;
+        if idr {
+            // The reference list was cleared for the IDR picture already.
+            if h.idr_long_term {
+                current_long_term = Some(0);
+                self.max_long_term_idx = Some(0);
+            } else {
+                self.max_long_term_idx = None;
             }
-            Some(ops) => {
-                for op in ops {
-                    match *op {
-                        Mmco::ForgetShortTerm(diff) => {
-                            let target = h.frame_num as i64 - (diff as i64 + 1);
-                            self.refs.retain(|r| pic_num(r.frame_num) != target);
-                        }
+        } else if let Some(ops) = &h.mmcos {
+            let max_frame_num = 1i64 << sps.log2_max_frame_num;
+            let current = h.frame_num as i64;
+            let pic_num = |frame_num: u32| if frame_num as i64 > current { frame_num as i64 - max_frame_num } else { frame_num as i64 };
+            for op in ops {
+                match *op {
+                    Mmco::ForgetShortTerm(diff) => {
+                        let target = current - (diff as i64 + 1);
+                        self.refs.retain(|r| r.long_term.is_some() || pic_num(r.frame_num) != target);
+                    }
+                    Mmco::ForgetLongTerm(num) => self.refs.retain(|r| r.long_term != Some(num)),
+                    Mmco::ShortToLong(diff, idx) => {
+                        self.check_long_term_idx(idx)?;
+                        let target = current - (diff as i64 + 1);
+                        self.refs.retain(|r| r.long_term != Some(idx));
+                        let r = self
+                            .refs
+                            .iter_mut()
+                            .find(|r| r.long_term.is_none() && pic_num(r.frame_num) == target)
+                            .ok_or(Error::Invalid("marking refers to a missing short-term picture"))?;
+                        r.long_term = Some(idx);
+                    }
+                    Mmco::MaxLongTermIdx(plus1) => {
+                        self.max_long_term_idx = plus1.checked_sub(1);
+                        let max = self.max_long_term_idx;
+                        self.refs.retain(|r| r.long_term.is_none_or(|i| max.is_some_and(|m| i <= m)));
+                    }
+                    Mmco::CurrentToLong(idx) => {
+                        self.check_long_term_idx(idx)?;
+                        self.refs.retain(|r| r.long_term != Some(idx));
+                        current_long_term = Some(idx);
                     }
                 }
-                if self.refs.len() >= sps.max_num_ref_frames.max(1) as usize {
-                    return Err(Error::Invalid("reference pictures exceed max_num_ref_frames"));
-                }
             }
+        } else if self.refs.len() >= max_refs {
+            // Sliding window: drop the oldest short-term picture.
+            let max_frame_num = 1i64 << sps.log2_max_frame_num;
+            let wrap = |f: u32| if f > h.frame_num { f as i64 - max_frame_num } else { f as i64 };
+            let oldest = (0..self.refs.len())
+                .filter(|&i| self.refs[i].long_term.is_none())
+                .min_by_key(|&i| wrap(self.refs[i].frame_num))
+                .ok_or(Error::Invalid("sliding window with only long-term references"))?;
+            self.refs.remove(oldest);
         }
-        self.refs.push(RefPic { slot, frame_num: h.frame_num, poc });
+        if self.refs.len() >= max_refs {
+            return Err(Error::Invalid("reference pictures exceed max_num_ref_frames"));
+        }
+        self.refs.push(RefPic { slot, frame_num: h.frame_num, long_term: current_long_term, poc });
+        Ok(())
+    }
+
+    fn check_long_term_idx(&self, idx: u32) -> Result<(), Error> {
+        if self.max_long_term_idx.is_none_or(|m| idx > m) {
+            return Err(Error::Invalid("long_term_frame_idx above MaxLongTermFrameIdx"));
+        }
         Ok(())
     }
 }

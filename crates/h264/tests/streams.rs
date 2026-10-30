@@ -72,6 +72,11 @@ fn videotoolbox_low_latency() {
         if i == 0 {
             assert!(job.idr);
         }
+        // VideoToolbox keeps its first frames as long-term references for loss recovery.
+        if i == 3 {
+            assert_eq!(job.references.iter().filter(|r| r.long_term).count(), 3);
+        }
+        assert!(!job.references.iter().any(|r| r.slot == job.slot));
     }
 }
 
