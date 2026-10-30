@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- umac tray icon: a window with the Command (⌘) symbol. Original work, same license as umac. -->
+  <g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="4" y="6" width="56" height="52" rx="8" stroke-width="4"/>
+    <path d="M4 18H60" stroke-width="4"/>
+    <path stroke-width="3" d="M18.5 33H45.5M18.5 43H45.5M27 24.5V51.5M37 24.5V51.5"/>
+    <circle cx="22.5" cy="28.5" r="4.5" stroke-width="3"/>
+    <circle cx="41.5" cy="28.5" r="4.5" stroke-width="3"/>
+    <circle cx="22.5" cy="47.5" r="4.5" stroke-width="3"/>
+    <circle cx="41.5" cy="47.5" r="4.5" stroke-width="3"/>
+  </g>
+  <g fill="#000">
+    <circle cx="42" cy="12" r="2.5"/>
+    <circle cx="48.5" cy="12" r="2.5"/>
+    <circle cx="55" cy="12" r="2.5"/>
+  </g>
+</svg>

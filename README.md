@@ -64,3 +64,9 @@ With `"swap_ctrl_cmd": true` (default) Ctrl acts as Cmd and Super as Control. Wi
 In Mac terminals (Terminal, iTerm2, kitty, Alacritty, WezTerm, Ghostty, Warp) Ctrl stays
 Control so Ctrl+C interrupts, Ctrl+Shift+C / Ctrl+Shift+V copy and paste, and Home / End
 send Ctrl+A / Ctrl+E.
+
+## Dependencies
+
+Every dependency is pinned to an exact version (`=x.y.z`) and `Cargo.lock` is committed, so
+nothing updates by accident. Build with `--locked`. To update a crate, change its pin
+deliberately, run `cargo update -p <crate>`, and review the lockfile diff.
