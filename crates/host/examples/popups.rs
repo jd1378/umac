@@ -51,7 +51,14 @@ async fn main() -> anyhow::Result<()> {
     let reply: HelloReply = read_msg(&mut recv).await?.ok_or_else(|| anyhow::anyhow!("no reply"))?;
     println!("hello -> {reply:?}");
     write_msg(&mut send, &ClientMsg::ListWindows).await?;
-    let Some(HostMsg::Windows(list)) = read_msg(&mut recv).await? else { anyhow::bail!("no window list") };
+    // Other messages (the current cursor) can arrive first.
+    let list = loop {
+        match read_msg(&mut recv).await? {
+            Some(HostMsg::Windows(list)) => break list,
+            Some(_) => continue,
+            None => anyhow::bail!("no window list"),
+        }
+    };
     let w = list
         .iter()
         .find(|w| w.app_name.contains(app.as_str()))

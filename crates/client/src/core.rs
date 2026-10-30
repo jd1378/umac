@@ -13,6 +13,7 @@ use umac_proto::{ClientMsg, InputEvent, MouseButton, WindowId, WindowInfo, Windo
 use crate::{
     clipboard::PasteFlow,
     config::Config,
+    cursor::{Cursors, Shape},
     decode::Nv12Frame,
     net::NetCmd,
     render::{Gpu, WindowRenderer},
@@ -47,6 +48,7 @@ pub struct Core {
     opened_any: bool,
     paste: PasteFlow,
     keys: Translator,
+    cursors: Cursors,
     pub error: Option<String>,
 }
 
@@ -94,6 +96,7 @@ impl Core {
             opened_any: false,
             paste: PasteFlow::new(cfg.clipboard_to_mac),
             keys: Translator::new(cfg.swap_ctrl_cmd),
+            cursors: Cursors::default(),
             error: None,
         }
     }
@@ -322,6 +325,29 @@ impl Core {
         };
         for (keycode, pressed) in self.keys.key(keycode, pressed, profile) {
             self.input(InputEvent::Key { window, keycode, pressed });
+        }
+    }
+
+    /// Applies a cursor change from the host; true if the shown shape should change.
+    pub fn cursor_update(&mut self, id: u64, shape: Option<umac_proto::CursorShape>) -> bool {
+        let changed = match shape {
+            Some(shape) => self.cursors.set(id, shape),
+            None => self.cursors.known(id),
+        };
+        if changed {
+            tracing::debug!(cursor = ?self.cursor_name(), "cursor");
+        }
+        changed
+    }
+
+    pub fn cursor(&self) -> &Shape {
+        self.cursors.current()
+    }
+
+    fn cursor_name(&self) -> String {
+        match self.cursors.current() {
+            Shape::Named(n) => n.name().to_owned(),
+            Shape::Image(i) => format!("image {}x{}", i.width, i.height),
         }
     }
 

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use umac_proto::{WindowId, WindowInfo};
+use umac_proto::{CursorShape, WindowId, WindowInfo};
 
 use crate::decode::Nv12Frame;
 
@@ -16,6 +16,8 @@ pub enum UiEvent {
     Clipboard(String),
     /// The host needs our clipboard for a paste; answer through `Core::clipboard_read`.
     ClipboardRequest(u64),
+    /// The Mac cursor changed; `shape` is `None` for a cached image (`CursorKnown`).
+    Cursor { id: u64, shape: Option<CursorShape> },
 }
 
 /// Wakes the shell's event loop with an event. `send` returns false once the loop is gone.

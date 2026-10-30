@@ -12,11 +12,12 @@ use winit::{
     event::{ElementState, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Fullscreen, Window, WindowId as LocalId},
+    window::{Cursor, CustomCursor, Fullscreen, Window, WindowId as LocalId},
 };
 
 use crate::{
     core::{self, Core, LINE_PX},
+    cursor::Shape as CursorShape,
     keymap,
     ui::{UiEvent, UiSender},
 };
@@ -75,7 +76,30 @@ impl App {
         self.core.attach(info, surface, (size.width, size.height))?;
         self.by_remote.insert(id, window.id());
         self.windows.insert(window.id(), (id, window));
+        self.apply_cursor(el);
         Ok(())
+    }
+
+    /// Shows the Mac cursor shape on every streamed window; desktops draw their own.
+    fn apply_cursor(&self, el: &ActiveEventLoop) {
+        let cursor: Cursor = match self.core.cursor() {
+            CursorShape::Named(icon) => (*icon).into(),
+            CursorShape::Image(img) => {
+                let source = CustomCursor::from_rgba(img.rgba.clone(), img.width as u16, img.height as u16, img.hot_x as u16, img.hot_y as u16);
+                match source {
+                    Ok(s) => el.create_custom_cursor(s).into(),
+                    Err(e) => {
+                        tracing::debug!("custom cursor: {e}");
+                        Cursor::default()
+                    }
+                }
+            }
+        };
+        for (remote, window) in self.windows.values() {
+            if !self.core.is_desktop(*remote) {
+                window.set_cursor(cursor.clone());
+            }
+        }
     }
 
     fn close(&mut self, el: &ActiveEventLoop, remote: WindowId) {
@@ -135,6 +159,11 @@ impl ApplicationHandler<UiEvent> for App {
                 }
             }
             UiEvent::ClipboardRequest(nonce) => self.core.clipboard_request(nonce),
+            UiEvent::Cursor { id, shape } => {
+                if self.core.cursor_update(id, shape) {
+                    self.apply_cursor(el);
+                }
+            }
         }
     }
 

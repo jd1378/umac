@@ -39,7 +39,7 @@ use smithay_client_toolkit::{
                 wl_data_device::WlDataDevice,
                 wl_data_device_manager::DndAction,
                 wl_data_source::WlDataSource,
-                wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface,
+                wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
             },
         },
         protocols::xdg::shell::client::xdg_positioner::{Anchor, ConstraintAdjustment, Gravity},
@@ -49,7 +49,7 @@ use smithay_client_toolkit::{
     seat::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
-        pointer::{CursorIcon, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer},
     },
     shell::{
         WaylandSurface,
@@ -59,13 +59,17 @@ use smithay_client_toolkit::{
             window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
         },
     },
-    shm::{Shm, ShmHandler},
+    shm::{
+        Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
+    },
 };
 use umac_proto::{MouseButton, WindowId, WindowInfo, WindowKind};
 
 use crate::{
     clipboard::sendable,
     core::{self, Core, LINE_PX, MAX_POPUPS},
+    cursor::{self as cursors, Shape as CursorShape},
     keymap,
     ui::{UiEvent, UiSender},
 };
@@ -150,6 +154,8 @@ impl Shell {
             nodes: HashMap::new(),
             keyboard: None,
             pointer: None,
+            hover: None,
+            cursor_image: None,
             kb_focus: None,
             exit: false,
         };
@@ -227,8 +233,20 @@ struct State {
     nodes: HashMap<WindowId, Node>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<ThemedPointer>,
+    /// Streamed window under the pointer and the serial of its enter event.
+    hover: Option<(WindowId, u32)>,
+    cursor_image: Option<ImageCursor>,
     kb_focus: Option<WindowId>,
     exit: bool,
+}
+
+/// A Mac cursor that is not a standard shape, drawn from the host's image.
+struct ImageCursor {
+    id: u64,
+    hot: (i32, i32),
+    surface: wl_surface::WlSurface,
+    _pool: SlotPool,
+    _buffer: Buffer,
 }
 
 /// Wheel or touchpad scroll on one axis, in the protocol's sign (positive = down/right).
@@ -292,7 +310,49 @@ impl State {
             }
             UiEvent::Clipboard(text) => self.set_selection(text),
             UiEvent::ClipboardRequest(nonce) => self.core.clipboard_request(nonce),
+            UiEvent::Cursor { id, shape } => {
+                if self.core.cursor_update(id, shape) {
+                    self.apply_cursor();
+                }
+            }
         }
+    }
+
+    /// Shows the Mac cursor shape while the pointer is over a streamed window. A desktop
+    /// stream has the Mac cursor drawn in, so ours is hidden there.
+    fn apply_cursor(&mut self) {
+        let (Some((id, serial)), Some(p)) = (self.hover, &self.pointer) else { return };
+        if self.core.is_desktop(id) {
+            let _ = p.hide_cursor();
+            return;
+        }
+        match self.core.cursor().clone() {
+            CursorShape::Named(icon) => {
+                if let Err(e) = p.set_cursor(&self.conn, icon) {
+                    tracing::debug!("cursor {icon:?}: {e}");
+                }
+            }
+            CursorShape::Image(img) => {
+                if self.cursor_image.as_ref().is_none_or(|c| c.id != img.id) {
+                    self.cursor_image = self.image_cursor(&img);
+                }
+                if let Some(c) = &self.cursor_image {
+                    p.pointer().set_cursor(serial, Some(&c.surface), c.hot.0, c.hot.1);
+                }
+            }
+        }
+    }
+
+    fn image_cursor(&self, img: &cursors::Image) -> Option<ImageCursor> {
+        let (w, h) = (img.width as i32, img.height as i32);
+        let mut pool = SlotPool::new((w * h * 4) as usize, &self.shm).inspect_err(|e| tracing::debug!("cursor pool: {e}")).ok()?;
+        let (buffer, canvas) = pool.create_buffer(w, h, w * 4, wl_shm::Format::Argb8888).ok()?;
+        canvas.copy_from_slice(&img.bgra_premultiplied());
+        let surface = self.compositor.create_surface(&self.qh);
+        buffer.attach_to(&surface).ok()?;
+        surface.damage_buffer(0, 0, w, h);
+        surface.commit();
+        Some(ImageCursor { id: img.id, hot: (img.hot_x as i32, img.hot_y as i32), surface, _pool: pool, _buffer: buffer })
     }
 
     fn open(&mut self, info: WindowInfo) -> Result<()> {
@@ -468,20 +528,21 @@ impl PopupHandler for State {
 }
 
 impl PointerHandler for State {
-    fn pointer_frame(&mut self, conn: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+    fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
         for e in events {
             let Some(id) = self.id_of(&e.surface) else { continue };
             let (x, y) = e.position;
             match e.kind {
-                PointerEventKind::Enter { .. } => {
-                    // Seam for cursor shape sync: the host's cursor would be applied here.
-                    // A desktop stream has the Mac cursor drawn in, so hide ours there.
-                    if let Some(p) = &self.pointer {
-                        let _ = if self.core.is_desktop(id) { p.hide_cursor() } else { p.set_cursor(conn, CursorIcon::Default) };
-                    }
+                PointerEventKind::Enter { serial } => {
+                    self.hover = Some((id, serial));
+                    self.apply_cursor();
                     self.core.pointer_moved(id, x, y);
                 }
-                PointerEventKind::Leave { .. } => {}
+                PointerEventKind::Leave { .. } => {
+                    if self.hover.is_some_and(|(h, _)| h == id) {
+                        self.hover = None;
+                    }
+                }
                 PointerEventKind::Motion { .. } => self.core.pointer_moved(id, x, y),
                 PointerEventKind::Press { button, .. } => self.core.button(id, mouse_button(button), true),
                 PointerEventKind::Release { button, .. } => self.core.button(id, mouse_button(button), false),

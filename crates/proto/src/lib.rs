@@ -158,6 +158,60 @@ pub enum HostMsg {
     /// the client answers with `InputEvent::SetClipboard` carrying the same nonce.
     ClipboardRequest { nonce: u64 },
     Displays(Vec<DisplayInfo>),
+    /// The Mac cursor over a streamed window changed shape.
+    Cursor(Cursor),
+    /// Switch back to a cursor image sent earlier with this id (the client caches a few).
+    CursorKnown { id: u64 },
+}
+
+/// Largest cursor image accepted, per side, in pixels.
+pub const MAX_CURSOR_SIDE: u32 = 256;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Cursor {
+    /// Content hash; the same image always has the same id within one host run.
+    pub id: u64,
+    pub shape: CursorShape,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CursorShape {
+    Named(NamedCursor),
+    /// Unpremultiplied RGBA, row-major, `width * height * 4` bytes. Hotspot in pixels.
+    Image { width: u32, height: u32, hot_x: u32, hot_y: u32, rgba: Vec<u8> },
+}
+
+/// Standard cursor shapes, named after the CSS / freedesktop cursor names so clients can use
+/// their native themed cursors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NamedCursor {
+    Default,
+    Text,
+    VerticalText,
+    Pointer,
+    Grab,
+    Grabbing,
+    Crosshair,
+    NotAllowed,
+    Copy,
+    Alias,
+    ContextMenu,
+    ColResize,
+    RowResize,
+    EwResize,
+    NsResize,
+    EResize,
+    WResize,
+    NResize,
+    SResize,
+    NeResize,
+    NwResize,
+    SeResize,
+    SwResize,
+    NeswResize,
+    NwseResize,
+    ZoomIn,
+    ZoomOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

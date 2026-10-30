@@ -315,6 +315,12 @@ pub async fn run_open(
                     HostMsg::ClipboardRequest { nonce } => {
                         ui.send(UiEvent::ClipboardRequest(nonce));
                     }
+                    HostMsg::Cursor(c) => {
+                        ui.send(UiEvent::Cursor { id: c.id, shape: Some(c.shape) });
+                    }
+                    HostMsg::CursorKnown { id } => {
+                        ui.send(UiEvent::Cursor { id, shape: None });
+                    }
                     other => tracing::debug!(?other, "ignored host message"),
                 }
             }

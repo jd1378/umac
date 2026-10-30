@@ -6,6 +6,7 @@ mod auth;
 mod clipboard;
 mod clock;
 mod config;
+mod cursor;
 mod encode;
 mod input_state;
 mod popup;

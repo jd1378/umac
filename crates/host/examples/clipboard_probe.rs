@@ -64,7 +64,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Some("menu") => {
             write_msg(&mut send, &ClientMsg::ListWindows).await?;
-            let Some(HostMsg::Windows(list)) = read_msg(&mut recv).await? else { anyhow::bail!("no list") };
+            // Other messages (the current cursor) can arrive first.
+            let list = loop {
+                match read_msg(&mut recv).await? {
+                    Some(HostMsg::Windows(list)) => break list,
+                    Some(_) => continue,
+                    None => anyhow::bail!("no list"),
+                }
+            };
             let w = list.iter().find(|w| w.app_name == args[1]).ok_or_else(|| anyhow::anyhow!("no window"))?;
             write_msg(&mut send, &ClientMsg::Subscribe { window: w.id, max_fps: 30, bitrate_kbps: 5000 }).await?;
             write_msg(&mut send, &ClientMsg::Focus { window: w.id }).await?;

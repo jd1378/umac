@@ -3074,6 +3074,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "clap",
+ "cursor-icon",
  "dirs",
  "ffmpeg-next",
  "libc",

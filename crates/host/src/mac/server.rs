@@ -13,11 +13,11 @@ use std::{
 
 use anyhow::{Context, anyhow, bail};
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, watch},
     time::timeout,
 };
 use umac_proto::{
-    ClientMsg, Codec, ColorFormat, Hello, HelloReply, HostMsg, InputEvent, MAX_CLIPBOARD_BYTES, PROTOCOL_VERSION,
+    ClientMsg, Codec, ColorFormat, Cursor, Hello, HelloReply, HostMsg, InputEvent, MAX_CLIPBOARD_BYTES, PROTOCOL_VERSION,
     WindowId, WindowInfo, WindowKind, desktop_id,
 };
 use umac_transport::{
@@ -29,6 +29,7 @@ use umac_transport::{
 
 use super::{
     capture::{self, Rect, display_at, find_window},
+    cursor as mac_cursor,
     input::{self, ClipboardLink, Command, Reply, Target, Targets},
     pasteboard, permissions,
     stream::{StreamParams, WindowStream},
@@ -62,6 +63,8 @@ struct Shared {
     /// New Mac clipboard text, fanned out to every session.
     clipboard: broadcast::Sender<String>,
     clip: ClipboardLink,
+    /// The Mac cursor shape over streamed windows; each session forwards changes.
+    cursor: watch::Receiver<Option<Arc<Cursor>>>,
     host_name: String,
 }
 
@@ -104,8 +107,11 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     let clip = ClipboardLink::default();
     let (clipboard_tx, _) = broadcast::channel(4);
     tokio::spawn(watch_pasteboard(clip.clone(), clipboard_tx.clone()));
+    let (cursor_tx, cursor_rx) = watch::channel(None);
+    let cursor_kick = mac_cursor::spawn(clip.focus.clone(), cursor_tx);
     let shared = Arc::new(Shared {
-        input: input::spawn(targets.clone(), clip.clone()),
+        input: input::spawn(targets.clone(), clip.clone(), cursor_kick),
+        cursor: cursor_rx,
         clip,
         targets,
         active: Arc::default(),
@@ -327,6 +333,13 @@ impl Session {
         mut replies: mpsc::UnboundedReceiver<HostMsg>,
     ) -> anyhow::Result<()> {
         let mut clipboard = self.shared.clipboard.subscribe();
+        let mut cursor = self.shared.cursor.clone();
+        let mut cursor_sent = crate::cursor::SessionCursor::default();
+        // The watcher only reports changes, so a new client starts from the current shape.
+        let initial = cursor.borrow_and_update().as_ref().and_then(|c| cursor_sent.message(c));
+        if let Some(msg) = initial {
+            write_msg(send, &msg).await?;
+        }
         let mut poll = tokio::time::interval(POLL);
         let mut popup_poll = tokio::time::interval(POPUP_POLL);
         popup_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -371,6 +384,14 @@ impl Session {
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => {}
                 },
+                Ok(()) = cursor.changed() => {
+                    let msg = cursor.borrow_and_update().as_ref().and_then(|c| cursor_sent.message(c));
+                    if let Some(msg) = msg
+                        && let Err(e) = write_msg(send, &msg).await
+                    {
+                        break Err(e.into());
+                    }
+                }
                 _ = popup_poll.tick() => {
                     if let Err(e) = self.poll_popups(send).await {
                         break Err(e);

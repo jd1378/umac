@@ -1,6 +1,7 @@
 pub mod ax;
 pub mod capture;
 pub mod capture_test;
+pub mod cursor;
 pub mod ffi;
 pub mod input;
 pub mod pasteboard;

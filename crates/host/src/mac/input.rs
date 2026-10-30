@@ -64,7 +64,7 @@ impl ClipboardLink {
     }
 }
 
-pub fn spawn(targets: Targets, clip: ClipboardLink) -> mpsc::Sender<Command> {
+pub fn spawn(targets: Targets, clip: ClipboardLink, cursor: mpsc::Sender<()>) -> mpsc::Sender<Command> {
     let (tx, rx) = mpsc::channel::<Command>();
     std::thread::Builder::new()
         .name("umac-input".into())
@@ -82,6 +82,7 @@ pub fn spawn(targets: Targets, clip: ClipboardLink) -> mpsc::Sender<Command> {
                 last_pos: HashMap::new(),
                 gate: PasteGate::default(),
                 clip,
+                cursor,
                 paste_titles: HashMap::new(),
                 repeat: KeyRepeat::new(repeat_delay, repeat_interval),
             };
@@ -130,6 +131,8 @@ struct Injector {
     /// Menu-bar Paste titles per app; walking the menu bar costs tens of milliseconds.
     paste_titles: HashMap<i32, (Instant, Vec<String>)>,
     repeat: KeyRepeat,
+    /// Wakes the cursor watcher after pointer events over a streamed window.
+    cursor: mpsc::Sender<()>,
 }
 
 /// The Mac's own key repeat settings (System Settings > Keyboard), via NSEvent.
@@ -211,7 +214,15 @@ impl Injector {
             ev => {
                 // Copies are caused by keys and clicks; pointer motion and scrolling are not.
                 let may_copy = matches!(ev, InputEvent::Key { .. } | InputEvent::MouseButton { .. });
+                // A desktop stream has the Mac cursor drawn in, so only windows need its shape.
+                let pointer_window = match ev {
+                    InputEvent::MouseMove { window, .. } | InputEvent::MouseButton { window, .. } | InputEvent::Scroll { window, .. } => Some(window),
+                    _ => None,
+                };
                 self.handle(ev);
+                if pointer_window.and_then(|w| self.target(w)).is_some_and(|t| !t.desktop) {
+                    let _ = self.cursor.send(());
+                }
                 if may_copy {
                     *self.clip.last_input.lock().unwrap() = Some(Instant::now());
                     self.clip.kick.notify_one();
