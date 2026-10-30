@@ -15,6 +15,8 @@ pub struct FfmpegDecoder {
     sw_frame: *mut ff::AVFrame,
     desc: String,
     hw_checked: bool,
+    /// Consecutive failed VA surface exports; zero-copy stops for this decoder after a few.
+    export_failures: u32,
     /// Overrides the process-wide zero-copy switch (tests compare both paths side by side).
     pub(crate) export: Option<bool>,
 }
@@ -113,13 +115,15 @@ impl FfmpegDecoder {
                 sw_frame: ff::av_frame_alloc(),
                 desc: String::new(),
                 hw_checked: !hw,
+                export_failures: 0,
                 export: None,
             })
         }
     }
 
     /// Hands out the current frame: as an exported VA surface when zero-copy is on, else
-    /// copied to CPU memory. A failed export falls back to copying from then on.
+    /// copied to CPU memory. A failed export copies that frame; repeated failures stop
+    /// exporting for this decoder.
     unsafe fn picture(&mut self) -> Result<Picture> {
         unsafe {
             #[cfg(target_os = "linux")]
@@ -127,11 +131,16 @@ impl FfmpegDecoder {
                 match super::dmabuf::DmabufFrame::export(self.frame) {
                     Ok(f) => {
                         self.hw_checked = true;
+                        self.export_failures = 0;
                         return Ok(Picture::Dmabuf(f));
                     }
                     Err(e) => {
-                        tracing::warn!("VA surface export failed ({e:#}); copying frames instead");
-                        super::set_zero_copy(false);
+                        self.export_failures += 1;
+                        tracing::warn!(failures = self.export_failures, "VA surface export failed ({e:#}); copying this frame");
+                        if self.export_failures >= super::MAX_ZERO_COPY_FAILURES {
+                            tracing::warn!("VA surface export keeps failing; copying frames from this decoder");
+                            self.export = Some(false);
+                        }
                     }
                 }
             }
@@ -155,40 +164,67 @@ impl FfmpegDecoder {
                 self.desc = self.desc.replace("vaapi", "software");
             }
             self.hw_checked = true;
-
-            let (w, h) = ((*src).width, (*src).height);
-            if w <= 0 || h <= 0 || w as u32 > MAX_DIMENSION || h as u32 > MAX_DIMENSION {
-                bail!("decoded picture has bad size {w}x{h}");
-            }
-            let (w, h) = (w as usize, h as usize);
-            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-            let plane = |i: usize, row: usize, len: usize| {
-                let base = (*src).data[i];
-                let stride = (*src).linesize[i] as isize;
-                std::slice::from_raw_parts(base.offset(row as isize * stride), len)
-            };
-            let mut y = Vec::with_capacity(w * h);
-            for r in 0..h {
-                y.extend_from_slice(plane(0, r, w));
-            }
-            let mut uv = Vec::with_capacity(cw * 2 * ch);
-            let fmt = (*src).format;
-            if fmt == ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32 {
-                for r in 0..ch {
-                    uv.extend_from_slice(plane(1, r, cw * 2));
-                }
-            } else if fmt == ff::AVPixelFormat::AV_PIX_FMT_YUV420P as i32
-                || fmt == ff::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32
-            {
-                for r in 0..ch {
-                    let (u, v) = (plane(1, r, cw), plane(2, r, cw));
-                    uv.extend(u.iter().zip(v).flat_map(|(a, b)| [*a, *b]));
-                }
-            } else {
-                bail!("unsupported decoded pixel format {fmt}");
-            }
-            Ok(Nv12Frame { width: w as u32, height: h as u32, y, y_stride: w, uv, uv_stride: cw * 2 })
+            read_nv12(src)
         }
+    }
+}
+
+/// Copies a VA-API (or software) frame to CPU memory.
+///
+/// # Safety
+/// `src` must be a valid decoded frame.
+pub(super) unsafe fn copy_nv12(src: *const ff::AVFrame) -> Result<Nv12Frame> {
+    unsafe {
+        if (*src).format != ff::AVPixelFormat::AV_PIX_FMT_VAAPI as i32 {
+            return read_nv12(src);
+        }
+        let mut sw = ff::av_frame_alloc();
+        if sw.is_null() {
+            bail!("av_frame_alloc failed");
+        }
+        (*sw).format = ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+        let ret = ff::av_hwframe_transfer_data(sw, src, 0);
+        let out = if ret < 0 { Err(av_err(ret)) } else { read_nv12(sw) };
+        ff::av_frame_free(&mut sw);
+        out
+    }
+}
+
+/// Packs a CPU frame (NV12 or planar 4:2:0) into an `Nv12Frame`.
+unsafe fn read_nv12(src: *const ff::AVFrame) -> Result<Nv12Frame> {
+    unsafe {
+        let (w, h) = ((*src).width, (*src).height);
+        if w <= 0 || h <= 0 || w as u32 > MAX_DIMENSION || h as u32 > MAX_DIMENSION {
+            bail!("decoded picture has bad size {w}x{h}");
+        }
+        let (w, h) = (w as usize, h as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let plane = |i: usize, row: usize, len: usize| {
+            let base = (*src).data[i];
+            let stride = (*src).linesize[i] as isize;
+            std::slice::from_raw_parts(base.offset(row as isize * stride), len)
+        };
+        let mut y = Vec::with_capacity(w * h);
+        for r in 0..h {
+            y.extend_from_slice(plane(0, r, w));
+        }
+        let mut uv = Vec::with_capacity(cw * 2 * ch);
+        let fmt = (*src).format;
+        if fmt == ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32 {
+            for r in 0..ch {
+                uv.extend_from_slice(plane(1, r, cw * 2));
+            }
+        } else if fmt == ff::AVPixelFormat::AV_PIX_FMT_YUV420P as i32
+            || fmt == ff::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32
+        {
+            for r in 0..ch {
+                let (u, v) = (plane(1, r, cw), plane(2, r, cw));
+                uv.extend(u.iter().zip(v).flat_map(|(a, b)| [*a, *b]));
+            }
+        } else {
+            bail!("unsupported decoded pixel format {fmt}");
+        }
+        Ok(Nv12Frame { width: w as u32, height: h as u32, y, y_stride: w, uv, uv_stride: cw * 2 })
     }
 }
 

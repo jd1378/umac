@@ -14,10 +14,10 @@ use crate::{
     clipboard::PasteFlow,
     config::Config,
     cursor::{Cursors, Shape},
-    decode::Picture,
     net::NetCmd,
     render::{Gpu, WindowRenderer},
     shortcuts::{Profile, Translator, is_terminal},
+    ui::FrameSlot,
     viewport::Fit,
 };
 
@@ -159,7 +159,7 @@ impl Core {
             self.gpu = Some(Gpu::with_instance(&self.instance, Some(&surface))?);
         }
         let gpu = self.gpu.as_mut().unwrap();
-        let mut renderer = WindowRenderer::new(gpu, surface, size.0, size.1);
+        let mut renderer = WindowRenderer::new(gpu, info.id as u64, surface, size.0, size.1);
         if info.kind == WindowKind::Desktop {
             renderer.set_fit(Fit::Scale);
         }
@@ -182,7 +182,11 @@ impl Core {
 
     /// Drops the window's renderer. Call before destroying the native surface.
     pub fn remove(&mut self, window: WindowId) {
-        self.remotes.remove(&window);
+        if self.remotes.remove(&window).is_some()
+            && let Some(gpu) = self.gpu.as_mut()
+        {
+            gpu.forget(window as u64);
+        }
     }
 
     /// Popups whose parent is `window`, directly or through other popups.
@@ -205,8 +209,11 @@ impl Core {
         self.opened_any && !self.remotes.values().any(|r| is_toplevel(r.info.kind))
     }
 
-    pub fn frame(&mut self, window: WindowId, frame: Picture, decoded: Instant) {
+    /// Draws the picture waiting in `slot`, if the decoder has not already replaced it with a
+    /// newer one that a later event will bring.
+    pub fn frame(&mut self, window: WindowId, slot: &FrameSlot) {
         let (Some(r), Some(gpu)) = (self.remotes.get_mut(&window), self.gpu.as_mut()) else { return };
+        let Some((frame, decoded)) = slot.take() else { return };
         let start = Instant::now();
         r.renderer.upload(gpu, frame);
         r.renderer.render(gpu);

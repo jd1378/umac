@@ -65,6 +65,9 @@ pub struct Gpu {
     shader: wgpu::ShaderModule,
     sampler: wgpu::Sampler,
     pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    /// Consecutive zero-copy import or acquire failures.
+    #[cfg(target_os = "linux")]
+    zc_failures: u32,
 }
 
 impl Gpu {
@@ -142,10 +145,49 @@ impl Gpu {
             pipelines: HashMap::new(),
             #[cfg(target_os = "linux")]
             importer,
+            #[cfg(target_os = "linux")]
+            zc_failures: 0,
         })
     }
 
+    /// Drops the zero-copy state of a closed window.
+    pub fn forget(&mut self, owner: u64) {
+        #[cfg(target_os = "linux")]
+        if let Some(i) = self.importer.as_mut() {
+            i.forget(owner);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = owner;
+    }
+
+    /// Counts a zero-copy failure; too many in a row switch every decoder to copying.
+    #[cfg(target_os = "linux")]
+    fn zero_copy_failed(&mut self, what: &str, e: &anyhow::Error) {
+        self.zc_failures += 1;
+        tracing::warn!(failures = self.zc_failures, "zero-copy {what} failed ({e:#}); copying this frame");
+        if self.zc_failures >= decode::MAX_ZERO_COPY_FAILURES {
+            tracing::warn!("zero-copy keeps failing; copying frames from now on");
+            decode::set_zero_copy(false);
+        }
+    }
+
+    /// Draws `frame` into `target`. An imported frame is acquired from the decoder before the
+    /// submission and released back after it; if the acquire fails nothing samples it.
     fn draw(&mut self, target: &wgpu::TextureView, format: wgpu::TextureFormat, frame: Option<(&FrameTextures, Viewport)>) {
+        #[cfg(target_os = "linux")]
+        let imported = match frame {
+            Some((FrameTextures { source: Source::Imported { frame: f, images }, .. }, _)) => {
+                match self.importer.as_mut().map(|i| i.acquire(*images)) {
+                    Some(Ok(())) => Some((f.clone(), *images)),
+                    Some(Err(e)) => {
+                        self.zero_copy_failed("acquire", &e);
+                        return self.draw(target, format, None);
+                    }
+                    None => return self.draw(target, format, None),
+                }
+            }
+            _ => None,
+        };
         let pipeline = self.pipeline(format).clone();
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
@@ -170,6 +212,12 @@ impl Gpu {
             }
         }
         self.queue.submit([enc.finish()]);
+        #[cfg(target_os = "linux")]
+        if let (Some((f, images)), Some(importer)) = (imported, self.importer.as_mut())
+            && let Err(e) = importer.release(images, f)
+        {
+            tracing::warn!("zero-copy release failed: {e:#}");
+        }
     }
 
     fn pipeline(&mut self, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
@@ -209,13 +257,15 @@ struct FrameTextures {
 
 enum Source {
     Upload { y: wgpu::Texture, uv: wgpu::Texture },
-    /// Sampled in place; kept alive until every submission that drew it has finished.
+    /// Sampled in place; each draw hands the frame to the importer until the GPU is done.
     #[cfg(target_os = "linux")]
-    Imported(Arc<decode::dmabuf::DmabufFrame>),
+    Imported { frame: Arc<decode::dmabuf::DmabufFrame>, images: [ash::vk::Image; 2] },
 }
 
 /// Per-window presentation state.
 pub struct WindowRenderer {
+    /// Window id, so the importer can tell this window's decoder surfaces apart.
+    owner: u64,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     frame: Option<FrameTextures>,
@@ -223,7 +273,7 @@ pub struct WindowRenderer {
 }
 
 impl WindowRenderer {
-    pub fn new(gpu: &Gpu, surface: wgpu::Surface<'static>, width: u32, height: u32) -> Self {
+    pub fn new(gpu: &Gpu, owner: u64, surface: wgpu::Surface<'static>, width: u32, height: u32) -> Self {
         let caps = surface.get_capabilities(&gpu.adapter);
         let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
         let present_mode = [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate]
@@ -243,7 +293,7 @@ impl WindowRenderer {
             color_space: Default::default(),
         };
         surface.configure(&gpu.device, &config);
-        Self { surface, config, frame: None, fit: Fit::Exact }
+        Self { owner, surface, config, frame: None, fit: Fit::Exact }
     }
 
     pub fn set_fit(&mut self, fit: Fit) {
@@ -281,15 +331,23 @@ impl WindowRenderer {
             #[cfg(target_os = "linux")]
             Picture::Dmabuf(f) => {
                 let Gpu { device, layout, sampler, importer, .. } = gpu;
-                let Some(importer) = importer.as_mut() else { return };
-                match importer.import(device, layout, sampler, &f) {
-                    Ok(bind_group) => {
+                let res = match importer.as_mut() {
+                    Some(i) => i.import(device, layout, sampler, self.owner, &f),
+                    None => Err(anyhow::anyhow!("no importer")),
+                };
+                match res {
+                    Ok(imported) => {
+                        gpu.zc_failures = 0;
                         let (width, height) = (f.width, f.height);
-                        self.frame = Some(FrameTextures { source: Source::Imported(Arc::new(f)), bind_group, width, height });
+                        let source = Source::Imported { frame: Arc::new(f), images: imported.images };
+                        self.frame = Some(FrameTextures { source, bind_group: imported.bind_group, width, height });
                     }
                     Err(e) => {
-                        tracing::warn!("zero-copy import failed ({e:#}); copying frames instead");
-                        decode::set_zero_copy(false);
+                        gpu.zero_copy_failed("import", &e);
+                        match f.download() {
+                            Ok(cpu) => self.upload(gpu, Picture::Cpu(cpu)),
+                            Err(e) => tracing::warn!("copying the frame failed too: {e:#}"),
+                        }
                     }
                 }
             }
@@ -312,11 +370,6 @@ impl WindowRenderer {
         let view = texture.texture.create_view(&Default::default());
         let frame = self.frame.as_ref().zip(self.viewport());
         gpu.draw(&view, self.config.format, frame);
-        #[cfg(target_os = "linux")]
-        if let Some(FrameTextures { source: Source::Imported(f), .. }) = &self.frame {
-            let keep = f.clone();
-            gpu.queue.on_submitted_work_done(move || drop(keep));
-        }
         gpu.queue.present(texture);
     }
 }
@@ -457,18 +510,27 @@ mod tests {
         if !zc.describe().contains("vaapi") {
             return eprintln!("no VA-API, skipping");
         }
-        for p in packets.iter().take(5) {
+        // Every frame of the clip: the decoder cycles through its whole surface pool, so cached
+        // images are re-acquired many times. Each frame is drawn twice, as a redraw would.
+        assert!(packets.len() >= 50);
+        for (i, p) in packets.iter().enumerate() {
             let Some(Picture::Cpu(cpu)) = copy.decode(&p.data).unwrap() else { panic!("copy path gave no CPU picture") };
             let Some(Picture::Dmabuf(f)) = zc.decode(&p.data).unwrap() else { panic!("zero-copy path gave no dmabuf") };
             let a = FrameTextures::new(&gpu, cpu.width, cpu.height);
             a.write(&gpu, &cpu);
             let Gpu { device, layout, sampler, importer, .. } = &mut gpu;
-            let bind_group = importer.as_mut().unwrap().import(device, layout, sampler, &f).unwrap();
-            let b = FrameTextures { source: Source::Imported(Arc::new(f)), bind_group, width: cpu.width, height: cpu.height };
-            let (ra, rb) = (render_rgba(&mut gpu, &a, 320, 180), render_rgba(&mut gpu, &b, 320, 180));
-            let worst = ra.iter().zip(&rb).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
-            assert!(worst <= 1, "zero-copy differs from copy by up to {worst}");
+            let imported = importer.as_mut().unwrap().import(device, layout, sampler, 1, &f).unwrap();
+            let source = Source::Imported { frame: Arc::new(f), images: imported.images };
+            let b = FrameTextures { source, bind_group: imported.bind_group, width: cpu.width, height: cpu.height };
+            let ra = render_rgba(&mut gpu, &a, 320, 180);
+            for _ in 0..2 {
+                let rb = render_rgba(&mut gpu, &b, 320, 180);
+                let worst = ra.iter().zip(&rb).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+                assert!(worst <= 1, "frame {i}: zero-copy differs from copy by up to {worst}");
+            }
         }
+        assert_eq!(gpu.zc_failures, 0);
+        gpu.forget(1);
     }
 
     #[test]

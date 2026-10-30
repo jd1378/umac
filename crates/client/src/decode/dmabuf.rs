@@ -7,7 +7,7 @@ use std::os::fd::RawFd;
 use anyhow::{Result, bail, ensure};
 use ffmpeg_next::ffi as ff;
 
-use super::MAX_DIMENSION;
+use super::{MAX_DIMENSION, Nv12Frame};
 
 const fn fourcc(c: &[u8; 4]) -> u32 {
     c[0] as u32 | (c[1] as u32) << 8 | (c[2] as u32) << 16 | (c[3] as u32) << 24
@@ -30,6 +30,10 @@ pub struct Plane {
 
 pub struct DmabufFrame {
     frame: *mut ff::AVFrame,
+    /// The decoded VA-API frame itself, so the picture can still be copied if import fails.
+    source: *mut ff::AVFrame,
+    /// Identity of the decoder's surface pool; changes when the decoder is reinitialized.
+    pub pool: usize,
     pub width: u32,
     pub height: u32,
     /// Luma (R8) then interleaved chroma (RG8 at half size).
@@ -63,25 +67,38 @@ impl DmabufFrame {
                 ensure!(w > 0 && h > 0 && w as u32 <= MAX_DIMENSION && h as u32 <= MAX_DIMENSION, "bad size {w}x{h}");
                 Ok((w as u32, h as u32, planes(&*desc)?))
             })();
+            let source = if parsed.is_ok() { ff::av_frame_clone(src) } else { std::ptr::null_mut() };
             match parsed {
-                Ok((width, height, planes)) => Ok(Self { frame, width, height, planes }),
-                Err(e) => {
+                Ok((width, height, planes)) if !source.is_null() => {
+                    let pool = (*src).hw_frames_ctx.as_ref().map_or(0, |b| b.data as usize);
+                    Ok(Self { frame, source, pool, width, height, planes })
+                }
+                res => {
                     ff::av_frame_free(&mut frame);
-                    Err(e)
+                    Err(res.err().unwrap_or_else(|| anyhow::anyhow!("av_frame_clone failed")))
                 }
             }
         }
+    }
+
+    /// Copies the picture to CPU memory: the fallback when it cannot be imported.
+    pub fn download(&self) -> Result<Nv12Frame> {
+        unsafe { super::ffmpeg::copy_nv12(self.source) }
     }
 }
 
 impl Drop for DmabufFrame {
     fn drop(&mut self) {
         // Unmaps (closing the exported fds) and releases the VA surface.
-        unsafe { ff::av_frame_free(&mut self.frame) };
+        unsafe {
+            ff::av_frame_free(&mut self.frame);
+            ff::av_frame_free(&mut self.source);
+        }
     }
 }
 
-/// Accepts NV12 as one layer with two planes, or as separate R8 + GR88 layers.
+/// Accepts NV12 as separate R8 + GR88 layers (what ffmpeg's vaExportSurfaceHandle export
+/// asks for), or as one layer with two planes (its vaDeriveImage fallback on old libva).
 fn planes(d: &ff::AVDRMFrameDescriptor) -> Result<[Plane; 2]> {
     let objects = usize::try_from(d.nb_objects).unwrap_or(0);
     let layers = usize::try_from(d.nb_layers).unwrap_or(0);

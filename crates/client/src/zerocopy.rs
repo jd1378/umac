@@ -2,18 +2,21 @@
 //! (R8 luma, RG8 chroma) on the wgpu device and wrapped as a wgpu texture.
 //!
 //! Invariants:
-//! - Imported images are cached per dmabuf (inode, offsets, modifier); ffmpeg reuses a fixed
-//!   surface pool, so after warm-up no frame imports anything.
-//! - An image is only sampled while the `DmabufFrame` it came from is alive (the caller holds
-//!   it until the GPU finished), so the decoder never writes a surface being read.
-//! - Before each new frame is drawn, its images are acquired from the foreign (decoder) queue
-//!   family in a small submission on the same queue, which makes the decoder's writes visible.
-//! - Every Vulkan call happens on the thread that owns the `Gpu`.
+//! - Imported images are cached per dmabuf (inode, offsets, modifier), tagged with the window
+//!   and decoder surface pool they came from. A window's entries go when its pool changes or
+//!   it closes; the rest are evicted least recently used under a count and byte budget.
+//! - Every draw is bracketed wlroots-style: acquire from the foreign (decoder) queue family
+//!   (GENERAL to SHADER_READ_ONLY) before wgpu's submission, release back after it. Both are
+//!   raw submissions on wgpu's queue from the one thread that drives wgpu.
+//! - Nothing referenced by a raw submission is freed before its fence signals: evicted entries
+//!   and drawn frames wait in `pending` until then, so the decoder never rewrites a surface
+//!   that is still being sampled and no image is destroyed under a pending barrier.
 
 use std::{
     collections::HashMap,
     ffi::CStr,
     os::fd::{AsRawFd, BorrowedFd, IntoRawFd},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -29,10 +32,11 @@ const EXTENSIONS: [&CStr; 4] = [
     ash::ext::image_drm_format_modifier::NAME,
     ash::ext::queue_family_foreign::NAME,
 ];
-/// Cached surfaces; ffmpeg's pool is about refs + extra_hw_frames, so this is never reached
-/// unless surfaces churn, in which case the cache restarts.
-const MAX_CACHED: usize = 48;
-const RING: usize = 4;
+/// Cache budget. A decoder pool is about 25 surfaces, so this fits a few windows at once.
+const MAX_CACHED: usize = 96;
+const MAX_CACHED_BYTES: u64 = 512 << 20;
+/// Raw submissions in flight: an acquire and a release per draw.
+const RING: usize = 8;
 
 /// Opens a wgpu device with the dmabuf import extensions, or `None` if the adapter lacks them.
 pub fn open_device(adapter: &wgpu::Adapter) -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -71,11 +75,34 @@ struct Key {
 }
 
 struct Entry {
-    images: [vk::Image; 2],
-    /// Laid out for sampling by an earlier acquire; the first acquire starts from UNDEFINED.
-    acquired: bool,
     bind_group: wgpu::BindGroup,
+    images: [vk::Image; 2],
+    owner: u64,
+    pool: usize,
+    bytes: u64,
+    last_used: u64,
 }
+
+/// A frame ready to draw: bind group plus the images to acquire and release around the draw.
+pub struct Imported {
+    pub bind_group: wgpu::BindGroup,
+    pub images: [vk::Image; 2],
+}
+
+/// Something that must outlive the raw submissions up to `serial`.
+enum Keep {
+    Entry(#[allow(dead_code)] Entry),
+    Frame(#[allow(dead_code)] Arc<DmabufFrame>),
+}
+
+struct Slot {
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    serial: u64,
+}
+
+/// What a (format, modifier) pair supports: `None` if it cannot be imported and sampled.
+type Support = Option<vk::Extent3D>;
 
 pub struct Importer {
     device: ash::Device,
@@ -84,11 +111,18 @@ pub struct Importer {
     family: u32,
     queue: vk::Queue,
     memory_fd: ash::khr::external_memory_fd::Device,
+    memory_types: vk::PhysicalDeviceMemoryProperties,
     pool: vk::CommandPool,
-    ring: Vec<(vk::CommandBuffer, vk::Fence)>,
+    ring: Vec<Slot>,
     next: usize,
+    submitted: u64,
+    pending: Vec<(u64, Keep)>,
     cache: HashMap<Key, Entry>,
-    supported: HashMap<(vk::Format, u64), bool>,
+    cached_bytes: u64,
+    tick: u64,
+    /// Current decoder surface pool per window.
+    pools: HashMap<u64, usize>,
+    supported: HashMap<(vk::Format, u64), Support>,
 }
 
 impl Importer {
@@ -99,6 +133,7 @@ impl Importer {
         let (physical, queue) = (hal.raw_physical_device(), hal.raw_queue());
         drop(hal);
         let memory_fd = ash::khr::external_memory_fd::Device::new(&instance, &raw);
+        let memory_types = unsafe { instance.get_physical_device_memory_properties(physical) };
         unsafe {
             let pool = raw.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -119,10 +154,10 @@ impl Importer {
             let mut ring = Vec::with_capacity(RING);
             for cmd in cmds {
                 match raw.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None) {
-                    Ok(f) => ring.push((cmd, f)),
+                    Ok(fence) => ring.push(Slot { cmd, fence, serial: 0 }),
                     Err(e) => {
-                        for (_, f) in ring {
-                            raw.destroy_fence(f, None);
+                        for s in ring {
+                            raw.destroy_fence(s.fence, None);
                         }
                         raw.destroy_command_pool(pool, None);
                         return Err(e.into());
@@ -136,38 +171,123 @@ impl Importer {
                 family,
                 queue,
                 memory_fd,
+                memory_types,
                 pool,
                 ring,
                 next: 0,
+                submitted: 0,
+                pending: Vec::new(),
                 cache: HashMap::new(),
+                cached_bytes: 0,
+                tick: 0,
+                pools: HashMap::new(),
                 supported: HashMap::new(),
             })
         }
     }
 
-    /// Bind group sampling `frame`, ready for drawing on the next submission.
+    /// Bind group sampling `frame` for window `owner`. The draw must be wrapped in
+    /// `acquire` and `release`.
     pub fn import(
         &mut self,
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
+        owner: u64,
         frame: &DmabufFrame,
-    ) -> Result<wgpu::BindGroup> {
-        let key = key(frame)?;
-        if !self.cache.contains_key(&key) {
-            if self.cache.len() >= MAX_CACHED {
-                tracing::debug!("zero-copy cache full; restarting it");
-                self.cache.clear();
-            }
-            let entry = self.create(device, layout, sampler, frame)?;
-            self.cache.insert(key, entry);
+    ) -> Result<Imported> {
+        self.collect();
+        if self.pools.insert(owner, frame.pool).is_some_and(|p| p != frame.pool) {
+            // New decoder or resized stream: the old surfaces will never come back.
+            self.evict(|e| e.owner == owner && e.pool != frame.pool);
         }
-        let entry = self.cache.get(&key).unwrap();
-        let (images, acquired) = (entry.images, entry.acquired);
-        self.acquire(images, acquired)?;
-        let entry = self.cache.get_mut(&key).unwrap();
-        entry.acquired = true;
-        Ok(entry.bind_group.clone())
+        let key = key(frame)?;
+        self.tick += 1;
+        if !self.cache.contains_key(&key) {
+            let entry = self.create(device, layout, sampler, owner, frame)?;
+            self.cached_bytes += entry.bytes;
+            self.cache.insert(key, entry);
+            self.trim(key);
+            tracing::debug!(owner, entries = self.cache.len(), mib = self.cached_bytes >> 20, "zero-copy surface imported");
+        }
+        let entry = self.cache.get_mut(&key).expect("just inserted");
+        entry.last_used = self.tick;
+        Ok(Imported { bind_group: entry.bind_group.clone(), images: entry.images })
+    }
+
+    /// Drops every cached surface of a closed window.
+    pub fn forget(&mut self, owner: u64) {
+        self.pools.remove(&owner);
+        self.evict(|e| e.owner == owner);
+    }
+
+    /// Takes the images over from the decoder before a draw that samples them.
+    pub fn acquire(&mut self, images: [vk::Image; 2]) -> Result<()> {
+        let barriers = images.map(|image| {
+            barrier(image)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .dst_queue_family_index(self.family)
+        });
+        self.submit(&barriers, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::FRAGMENT_SHADER)?;
+        Ok(())
+    }
+
+    /// Hands the images back to the decoder after the draw was submitted. `frame` stays alive
+    /// until this release (and so the draw before it) has finished on the GPU.
+    pub fn release(&mut self, images: [vk::Image; 2], frame: Arc<DmabufFrame>) -> Result<()> {
+        let barriers = images.map(|image| {
+            barrier(image)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(self.family)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+        });
+        let serial =
+            self.submit(&barriers, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::PipelineStageFlags::BOTTOM_OF_PIPE)?;
+        self.pending.push((serial, Keep::Frame(frame)));
+        Ok(())
+    }
+
+    fn evict(&mut self, mut doomed: impl FnMut(&Entry) -> bool) {
+        let keys: Vec<Key> = self.cache.iter().filter(|(_, e)| doomed(e)).map(|(k, _)| *k).collect();
+        for k in keys {
+            self.retire(k);
+        }
+    }
+
+    /// Evicts least recently used entries (never `keep`) until the cache fits its budget.
+    fn trim(&mut self, keep: Key) {
+        while self.cache.len() > MAX_CACHED || self.cached_bytes > MAX_CACHED_BYTES {
+            let oldest = self.cache.iter().filter(|(k, _)| **k != keep).min_by_key(|(_, e)| e.last_used).map(|(k, _)| *k);
+            let Some(k) = oldest else { break };
+            self.retire(k);
+        }
+    }
+
+    /// Moves an entry out of the cache; it is dropped once no raw submission can use it.
+    fn retire(&mut self, k: Key) {
+        if let Some(e) = self.cache.remove(&k) {
+            self.cached_bytes -= e.bytes;
+            self.pending.push((self.submitted, Keep::Entry(e)));
+        }
+    }
+
+    /// Frees what waited for raw submissions that have now finished.
+    fn collect(&mut self) {
+        let incomplete = self
+            .ring
+            .iter()
+            .filter(|s| s.serial > 0 && !matches!(unsafe { self.device.get_fence_status(s.fence) }, Ok(true)))
+            .map(|s| s.serial)
+            .min();
+        let done = incomplete.map_or(self.submitted, |s| s - 1);
+        self.pending.retain(|(serial, _)| *serial > done);
     }
 
     fn create(
@@ -175,18 +295,13 @@ impl Importer {
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
+        owner: u64,
         frame: &DmabufFrame,
     ) -> Result<Entry> {
         let (w, h) = (frame.width, frame.height);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let y = self.texture(device, &frame.planes[0], vk::Format::R8_UNORM, wgpu::TextureFormat::R8Unorm, w, h)?;
-        let uv = self.texture(
-            device,
-            &frame.planes[1],
-            vk::Format::R8G8_UNORM,
-            wgpu::TextureFormat::Rg8Unorm,
-            w.div_ceil(2),
-            h.div_ceil(2),
-        )?;
+        let uv = self.texture(device, &frame.planes[1], vk::Format::R8G8_UNORM, wgpu::TextureFormat::Rg8Unorm, cw, ch)?;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("nv12 dmabuf"),
             layout,
@@ -202,10 +317,14 @@ impl Importer {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
             ],
         });
-        Ok(Entry { images: [y.0, uv.0], acquired: false, bind_group })
+        // Both planes usually live in one buffer object; count it once.
+        let [a, b] = frame.planes;
+        let bytes = if a.fd == b.fd { y.2.max(uv.2) } else { y.2 + uv.2 };
+        Ok(Entry { bind_group, images: [y.0, uv.0], owner, pool: frame.pool, bytes, last_used: 0 })
     }
 
-    fn supports(&mut self, format: vk::Format, modifier: u64) -> bool {
+    /// Largest importable and linearly sampleable extent for this format and modifier.
+    fn support(&mut self, format: vk::Format, modifier: u64) -> Support {
         let (instance, physical) = (&self.instance, self.physical);
         *self.supported.entry((format, modifier)).or_insert_with(|| unsafe {
             let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
@@ -215,20 +334,43 @@ impl Importer {
             let mut list = vk::DrmFormatModifierPropertiesListEXT::default().drm_format_modifier_properties(&mut mods);
             let mut props = vk::FormatProperties2::default().push_next(&mut list);
             instance.get_physical_device_format_properties2(physical, format, &mut props);
-            let ok = mods.iter().any(|m| {
+            let needed = vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+            let listed = mods.iter().any(|m| {
                 m.drm_format_modifier == modifier
                     && m.drm_format_modifier_plane_count == 1
-                    && m.drm_format_modifier_tiling_features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+                    && m.drm_format_modifier_tiling_features.contains(needed)
             });
+            let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+                .drm_format_modifier(modifier)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let mut ext_info =
+                vk::PhysicalDeviceExternalImageFormatInfo::default().handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let info = vk::PhysicalDeviceImageFormatInfo2::default()
+                .format(format)
+                .ty(vk::ImageType::TYPE_2D)
+                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                .usage(vk::ImageUsageFlags::SAMPLED)
+                .push_next(&mut drm)
+                .push_next(&mut ext_info);
+            let mut ext_props = vk::ExternalImageFormatProperties::default();
+            let mut out = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
+            let queried = instance.get_physical_device_image_format_properties2(physical, &info, &mut out).is_ok();
+            let max = out.image_format_properties.max_extent;
+            let importable = ext_props
+                .external_memory_properties
+                .external_memory_features
+                .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+            let ok = listed && queried && importable;
             if !ok {
-                tracing::info!(?format, modifier = format_args!("{modifier:#x}"), "modifier not importable");
+                tracing::info!(?format, modifier = format_args!("{modifier:#x}"), listed, queried, importable, "modifier not importable");
             }
-            ok
+            ok.then_some(max)
         })
     }
 
     /// Imports one plane as a Vulkan image bound to the dmabuf, wrapped as a wgpu texture
-    /// that destroys the image and memory once wgpu is done with it.
+    /// that destroys the image and memory once wgpu is done with it. Returns the bytes of
+    /// memory it pins.
     fn texture(
         &mut self,
         device: &wgpu::Device,
@@ -237,8 +379,13 @@ impl Importer {
         format: wgpu::TextureFormat,
         width: u32,
         height: u32,
-    ) -> Result<(vk::Image, wgpu::Texture)> {
-        ensure!(self.supports(vk_format, plane.modifier), "format modifier not supported for sampling");
+    ) -> Result<(vk::Image, wgpu::Texture, u64)> {
+        let max = self.support(vk_format, plane.modifier).context("format modifier not supported for sampling")?;
+        ensure!(width <= max.width && height <= max.height, "{width}x{height} exceeds the importable {}x{}", max.width, max.height);
+        if plane.object_size > 0 {
+            let end = plane.pitch.checked_mul(height as u64).and_then(|n| n.checked_add(plane.offset));
+            ensure!(end.is_some_and(|e| e <= plane.object_size), "plane extends past its dmabuf");
+        }
         let raw = self.device.clone();
         let layouts = [vk::SubresourceLayout { offset: plane.offset, row_pitch: plane.pitch, ..Default::default() }];
         let mut explicit =
@@ -259,7 +406,7 @@ impl Importer {
             .push_next(&mut external)
             .push_next(&mut explicit);
         let image = unsafe { raw.create_image(&info, None) }.context("creating dmabuf image")?;
-        let memory = match unsafe { self.bind_memory(image, plane) } {
+        let (memory, bytes) = match unsafe { self.bind_memory(image, plane) } {
             Ok(m) => m,
             Err(e) => {
                 unsafe { raw.destroy_image(image, None) };
@@ -295,13 +442,13 @@ impl Importer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         };
-        // The image is moved to SHADER_READ_ONLY_OPTIMAL by `acquire` before any draw.
+        // `acquire` moves the image to SHADER_READ_ONLY_OPTIMAL before every draw.
         let texture = unsafe { device.create_texture_from_hal::<Vulkan>(hal_tex, &desc, wgpu::TextureUses::RESOURCE) };
-        Ok((image, texture))
+        Ok((image, texture, bytes))
     }
 
     /// Imports a duplicate of the plane's dmabuf fd as dedicated memory for `image`.
-    unsafe fn bind_memory(&self, image: vk::Image, plane: &Plane) -> Result<vk::DeviceMemory> {
+    unsafe fn bind_memory(&self, image: vk::Image, plane: &Plane) -> Result<(vk::DeviceMemory, u64)> {
         unsafe {
             let reqs = self.device.get_image_memory_requirements(image);
             ensure!(plane.object_size == 0 || reqs.size <= plane.object_size, "dmabuf smaller than the image");
@@ -309,7 +456,7 @@ impl Importer {
             let mut props = vk::MemoryFdPropertiesKHR::default();
             self.memory_fd.get_memory_fd_properties(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT, fd.as_raw_fd(), &mut props)?;
             let bits = reqs.memory_type_bits & props.memory_type_bits;
-            ensure!(bits != 0, "no memory type fits the dmabuf");
+            let index = memory_type(&self.memory_types, bits).context("no memory type fits the dmabuf")?;
             let size = if plane.object_size > 0 { plane.object_size } else { reqs.size };
             let mut import = vk::ImportMemoryFdInfoKHR::default()
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
@@ -317,7 +464,7 @@ impl Importer {
             let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
             let alloc = vk::MemoryAllocateInfo::default()
                 .allocation_size(size)
-                .memory_type_index(bits.trailing_zeros())
+                .memory_type_index(index)
                 .push_next(&mut import)
                 .push_next(&mut dedicated);
             let memory = self.device.allocate_memory(&alloc, None).context("importing dmabuf")?;
@@ -327,71 +474,72 @@ impl Importer {
                 self.device.free_memory(memory, None);
                 bail!("binding dmabuf memory: {e}");
             }
-            Ok(memory)
+            Ok((memory, size))
         }
     }
 
-    /// Takes the images over from the decoder's (foreign) queue family so its writes are
-    /// visible, and leaves them in SHADER_READ_ONLY_OPTIMAL as wgpu expects.
-    fn acquire(&mut self, images: [vk::Image; 2], acquired: bool) -> Result<()> {
-        let (cmd, fence) = self.ring[self.next];
-        self.next = (self.next + 1) % self.ring.len();
-        let old = if acquired { vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL } else { vk::ImageLayout::UNDEFINED };
-        let barriers = images.map(|image| {
-            vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .old_layout(old)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                .dst_queue_family_index(self.family)
-                .image(image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-        });
+    /// Records `barriers` into the next ring slot and submits them on wgpu's queue. Returns
+    /// the submission's serial.
+    fn submit(
+        &mut self,
+        barriers: &[vk::ImageMemoryBarrier<'_>],
+        src: vk::PipelineStageFlags,
+        dst: vk::PipelineStageFlags,
+    ) -> Result<u64> {
+        let slot = &mut self.ring[self.next];
+        self.next = (self.next + 1) % RING;
         unsafe {
-            // The slot was used RING frames ago; its fence is long signaled in practice.
-            self.device.wait_for_fences(&[fence], true, 1_000_000_000)?;
-            self.device.reset_fences(&[fence])?;
+            // Used RING submissions ago, so this is signaled in practice.
+            self.device.wait_for_fences(&[slot.fence], true, u64::MAX)?;
+            self.device.reset_fences(&[slot.fence])?;
             self.device.begin_command_buffer(
-                cmd,
+                slot.cmd,
                 &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barriers,
-            );
-            self.device.end_command_buffer(cmd)?;
-            let cmds = [cmd];
-            // Same queue as wgpu, and only from the thread that drives wgpu, so submission
-            // order puts this barrier before the draw that samples the images.
-            self.device.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence)?;
+            self.device.cmd_pipeline_barrier(slot.cmd, src, dst, vk::DependencyFlags::empty(), &[], &[], barriers);
+            self.device.end_command_buffer(slot.cmd)?;
+            let cmds = [slot.cmd];
+            // Same queue as wgpu and only from the thread that drives wgpu, so submission order
+            // places this exactly between wgpu's own submissions.
+            self.device.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], slot.fence)?;
         }
-        Ok(())
+        self.submitted += 1;
+        slot.serial = self.submitted;
+        Ok(self.submitted)
     }
 }
 
 impl Drop for Importer {
     fn drop(&mut self) {
         unsafe {
-            let fences: Vec<vk::Fence> = self.ring.iter().map(|(_, f)| *f).collect();
-            let _ = self.device.wait_for_fences(&fences, true, 1_000_000_000);
+            let fences: Vec<vk::Fence> = self.ring.iter().map(|s| s.fence).collect();
+            // Unbounded: the pool and everything in `pending` may only go once the GPU is done.
+            let _ = self.device.wait_for_fences(&fences, true, u64::MAX);
+            self.pending.clear();
             for f in fences {
                 self.device.destroy_fence(f, None);
             }
             self.device.destroy_command_pool(self.pool, None);
         }
     }
+}
+
+fn barrier<'a>(image: vk::Image) -> vk::ImageMemoryBarrier<'a> {
+    vk::ImageMemoryBarrier::default().image(image).subresource_range(vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    })
+}
+
+/// A memory type allowed by `bits`, preferring device local memory.
+fn memory_type(props: &vk::PhysicalDeviceMemoryProperties, bits: u32) -> Option<u32> {
+    let allowed = |i: &u32| bits & (1 << i) != 0;
+    let mut types = (0..props.memory_type_count.min(32)).filter(allowed);
+    let local = |i: &u32| props.memory_types[*i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL);
+    types.clone().find(local).or_else(|| types.next())
 }
 
 /// Identity of a decoder surface: the dmabuf inode plus everything that shapes the import.
@@ -411,4 +559,19 @@ fn key(frame: &DmabufFrame) -> Result<Key> {
         modifier: a.modifier,
         size: (frame.width, frame.height),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_type_prefers_device_local() {
+        let mut p = vk::PhysicalDeviceMemoryProperties { memory_type_count: 3, ..Default::default() };
+        p.memory_types[0].property_flags = vk::MemoryPropertyFlags::HOST_VISIBLE;
+        p.memory_types[2].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        assert_eq!(memory_type(&p, 0b101), Some(2));
+        assert_eq!(memory_type(&p, 0b001), Some(0));
+        assert_eq!(memory_type(&p, 0b1000), None);
+    }
 }

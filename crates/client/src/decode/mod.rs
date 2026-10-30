@@ -45,8 +45,11 @@ const ZC_ON: u8 = 1;
 const ZC_OFF: u8 = 2;
 static ZERO_COPY: AtomicU8 = AtomicU8::new(ZC_UNSET);
 
+/// Consecutive zero-copy failures (export or import) tolerated before falling back to copying.
+pub const MAX_ZERO_COPY_FAILURES: u32 = 8;
+
 /// Whether decoders should hand out GPU surfaces instead of copying. Enabled by the renderer
-/// once its device can import dmabufs; any import failure turns it off for good.
+/// once its device can import dmabufs; repeated import failures turn it off for good.
 pub fn zero_copy() -> bool {
     ZERO_COPY.load(Ordering::Relaxed) == ZC_ON
 }

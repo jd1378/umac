@@ -302,7 +302,7 @@ impl State {
                     }
                 }
             }
-            UiEvent::Frame { window, frame, decoded } => self.core.frame(window, frame, decoded),
+            UiEvent::Frame { window, slot } => self.core.frame(window, &slot),
             UiEvent::Changed(info) => self.changed(info),
             UiEvent::Closed(window) => self.close(window),
             UiEvent::Shutdown(reason) => {

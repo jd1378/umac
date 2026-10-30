@@ -4,7 +4,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::mpsc::{SyncSender, TrySendError, sync_channel},
+    sync::{
+        Arc,
+        mpsc::{SyncSender, TrySendError, sync_channel},
+    },
     time::{Duration, Instant},
 };
 
@@ -26,7 +29,7 @@ use crate::{
     core::MAX_POPUPS,
     decode,
     gate::KeyframeGate,
-    ui::{UiEvent, UiSender},
+    ui::{FrameSlot, UiEvent, UiSender},
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -417,6 +420,7 @@ fn spawn_decoder(
     tracing::info!(window, "decoder: {}", decoder.describe());
     let (tx, rx) = sync_channel::<fec::Frame>(DECODE_QUEUE);
     std::thread::Builder::new().name(format!("decode-{window}")).spawn(move || {
+        let slot = Arc::new(FrameSlot::default());
         let (mut n, mut total, mut since) = (0u32, Duration::ZERO, Instant::now());
         while let Ok(f) = rx.recv() {
             let t = Instant::now();
@@ -424,7 +428,7 @@ fn spawn_decoder(
                 Ok(Some(frame)) => {
                     total += t.elapsed();
                     n += 1;
-                    if !ui.send(UiEvent::Frame { window, frame, decoded: Instant::now() }) {
+                    if slot.put(frame, Instant::now()) && !ui.send(UiEvent::Frame { window, slot: slot.clone() }) {
                         break;
                     }
                 }
@@ -435,7 +439,8 @@ fn spawn_decoder(
                 }
             }
             if since.elapsed() >= STATS_EVERY && n > 0 {
-                tracing::info!(window, decode_ms = format_args!("{:.2}", total.as_secs_f64() * 1e3 / n as f64), "decode");
+                let ms = total.as_secs_f64() * 1e3 / n as f64;
+                tracing::info!(window, decode_ms = format_args!("{ms:.2}"), skipped = slot.take_dropped(), "decode");
                 (n, total, since) = (0, Duration::ZERO, Instant::now());
             }
         }
