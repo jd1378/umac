@@ -20,33 +20,20 @@ pub struct Header {
     pub height: u32,
 }
 
-/// Walks the markers up to the scan and accepts only baseline 8-bit 4:2:0 YCbCr.
+/// Walks the markers up to the scan and accepts only baseline 8-bit 4:2:0 YCbCr. An allow-list:
+/// any marker zune-jpeg might interpret differently (fill `FF 00`, restart, TEM, other frame
+/// types) is rejected, so no second frame header can hide from this check.
 pub fn check_header(data: &[u8]) -> Result<Header> {
     if data.len() < 4 || data[..2] != [0xFF, 0xD8] {
         bail!("not a JPEG");
     }
     let mut at = 2;
-    let mut header = None;
+    let mut frame: Option<(Header, [u8; 3])> = None;
     while at + 4 <= data.len() {
         if data[at] != 0xFF {
             bail!("expected a marker at {at}");
         }
         let marker = data[at + 1];
-        match marker {
-            // Fill bytes and standalone markers carry no length.
-            0xFF => {
-                at += 1;
-                continue;
-            }
-            0x01 | 0xD0..=0xD7 => {
-                at += 2;
-                continue;
-            }
-            0xDA => {
-                return header.ok_or_else(|| anyhow::anyhow!("scan before frame header"));
-            }
-            _ => {}
-        }
         let len = u16::from_be_bytes([data[at + 2], data[at + 3]]) as usize;
         if len < 2 || at + 2 + len > data.len() {
             bail!("segment length {len} out of bounds");
@@ -54,21 +41,38 @@ pub fn check_header(data: &[u8]) -> Result<Header> {
         let seg = &data[at + 4..at + 2 + len];
         match marker {
             0xC0 => {
-                if header.is_some() {
+                if frame.is_some() {
                     bail!("second frame header");
                 }
-                header = Some(frame_header(seg)?);
+                frame = Some(frame_header(seg)?);
             }
-            // Every other start-of-frame: extended, progressive, lossless, arithmetic.
-            0xC1..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => bail!("unsupported JPEG process 0x{marker:02X}"),
-            _ => {}
+            0xDA => {
+                let (header, ids) = frame.ok_or_else(|| anyhow::anyhow!("scan before frame header"))?;
+                scan_header(seg, ids)?;
+                return Ok(header);
+            }
+            // Tables, restart interval, application data and comments.
+            0xC4 | 0xDB | 0xDD | 0xE0..=0xEF | 0xFE => {}
+            other => bail!("unexpected JPEG marker 0x{other:02X}"),
         }
         at += 2 + len;
     }
     bail!("no scan")
 }
 
-fn frame_header(seg: &[u8]) -> Result<Header> {
+/// The first (and only) scan must carry all three frame components.
+fn scan_header(seg: &[u8], ids: [u8; 3]) -> Result<()> {
+    if seg.len() != 1 + 3 * 2 + 3 || seg[0] != 3 {
+        bail!("expected one interleaved scan of 3 components");
+    }
+    let scan_ids = [seg[1], seg[3], seg[5]];
+    if scan_ids != ids {
+        bail!("scan components {scan_ids:?} do not match the frame {ids:?}");
+    }
+    Ok(())
+}
+
+fn frame_header(seg: &[u8]) -> Result<(Header, [u8; 3])> {
     if seg.len() != 6 + 3 * 3 {
         bail!("expected 3 components");
     }
@@ -84,7 +88,7 @@ fn frame_header(seg: &[u8]) -> Result<Header> {
     if sampling != [0x22, 0x11, 0x11] {
         bail!("expected 4:2:0 sampling, got {sampling:02X?}");
     }
-    Ok(Header { width, height })
+    Ok((Header { width, height }, [seg[6], seg[9], seg[12]]))
 }
 
 /// Full range to limited range: luma 0..255 to 16..235, chroma 0..255 to 16..240.
@@ -131,6 +135,7 @@ impl Decoder for MjpegDecoder {
             .set_max_width(width as usize)
             .set_max_height(height as usize)
             .set_strict_mode(true)
+            .jpeg_set_max_scans(1)
             .jpeg_set_out_colorspace(ColorSpace::YCbCr);
         let mut dec = JpegDecoder::new_with_options(ZCursor::new(data), options);
         let ycc = dec.decode().map_err(|e| anyhow::anyhow!("JPEG: {e:?}"))?;
@@ -154,6 +159,34 @@ mod tests {
 
     const CODE: &[u8] = include_bytes!("../../testdata/mjpeg/code.q50.jpg");
     const MIXED: &[u8] = include_bytes!("../../testdata/mjpeg/mixed.q50.jpg");
+
+    /// Inserts `extra` right after SOI, the way an attacker would hide a second header.
+    fn with_prefix(extra: &[u8]) -> Vec<u8> {
+        let mut v = CODE[..2].to_vec();
+        v.extend_from_slice(extra);
+        v.extend_from_slice(&CODE[2..]);
+        v
+    }
+
+    #[test]
+    fn rejects_markers_that_could_hide_a_frame_header() {
+        assert!(check_header(CODE).is_ok());
+        // FF 00 fill followed by a progressive SOF2, as zune-jpeg would read it.
+        let sof2 = [0xFF, 0x00, 0xFF, 0xC2, 0x00, 0x11, 8, 0, 16, 0, 16, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1];
+        assert!(check_header(&with_prefix(&sof2)).is_err());
+        // A restart marker before the frame header.
+        assert!(check_header(&with_prefix(&[0xFF, 0xD0, 0x00, 0x04, 0, 0])).is_err());
+        // TEM.
+        assert!(check_header(&with_prefix(&[0xFF, 0x01, 0x00, 0x04, 0, 0])).is_err());
+    }
+
+    #[test]
+    fn rejects_a_scan_without_all_components() {
+        let sos = CODE.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap();
+        let mut v = CODE.to_vec();
+        v[sos + 4] = 1;
+        assert!(check_header(&v).is_err());
+    }
 
     fn mean(v: &[u8]) -> f64 {
         v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64
