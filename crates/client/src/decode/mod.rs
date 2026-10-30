@@ -82,8 +82,8 @@ pub(crate) fn create_with_export(codec: Codec, export: bool) -> Result<Box<dyn D
 }
 
 pub fn create(codec: Codec, color: ColorFormat) -> Result<Box<dyn Decoder>> {
-    match color {
-        ColorFormat::Yuv420Bt709Limited => {}
+    if color == ColorFormat::Yuv444Bt709Limited && codec != Codec::PyroWave {
+        bail!("{codec:?} streams are 4:2:0 only");
     }
     match codec {
         Codec::Hevc | Codec::H264 => Ok(Box::new(ffmpeg::FfmpegDecoder::new(codec)?)),

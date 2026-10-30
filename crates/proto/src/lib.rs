@@ -38,6 +38,7 @@ pub enum Codec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorFormat {
     Yuv420Bt709Limited,
+    Yuv444Bt709Limited,
 }
 
 /// First message on the control stream, client to host.
