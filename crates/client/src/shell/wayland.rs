@@ -573,7 +573,7 @@ impl State {
             return;
         }
         if let Some(id) = self.kb_focus
-            && let Some(keycode) = keymap::evdev_to_mac(evdev, self.core.swap_ctrl_cmd())
+            && let Some(keycode) = keymap::evdev_to_mac(evdev, false)
         {
             self.core.key(id, keycode, pressed);
         }
@@ -586,14 +586,13 @@ impl SeatHandler for State {
     }
 
     fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
-        if self.clip.device.is_none()
-            && let Some(m) = &self.clip.manager
-        {
-            self.clip.device = Some(m.get_data_device(qh, &seat));
-        }
+        self.ensure_data_device(qh, &seat);
     }
 
     fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
+        // Seats present at startup are bound by SeatState::new without a new_seat callback,
+        // so the first capability is the earliest reliable point to attach the data device.
+        self.ensure_data_device(qh, &seat);
         match capability {
             Capability::Keyboard if self.keyboard.is_none() => match self.seats.get_keyboard(qh, &seat, None) {
                 Ok(k) => self.keyboard = Some(k),
@@ -626,10 +625,22 @@ impl SeatHandler for State {
 }
 
 impl State {
+    fn ensure_data_device(&mut self, qh: &QueueHandle<Self>, seat: &wl_seat::WlSeat) {
+        if self.clip.device.is_none()
+            && let Some(m) = &self.clip.manager
+        {
+            self.clip.device = Some(m.get_data_device(qh, seat));
+            tracing::debug!("clipboard data device ready");
+        }
+    }
+
     /// Puts Mac clipboard text on the local clipboard. Wayland only lets a client with
     /// keyboard focus set the selection, so without focus it waits for the next one.
     fn set_selection(&mut self, text: String) {
-        let (Some(manager), Some(device)) = (&self.clip.manager, &self.clip.device) else { return };
+        let (Some(manager), Some(device)) = (&self.clip.manager, &self.clip.device) else {
+            tracing::warn!("no Wayland data device; cannot set the local clipboard");
+            return;
+        };
         let (Some(serial), Some(_)) = (self.clip.serial, self.kb_focus) else {
             self.clip.pending = Some(text);
             return;

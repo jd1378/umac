@@ -182,7 +182,7 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key
                     && !event.repeat
-                    && let Some(keycode) = keymap::to_mac(code, core.swap_ctrl_cmd())
+                    && let Some(keycode) = keymap::to_mac(code, false)
                 {
                     core.key(remote, keycode, event.state == ElementState::Pressed);
                 }

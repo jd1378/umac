@@ -16,6 +16,10 @@ pub struct Config {
     pub max_fps: u16,
     /// Ctrl acts as Cmd and Super acts as Control, matching Linux/Windows shortcut habits.
     pub swap_ctrl_cmd: bool,
+    /// Rewrite Linux text editing chords (Ctrl+Backspace, Ctrl+Arrows, Home/End) to their Mac
+    /// equivalents, and use Linux terminal keys in Mac terminals (Ctrl+C interrupts,
+    /// Ctrl+Shift+C/V copy and paste).
+    pub linux_shortcuts: bool,
     /// Copies made on the Mac land on this computer's clipboard.
     pub clipboard_to_pc: bool,
     /// When this computer's clipboard is sent to the Mac.
@@ -28,6 +32,7 @@ impl Default for Config {
             bitrate_kbps: 25_000,
             max_fps: 60,
             swap_ctrl_cmd: true,
+            linux_shortcuts: true,
             clipboard_to_pc: true,
             clipboard_to_mac: ClipboardToMac::OnPaste,
         }

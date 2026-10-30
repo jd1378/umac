@@ -10,6 +10,7 @@ pub mod keymap;
 pub mod net;
 pub mod render;
 pub mod sample;
+pub mod shortcuts;
 pub mod shell;
 pub mod ui;
 pub mod viewport;

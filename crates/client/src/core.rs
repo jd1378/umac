@@ -16,6 +16,7 @@ use crate::{
     decode::Nv12Frame,
     net::NetCmd,
     render::{Gpu, WindowRenderer},
+    shortcuts::{Profile, Translator, is_terminal},
     viewport::Fit,
 };
 
@@ -45,6 +46,7 @@ pub struct Core {
     remotes: HashMap<WindowId, Remote>,
     opened_any: bool,
     paste: PasteFlow,
+    keys: Translator,
     pub error: Option<String>,
 }
 
@@ -91,12 +93,9 @@ impl Core {
             remotes: HashMap::new(),
             opened_any: false,
             paste: PasteFlow::new(cfg.clipboard_to_mac),
+            keys: Translator::new(cfg.swap_ctrl_cmd),
             error: None,
         }
-    }
-
-    pub fn swap_ctrl_cmd(&self) -> bool {
-        self.cfg.swap_ctrl_cmd
     }
 
     /// Instance shells create their wgpu surfaces from.
@@ -313,8 +312,15 @@ impl Core {
     }
 
     /// Keys always go to the normal window; the Mac routes them to an open menu itself.
+    /// `keycode` is positional (Linux Ctrl is `kVK_Control`); see `shortcuts`.
     pub fn key(&mut self, window: WindowId, keycode: u16, pressed: bool) {
-        if let Some(window) = self.root(window) {
+        let Some(window) = self.root(window) else { return };
+        let profile = match self.info(window) {
+            _ if !self.cfg.linux_shortcuts => Profile::Native,
+            Some(i) if i.kind == WindowKind::Normal && is_terminal(i.bundle_id.as_deref()) => Profile::Terminal,
+            _ => Profile::Apps,
+        };
+        for (keycode, pressed) in self.keys.key(keycode, pressed, profile) {
             self.input(InputEvent::Key { window, keycode, pressed });
         }
     }
@@ -332,6 +338,7 @@ impl Core {
             self.send(NetCmd::Control(ClientMsg::Focus { window }));
             self.paste.focused();
         } else {
+            self.keys.reset();
             self.input(InputEvent::ReleaseAll);
         }
     }

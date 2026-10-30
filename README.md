@@ -43,3 +43,22 @@ Both live in `~/.config/umac/config.json`, for example:
     { "clipboard_to_pc": true, "clipboard_to_mac": "on_paste" }
 
 Clipboard sync needs the Wayland backend; `--backend winit` does not sync.
+
+## Keyboard
+
+Keys are sent by position, so the Mac's own keyboard layout applies. Held keys repeat on
+the Mac at its own repeat rate (System Settings > Keyboard).
+
+With `"swap_ctrl_cmd": true` (default) Ctrl acts as Cmd and Super as Control. With
+`"linux_shortcuts": true` (default) Linux text editing habits are translated:
+
+| Linux | Mac |
+|---|---|
+| Ctrl+Backspace / Ctrl+Delete | Option+Delete / Option+Forward Delete (delete word) |
+| Ctrl+Left / Ctrl+Right (with Shift) | Option+Left / Option+Right (move or select by word) |
+| Home / End (with Shift) | Cmd+Left / Cmd+Right (line start / end) |
+| Ctrl+Home / Ctrl+End | Cmd+Up / Cmd+Down (document start / end) |
+
+In Mac terminals (Terminal, iTerm2, kitty, Alacritty, WezTerm, Ghostty, Warp) Ctrl stays
+Control so Ctrl+C interrupts, Ctrl+Shift+C / Ctrl+Shift+V copy and paste, and Home / End
+send Ctrl+A / Ctrl+E.

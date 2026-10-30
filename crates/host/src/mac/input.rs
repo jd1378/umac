@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicIsize, AtomicU64, Ordering},
         mpsc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use core_graphics::{
@@ -22,7 +22,7 @@ use umac_proto::{HostMsg, InputEvent, MAX_CLIPBOARD_BYTES, WindowId};
 use super::{ax, ax::AxWindow, pasteboard};
 use crate::{
     clipboard::{FocusTracker, PasteGate, is_paste_item},
-    input_state::{ButtonKey, InputState, KeyAction, Placement},
+    input_state::{ButtonKey, InputState, KeyAction, KeyRepeat, Placement},
 };
 
 /// Where each streamed window currently sits on the Mac; kept fresh by the session poller.
@@ -69,6 +69,8 @@ pub fn spawn(targets: Targets, clip: ClipboardLink) -> mpsc::Sender<Command> {
     std::thread::Builder::new()
         .name("umac-input".into())
         .spawn(move || {
+            let (repeat_delay, repeat_interval) = system_key_repeat();
+            tracing::debug!(?repeat_delay, ?repeat_interval, "key repeat timing");
             let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
                 tracing::error!("cannot create CGEventSource; input disabled");
                 return;
@@ -81,9 +83,11 @@ pub fn spawn(targets: Targets, clip: ClipboardLink) -> mpsc::Sender<Command> {
                 gate: PasteGate::default(),
                 clip,
                 paste_titles: HashMap::new(),
+                repeat: KeyRepeat::new(repeat_delay, repeat_interval),
             };
             loop {
-                let cmd = match inj.gate.deadline() {
+                let deadline = [inj.gate.deadline(), inj.repeat.deadline()].into_iter().flatten().min();
+                let cmd = match deadline {
                     Some(d) => match rx.recv_timeout(d.saturating_duration_since(Instant::now())) {
                         Ok(c) => Some(c),
                         Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -99,9 +103,13 @@ pub fn spawn(targets: Targets, clip: ClipboardLink) -> mpsc::Sender<Command> {
                     Some(Command::Focus(w)) => inj.focus(w),
                     Some(Command::ReleaseAll) => inj.dispatch_local(InputEvent::ReleaseAll),
                     None => {
-                        if let Some(held) = inj.gate.expire(Instant::now()) {
+                        let now = Instant::now();
+                        if let Some(held) = inj.gate.expire(now) {
                             tracing::warn!("client did not send its clipboard in time; pasting without it");
                             inj.replay(held);
+                        }
+                        if let Some(key) = inj.repeat.due(now) {
+                            inj.post_key(key, true, None, inj.state.flags(), true);
                         }
                     }
                 }
@@ -121,6 +129,14 @@ struct Injector {
     clip: ClipboardLink,
     /// Menu-bar Paste titles per app; walking the menu bar costs tens of milliseconds.
     paste_titles: HashMap<i32, (Instant, Vec<String>)>,
+    repeat: KeyRepeat,
+}
+
+/// The Mac's own key repeat settings (System Settings > Keyboard), via NSEvent.
+fn system_key_repeat() -> (Duration, Duration) {
+    let (delay, interval) = super::pasteboard::key_repeat_seconds();
+    let valid = |s: f64, fallback: f64| Duration::from_secs_f64(if s.is_finite() && s > 0.0 && s < 5.0 { s } else { fallback });
+    (valid(delay, 0.5), valid(interval, 0.083))
 }
 
 const PASTE_TITLES_TTL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -258,8 +274,16 @@ impl Injector {
                 }
             }
             InputEvent::MouseButton { window, x, y, button, pressed } => {
-                let Some(t) = self.target(window) else { return };
-                let pos = t.placement.to_global(x, y);
+                // A release must never be dropped, even if its window (a menu) just closed,
+                // or the Mac keeps the button held and later clicks turn into drags.
+                let pos = match self.target(window) {
+                    Some(t) => t.placement.to_global(x, y),
+                    None if !pressed => match self.last_pos.get(&window).or_else(|| self.last_pos.values().next()) {
+                        Some(&p) => p,
+                        None => return,
+                    },
+                    None => return,
+                };
                 self.last_pos.insert(window, pos);
                 let clicks = self.state.button(button, pressed, pos, Instant::now());
                 let b = ButtonKey::from(button);
@@ -297,15 +321,30 @@ impl Injector {
             KeyAction::FlagsChanged { keycode, flags } => (keycode, pressed, Some(CGEventType::FlagsChanged), flags),
             KeyAction::Key { keycode, pressed, flags } => (keycode, pressed, None, flags),
         };
+        if kind.is_none() {
+            if down {
+                self.repeat.press(keycode, Instant::now());
+            } else {
+                self.repeat.release(keycode);
+            }
+        }
+        self.post_key(keycode, down, kind, flags, false);
+    }
+
+    fn post_key(&self, keycode: u16, down: bool, kind: Option<CGEventType>, flags: u64, autorepeat: bool) {
         let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), keycode, down) else { return };
         if let Some(k) = kind {
             ev.set_type(k);
+        }
+        if autorepeat {
+            ev.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
         }
         ev.set_flags(CGEventFlags::from_bits_retain(flags));
         ev.post(CGEventTapLocation::HID);
     }
 
     fn release_all(&mut self) {
+        self.repeat.clear();
         let (keys, buttons, mods) = self.state.take_held();
         for k in keys {
             if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), k, false) {

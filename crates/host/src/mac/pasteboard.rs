@@ -26,6 +26,15 @@ unsafe extern "C" {
     static NSPasteboardTypeString: CFStringRef;
 }
 
+/// `NSEvent.keyRepeatDelay` and `keyRepeatInterval` in seconds.
+pub fn key_repeat_seconds() -> (f64, f64) {
+    unsafe {
+        let send: extern "C" fn(Id, Sel) -> f64 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let class = objc_getClass(c"NSEvent".as_ptr());
+        (send(class, sel(c"keyRepeatDelay")), send(class, sel(c"keyRepeatInterval")))
+    }
+}
+
 fn sel(name: &CStr) -> Sel {
     unsafe { sel_registerName(name.as_ptr()) }
 }

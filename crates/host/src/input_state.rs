@@ -150,6 +150,51 @@ struct ClickCounter {
 }
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
+
+/// Repeats the held key like a physical keyboard: events posted by software never
+/// auto-repeat on macOS, and client-side repeat would add network jitter to the rhythm.
+#[derive(Debug)]
+pub struct KeyRepeat {
+    delay: Duration,
+    interval: Duration,
+    held: Option<(u16, Instant)>,
+}
+
+impl KeyRepeat {
+    pub fn new(delay: Duration, interval: Duration) -> Self {
+        Self { delay, interval: interval.max(Duration::from_millis(5)), held: None }
+    }
+
+    pub fn press(&mut self, keycode: u16, now: Instant) {
+        if !is_modifier(keycode) {
+            self.held = Some((keycode, now + self.delay));
+        }
+    }
+
+    pub fn release(&mut self, keycode: u16) {
+        if self.held.is_some_and(|(k, _)| k == keycode) {
+            self.held = None;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.held = None;
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.held.map(|(_, at)| at)
+    }
+
+    /// The key to repeat now, if due. A late wakeup repeats once instead of bursting.
+    pub fn due(&mut self, now: Instant) -> Option<u16> {
+        let (key, at) = self.held?;
+        if now < at {
+            return None;
+        }
+        self.held = Some((key, (at + self.interval).max(now)));
+        Some(key)
+    }
+}
 const CLICK_SLOP_POINTS: f64 = 4.0;
 
 impl ClickCounter {
@@ -249,6 +294,29 @@ mod tests {
         assert_eq!(s.button(MouseButton::Left, true, (11.0, 12.0), t + Duration::from_millis(1000)), 1);
         assert_eq!(s.button(MouseButton::Right, true, (11.0, 12.0), t + Duration::from_millis(1100)), 1);
         assert_eq!(s.dragging(), Some(ButtonKey(0)));
+    }
+
+    #[test]
+    fn key_repeat_waits_delay_then_repeats_held_key_only() {
+        let t = Instant::now();
+        let ms = Duration::from_millis;
+        let mut r = KeyRepeat::new(ms(300), ms(30));
+        r.press(kVK_Shift, t);
+        assert_eq!(r.deadline(), None);
+        r.press(kVK_Delete, t);
+        assert_eq!(r.due(t + ms(299)), None);
+        assert_eq!(r.due(t + ms(300)), Some(kVK_Delete));
+        assert_eq!(r.due(t + ms(310)), None);
+        assert_eq!(r.due(t + ms(330)), Some(kVK_Delete));
+        // A long stall repeats once, then resumes the normal rhythm.
+        assert_eq!(r.due(t + ms(1000)), Some(kVK_Delete));
+        assert_eq!(r.deadline(), Some(t + ms(1000)));
+        // Pressing another key takes over; releasing the old one does nothing.
+        r.press(kVK_ANSI_A, t + ms(1000));
+        r.release(kVK_Delete);
+        assert!(r.deadline().is_some());
+        r.release(kVK_ANSI_A);
+        assert_eq!(r.deadline(), None);
     }
 
     #[test]
