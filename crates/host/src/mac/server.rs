@@ -583,6 +583,16 @@ impl Session {
             self.rate.report(received, lost, now);
         }
         self.loss = LossCounters { quic_sent: path.sent_packets, quic_lost: path.lost_packets, last: Some(now), ..Default::default() };
+        tracing::debug!(
+            cwnd = path.cwnd,
+            rtt_us = path.rtt.as_micros() as u64,
+            sent,
+            lost,
+            congestion_events = path.congestion_events,
+            mtu = path.current_mtu,
+            max_datagram = self.conn.max_datagram_size().unwrap_or(0),
+            "quic path"
+        );
         if (self.rate.bpp() - before).abs() > 1e-6 {
             tracing::info!(bpp = format_args!("{:.2}", self.rate.bpp()), quic_loss = format_args!("{quic_ratio:.3}"), client_loss = format_args!("{client_ratio:.3}"), "PyroWave budget changed");
         }
