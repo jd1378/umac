@@ -16,7 +16,7 @@ use winit::{
 };
 
 use crate::{
-    core::{self, Core, LINE_PX},
+    core::{self, Core},
     cursor::Shape as CursorShape,
     keymap,
     ui::{UiEvent, UiSender},
@@ -192,7 +192,7 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 // Positive dy scrolls up (wheel away from the user), as in winit and CGEvent.
                 let (dx, dy, precise) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x * LINE_PX, y * LINE_PX, false),
+                    MouseScrollDelta::LineDelta(x, y) => (x, y, false),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32, true),
                 };
                 core.scroll(remote, dx, dy, precise);

@@ -46,7 +46,9 @@ Clipboard sync needs the Wayland backend; `--backend winit` does not sync.
 
 ## Keyboard
 
-Keys are sent by position, so the Mac's own keyboard layout applies. Held keys repeat on
+Keys are sent by position, so the Mac's own keyboard layout applies. Mouse wheel notches
+scroll `"scroll_lines"` lines each (default 3), times your desktop's scroll speed; touchpads
+scroll smoothly in pixels. Held keys repeat on
 the Mac at its own repeat rate (System Settings > Keyboard).
 
 With `"swap_ctrl_cmd": true` (default) Ctrl acts as Cmd and Super as Control. With

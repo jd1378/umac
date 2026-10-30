@@ -228,7 +228,8 @@ pub enum MouseButton {
 pub enum InputEvent {
     MouseMove { window: WindowId, x: f32, y: f32 },
     MouseButton { window: WindowId, x: f32, y: f32, button: MouseButton, pressed: bool },
-    /// Scroll delta in pixels; `precise` is true for touchpads / smooth scrolling.
+    /// Scroll delta. `precise` (touchpads, smooth scrolling): pixels. Otherwise (mouse wheels):
+    /// lines, possibly fractional for high-resolution wheels.
     Scroll { window: WindowId, dx: f32, dy: f32, precise: bool },
     /// macOS virtual keycode (`kVK_*`), see [`keys`].
     Key { window: WindowId, keycode: u16, pressed: bool },

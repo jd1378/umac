@@ -22,8 +22,8 @@ use crate::{
 };
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
-/// Pixels per wheel notch sent as a non-precise scroll, roughly one macOS scroll line.
-pub const LINE_PX: f32 = 10.0;
+/// Wayland axis value of one wheel notch at the desktop's default scroll speed (libinput).
+pub const WHEEL_NOTCH_VALUE: f64 = 15.0;
 /// Popups shown at once; more are refused (a misbehaving host could otherwise flood windows).
 pub const MAX_POPUPS: usize = 16;
 /// Popup offsets beyond this are treated as garbage.
@@ -314,11 +314,19 @@ impl Core {
         }
     }
 
-    /// Positive `dy` scrolls up (wheel away from the user).
+    /// Positive `dy` scrolls up (wheel away from the user). Precise deltas are pixels; wheel
+    /// deltas are notches, sent as `scroll_lines` lines each.
     pub fn scroll(&mut self, window: WindowId, dx: f32, dy: f32, precise: bool) {
-        if self.contains(window) {
-            self.input(InputEvent::Scroll { window, dx, dy, precise });
+        if !self.contains(window) {
+            return;
         }
+        let (dx, dy) = if precise {
+            (dx, dy)
+        } else {
+            let lines = self.cfg.scroll_lines.clamp(0.1, 50.0);
+            (dx * lines, dy * lines)
+        };
+        self.input(InputEvent::Scroll { window, dx, dy, precise });
     }
 
     /// The normal window a popup belongs to (itself for normal windows).

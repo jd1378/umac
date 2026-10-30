@@ -22,7 +22,7 @@ use umac_proto::{HostMsg, InputEvent, MAX_CLIPBOARD_BYTES, WindowId};
 use super::{ax, ax::AxWindow, pasteboard};
 use crate::{
     clipboard::{FocusTracker, PasteGate, is_paste_item},
-    input_state::{ButtonKey, InputState, KeyAction, KeyRepeat, Placement},
+    input_state::{ButtonKey, InputState, KeyAction, KeyRepeat, Placement, WheelLines},
 };
 
 /// Where each streamed window currently sits on the Mac; kept fresh by the session poller.
@@ -85,6 +85,7 @@ pub fn spawn(targets: Targets, clip: ClipboardLink, cursor: mpsc::Sender<()>) ->
                 cursor,
                 paste_titles: HashMap::new(),
                 repeat: KeyRepeat::new(repeat_delay, repeat_interval),
+                wheel: WheelLines::default(),
             };
             loop {
                 let deadline = [inj.gate.deadline(), inj.repeat.deadline()].into_iter().flatten().min();
@@ -131,6 +132,7 @@ struct Injector {
     /// Menu-bar Paste titles per app; walking the menu bar costs tens of milliseconds.
     paste_titles: HashMap<i32, (Instant, Vec<String>)>,
     repeat: KeyRepeat,
+    wheel: WheelLines,
     /// Wakes the cursor watcher after pointer events over a streamed window.
     cursor: mpsc::Sender<()>,
 }
@@ -308,11 +310,18 @@ impl Injector {
                     (p.x + p.width / 2.0, p.y + p.height / 2.0)
                 });
                 // Same sign convention on both ends: positive dy is wheel up (away from the user).
-                let (sx, sy) = ((dx as f64 / t.placement.scale) as i32, (dy as f64 / t.placement.scale) as i32);
+                // Wheels arrive in lines and become line scrolls, so the Mac scrolls like it does
+                // for its own mouse; fractions from high-resolution wheels carry over.
+                let (unit, sx, sy) = if precise {
+                    (ScrollEventUnit::PIXEL, (dx as f64 / t.placement.scale) as i32, (dy as f64 / t.placement.scale) as i32)
+                } else {
+                    let (sx, sy) = self.wheel.add(dx as f64, dy as f64);
+                    (ScrollEventUnit::LINE, sx, sy)
+                };
                 if sx == 0 && sy == 0 {
                     return;
                 }
-                let Ok(ev) = CGEvent::new_scroll_event(self.source.clone(), ScrollEventUnit::PIXEL, 2, sy, sx, 0) else { return };
+                let Ok(ev) = CGEvent::new_scroll_event(self.source.clone(), unit, 2, sy, sx, 0) else { return };
                 ev.set_location(CGPoint::new(pos.0, pos.1));
                 ev.set_flags(self.flags());
                 if precise {

@@ -68,7 +68,7 @@ use umac_proto::{MouseButton, WindowId, WindowInfo, WindowKind};
 
 use crate::{
     clipboard::sendable,
-    core::{self, Core, LINE_PX, MAX_POPUPS},
+    core::{self, Core, MAX_POPUPS, WHEEL_NOTCH_VALUE},
     cursor::{self as cursors, Shape as CursorShape},
     keymap,
     ui::{UiEvent, UiSender},
@@ -249,13 +249,16 @@ struct ImageCursor {
     _buffer: Buffer,
 }
 
-/// Wheel or touchpad scroll on one axis, in the protocol's sign (positive = down/right).
+/// Wheel or touchpad scroll on one axis, in Wayland's sign (positive = down/right): pixels for
+/// touchpads, wheel notches otherwise. Notches are scaled by the desktop's scroll speed, which
+/// the compositor applies to `absolute` (15 per notch at the default speed).
 pub fn axis_delta(absolute: f64, value120: i32, discrete: i32, continuous: bool) -> Option<(f32, bool)> {
     if continuous || (value120 == 0 && discrete == 0) {
         return (absolute != 0.0).then_some((absolute as f32, true));
     }
-    let steps = if value120 != 0 { value120 as f32 / 120.0 } else { discrete as f32 };
-    Some((steps * LINE_PX, false))
+    let steps = if value120 != 0 { value120 as f64 / 120.0 } else { discrete as f64 };
+    let speed = if absolute != 0.0 { (absolute.abs() / (steps.abs() * WHEEL_NOTCH_VALUE)).clamp(0.1, 20.0) } else { 1.0 };
+    Some(((steps * speed) as f32, false))
 }
 
 fn mouse_button(code: u32) -> MouseButton {
@@ -853,9 +856,11 @@ mod tests {
     #[test]
     fn wheel_and_touchpad_axis() {
         // One wheel notch down, hi-res and legacy.
-        assert_eq!(axis_delta(15.0, 120, 1, false), Some((LINE_PX, false)));
-        assert_eq!(axis_delta(15.0, 0, 1, false), Some((LINE_PX, false)));
-        assert_eq!(axis_delta(15.0, 60, 0, false), Some((LINE_PX / 2.0, false)));
+        assert_eq!(axis_delta(15.0, 120, 1, false), Some((1.0, false)));
+        assert_eq!(axis_delta(15.0, 0, 1, false), Some((1.0, false)));
+        assert_eq!(axis_delta(7.5, 60, 0, false), Some((0.5, false)));
+        // Desktop scroll speed doubled: twice the notches.
+        assert_eq!(axis_delta(-30.0, -120, -1, false), Some((-2.0, false)));
         // Touchpad: pixels, precise.
         assert_eq!(axis_delta(-3.5, 0, 0, true), Some((-3.5, true)));
         assert_eq!(axis_delta(0.0, 0, 0, true), None);

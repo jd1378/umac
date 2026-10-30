@@ -151,6 +151,28 @@ struct ClickCounter {
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
+/// Turns fractional wheel lines into whole line scrolls, keeping the remainder so slow
+/// high-resolution wheels still scroll. A direction change drops the old remainder.
+#[derive(Debug, Default)]
+pub struct WheelLines {
+    rest: (f64, f64),
+}
+
+impl WheelLines {
+    pub fn add(&mut self, dx: f64, dy: f64) -> (i32, i32) {
+        let axis = |rest: &mut f64, d: f64| {
+            if d.signum() != rest.signum() && *rest != 0.0 {
+                *rest = 0.0;
+            }
+            *rest += d;
+            let whole = rest.trunc();
+            *rest -= whole;
+            whole as i32
+        };
+        (axis(&mut self.rest.0, dx), axis(&mut self.rest.1, dy))
+    }
+}
+
 /// Repeats the held key like a physical keyboard: events posted by software never
 /// auto-repeat on macOS, and client-side repeat would add network jitter to the rhythm.
 #[derive(Debug)]
@@ -317,6 +339,16 @@ mod tests {
         assert!(r.deadline().is_some());
         r.release(kVK_ANSI_A);
         assert_eq!(r.deadline(), None);
+    }
+
+    #[test]
+    fn wheel_lines_carry_fractions_and_reset_on_reversal() {
+        let mut w = WheelLines::default();
+        assert_eq!(w.add(0.0, 3.0), (0, 3));
+        assert_eq!(w.add(0.0, 0.4), (0, 0));
+        assert_eq!(w.add(0.0, 0.7), (0, 1));
+        assert_eq!(w.add(0.0, -0.5), (0, 0));
+        assert_eq!(w.add(0.0, -0.6), (0, -1));
     }
 
     #[test]

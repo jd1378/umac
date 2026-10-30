@@ -16,6 +16,8 @@ pub struct Config {
     pub max_fps: u16,
     /// Ctrl acts as Cmd and Super acts as Control, matching Linux/Windows shortcut habits.
     pub swap_ctrl_cmd: bool,
+    /// Lines scrolled per mouse wheel notch, before the desktop's own scroll speed factor.
+    pub scroll_lines: f32,
     /// Rewrite Linux text editing chords (Ctrl+Backspace, Ctrl+Arrows, Home/End) to their Mac
     /// equivalents, and use Linux terminal keys in Mac terminals (Ctrl+C interrupts,
     /// Ctrl+Shift+C/V copy and paste).
@@ -33,6 +35,7 @@ impl Default for Config {
             max_fps: 60,
             swap_ctrl_cmd: true,
             linux_shortcuts: true,
+            scroll_lines: 3.0,
             clipboard_to_pc: true,
             clipboard_to_mac: ClipboardToMac::OnPaste,
         }
