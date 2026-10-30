@@ -16,6 +16,8 @@ pub struct EncodedFrame {
     pub keyframe: bool,
     /// Capture time, microseconds on the host monotonic clock.
     pub capture_us: u64,
+    /// When the encoder handed the frame out, same clock.
+    pub encoded_us: u64,
 }
 
 /// Receives encoder output. Encoders may call it from their own threads.

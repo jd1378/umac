@@ -51,6 +51,14 @@ struct App {
 }
 
 impl App {
+    fn apply_titles(&mut self) {
+        for (id, title) in self.core.take_titles() {
+            if let Some(w) = self.window(id) {
+                w.set_title(&title);
+            }
+        }
+    }
+
     fn window(&self, remote: WindowId) -> Option<&Arc<Window>> {
         self.windows.get(self.by_remote.get(&remote)?).map(|(_, w)| w)
     }
@@ -136,7 +144,14 @@ impl ApplicationHandler<UiEvent> for App {
                     }
                 }
             }
-            UiEvent::Frame { window, slot } => self.core.frame(window, &slot),
+            UiEvent::Frame { window, slot } => {
+                // No presentation feedback here: the submit time stands in for on screen.
+                if let Some((timing, submit)) = self.core.frame(window, &slot) {
+                    self.core.shown(window, timing, submit, None);
+                }
+                self.apply_titles();
+            }
+            UiEvent::HostStats { window, host } => self.core.host_stats(window, host),
             UiEvent::Changed(info) => {
                 let (id, kind, offset, parent) = (info.id, info.kind, core::popup_offset(&info), info.parent);
                 let Some(change) = self.core.changed(info) else { return };
@@ -222,6 +237,7 @@ impl ApplicationHandler<UiEvent> for App {
                 {
                     core.key(remote, keycode, event.state == ElementState::Pressed);
                 }
+                self.apply_titles();
             }
             WindowEvent::Focused(focused) => core.focus(remote, focused),
             _ => {}

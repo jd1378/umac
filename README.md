@@ -103,6 +103,20 @@ In Mac terminals (Terminal, iTerm2, kitty, Alacritty, WezTerm, Ghostty, Warp) Ct
 Control so Ctrl+C interrupts, Ctrl+Shift+C / Ctrl+Shift+V copy and paste, and Home / End
 send Ctrl+A / Ctrl+E.
 
+## Latency
+
+`umac latency [--seconds 10]` streams the main display for a while and prints a per-stage
+table; `--stats` on `open`, `desktop` and `launch` (or `"show_stats": true`) logs the same
+stages every 2 s. Ctrl+Alt+Shift+S toggles a live readout (glass-to-glass p50 and fps) in the
+window titles; that S is not sent to the Mac.
+
+Glass to glass runs from the Mac display refresh a frame belongs to (ScreenCaptureKit's
+display time) to when the compositor reports it on screen (Wayland presentation-time; the
+winit backend uses the submit time). The host and client clocks are synced with probes over
+the control stream; the table prints the remaining uncertainty (half the best round trip).
+To measure with steady frames, move the Mac pointer over a desktop stream, e.g.
+`cargo run -p umac-host --example wiggle -- 15` in parallel.
+
 ## Dependencies
 
 Every dependency is pinned to an exact version (`=x.y.z`) and `Cargo.lock` is committed, so

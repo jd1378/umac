@@ -29,8 +29,23 @@ use crate::{
     core::MAX_POPUPS,
     decode,
     gate::KeyframeGate,
+    latency::{self, ClockSync, FrameTiming, HostStages},
     ui::{FrameSlot, UiEvent, UiSender},
 };
+
+/// Clock probes: a burst when the session starts, then a few every interval.
+const PROBE_EVERY: Duration = Duration::from_secs(2);
+const PROBES_PER_ROUND: u64 = 4;
+/// Frames whose first datagram time is remembered while they arrive.
+const MAX_IN_FLIGHT: usize = 64;
+
+/// An encoded frame on its way to the decoder, with when it arrived.
+struct Arrived {
+    frame: fec::Frame,
+    capture: Option<Instant>,
+    first_datagram: Instant,
+    complete: Instant,
+}
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The host waits up to 5 s for a launched app's window; allow for that plus the network.
@@ -189,7 +204,9 @@ struct Stream {
     auto: bool,
     reassembler: Reassembler,
     gate: KeyframeGate,
-    decode_tx: SyncSender<fec::Frame>,
+    decode_tx: SyncSender<Arrived>,
+    /// When the first datagram of each frame still being assembled arrived.
+    first_seen: HashMap<u32, Instant>,
     frames: u32,
     bytes: u64,
     losses: u32,
@@ -256,12 +273,24 @@ pub async fn run_open(
     // SIGTERM (tray Exit) and Ctrl+C end the session cleanly, so the Mac stops streaming at
     // once instead of waiting for the connection to time out.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut clock = ClockSync::default();
+    let mut probe = tokio::time::interval(PROBE_EVERY);
+    let mut probe_nonce = 0u64;
+    if cfg.show_stats {
+        write_msg(&mut ctrl_send, &ClientMsg::WantStats { on: true }).await?;
+    }
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     loop {
         tokio::select! {
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
+            _ = probe.tick() => {
+                for _ in 0..PROBES_PER_ROUND {
+                    probe_nonce += 1;
+                    write_msg(&mut ctrl_send, &ClientMsg::TimeProbe { nonce: probe_nonce, client_us: latency::now_us() }).await?;
+                }
+            }
             dgram = conn.read_datagram() => {
                 let dgram = match dgram {
                     Ok(d) => d,
@@ -271,6 +300,10 @@ pub async fn run_open(
                 let Some(s) = streams.get_mut(&h.window) else { continue };
                 s.bytes += dgram.len() as u64;
                 let now = Instant::now();
+                if s.first_seen.len() >= MAX_IN_FLIGHT {
+                    s.first_seen.clear();
+                }
+                s.first_seen.entry(h.frame_seq).or_insert(now);
                 for out in s.reassembler.push(h, &dgram[HEADER_LEN..], now) {
                     match out {
                         Output::Lost => {
@@ -280,10 +313,13 @@ pub async fn run_open(
                             }
                         }
                         Output::Frame(f) => {
+                            let first_datagram = s.first_seen.remove(&f.meta.seq).unwrap_or(now);
+                            s.first_seen.retain(|&seq, _| seq.wrapping_sub(f.meta.seq) < u32::MAX / 2);
                             if !s.gate.accept(f.meta.keyframe) {
                                 continue;
                             }
-                            match s.decode_tx.try_send(f) {
+                            let capture = clock.capture_instant(f.meta.capture_us, now);
+                            match s.decode_tx.try_send(Arrived { frame: f, capture, first_datagram, complete: now }) {
                                 Ok(()) => s.frames += 1,
                                 Err(TrySendError::Full(_)) => {
                                     if s.gate.on_loss(now) {
@@ -320,11 +356,22 @@ pub async fn run_open(
                             reassembler: Reassembler::default(),
                             gate: KeyframeGate::new(Instant::now()),
                             decode_tx,
+                            first_seen: HashMap::new(),
                             frames: 0,
                             bytes: 0,
                             losses: 0,
                         });
                         ui.send(UiEvent::Open(info));
+                    }
+                    HostMsg::TimeReply { client_us, host_us, .. } => clock.add(client_us, host_us, latency::now_us()),
+                    HostMsg::StreamStats { window, encode_p50_us, encode_p95_us, send_p50_us, .. } => {
+                        let host = HostStages {
+                            encode_p50: encode_p50_us,
+                            encode_p95: encode_p95_us,
+                            send_p50: send_p50_us,
+                            uncertainty: clock.uncertainty_us().unwrap_or(0),
+                        };
+                        ui.send(UiEvent::HostStats { window, host });
                     }
                     HostMsg::WindowChanged(info) if streams.contains_key(&info.id) => {
                         ui.send(UiEvent::Changed(info));
@@ -471,20 +518,21 @@ fn spawn_decoder(
     color: ColorFormat,
     ui: UiSender,
     cmd_tx: mpsc::UnboundedSender<NetCmd>,
-) -> Result<SyncSender<fec::Frame>> {
+) -> Result<SyncSender<Arrived>> {
     let mut decoder = decode::create(codec, color)?;
     tracing::info!(window, "decoder: {}", decoder.describe());
-    let (tx, rx) = sync_channel::<fec::Frame>(DECODE_QUEUE);
+    let (tx, rx) = sync_channel::<Arrived>(DECODE_QUEUE);
     std::thread::Builder::new().name(format!("decode-{window}")).spawn(move || {
         let slot = Arc::new(FrameSlot::default());
         let (mut n, mut total, mut since) = (0u32, Duration::ZERO, Instant::now());
-        while let Ok(f) = rx.recv() {
+        while let Ok(a) = rx.recv() {
             let t = Instant::now();
-            match decoder.decode(&f.data) {
+            match decoder.decode(&a.frame.data) {
                 Ok(Some(frame)) => {
                     total += t.elapsed();
                     n += 1;
-                    if slot.put(frame, Instant::now()) && !ui.send(UiEvent::Frame { window, slot: slot.clone() }) {
+                    let timing = FrameTiming { capture: a.capture, first_datagram: a.first_datagram, complete: a.complete, decoded: Instant::now() };
+                    if slot.put(frame, timing) && !ui.send(UiEvent::Frame { window, slot: slot.clone() }) {
                         break;
                     }
                 }
@@ -542,6 +590,7 @@ mod tests {
             reassembler: Reassembler::default(),
             gate: KeyframeGate::new(Instant::now()),
             decode_tx: sync_channel(1).0,
+            first_seen: HashMap::new(),
             frames: 0,
             bytes: 0,
             losses: 0,

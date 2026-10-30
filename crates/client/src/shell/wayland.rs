@@ -42,7 +42,13 @@ use smithay_client_toolkit::{
                 wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
             },
         },
-        protocols::xdg::shell::client::xdg_positioner::{Anchor, ConstraintAdjustment, Gravity},
+        protocols::{
+            wp::presentation_time::client::{
+                wp_presentation::{self, WpPresentation},
+                wp_presentation_feedback::{self, WpPresentationFeedback},
+            },
+            xdg::shell::client::xdg_positioner::{Anchor, ConstraintAdjustment, Gravity},
+        },
     },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -71,8 +77,39 @@ use crate::{
     core::{self, Core, MAX_POPUPS, WHEEL_NOTCH_VALUE},
     cursor::{self as cursors, Shape as CursorShape},
     keymap,
+    latency::{self, FrameTiming},
     ui::{UiEvent, UiSender},
 };
+
+/// CLOCK_MONOTONIC, the presentation clock unless the compositor says otherwise.
+const DEFAULT_PRESENTATION_CLOCK: u32 = 1;
+
+/// The presentation-time global; its only event names the clock of the timestamps.
+struct PresentationData;
+
+impl smithay_client_toolkit::dispatch2::Dispatch2<WpPresentation, State> for PresentationData {
+    fn event(&self, state: &mut State, _: &WpPresentation, event: wp_presentation::Event, _: &Connection, _: &QueueHandle<State>) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            state.presentation_clock = clk_id;
+        }
+    }
+}
+
+/// One frame's presentation feedback; the timing is filled in once the frame was submitted.
+struct FeedbackData {
+    window: WindowId,
+    frame: Arc<std::sync::Mutex<Option<(FrameTiming, Instant)>>>,
+}
+
+impl smithay_client_toolkit::dispatch2::Dispatch2<WpPresentationFeedback, State> for FeedbackData {
+    fn event(&self, state: &mut State, _: &WpPresentationFeedback, event: wp_presentation_feedback::Event, _: &Connection, _: &QueueHandle<State>) {
+        let wp_presentation_feedback::Event::Presented { tv_sec_hi, tv_sec_lo, tv_nsec, .. } = event else { return };
+        let Some((timing, submit)) = self.frame.lock().ok().and_then(|mut f| f.take()) else { return };
+        let sec = ((tv_sec_hi as u64) << 32) | tv_sec_lo as u64;
+        let shown = latency::from_clock(state.presentation_clock, sec, tv_nsec);
+        state.core.shown(self.window, timing, submit, shown);
+    }
+}
 
 const APP_ID: &str = "dev.umac.client";
 /// Text types we offer and accept, most preferred first.
@@ -157,6 +194,8 @@ impl Shell {
             hover: None,
             cursor_image: None,
             kb_focus: None,
+            presentation: globals.bind::<WpPresentation, _, _>(&qh, 1..=2, PresentationData).ok(),
+            presentation_clock: DEFAULT_PRESENTATION_CLOCK,
             exit: false,
         };
         WaylandSource::new(conn, queue).insert(event_loop.handle()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -237,6 +276,9 @@ struct State {
     hover: Option<(WindowId, u32)>,
     cursor_image: Option<ImageCursor>,
     kb_focus: Option<WindowId>,
+    /// Reports when frames actually reach the screen; absent on some compositors.
+    presentation: Option<WpPresentation>,
+    presentation_clock: u32,
     exit: bool,
 }
 
@@ -302,7 +344,8 @@ impl State {
                     }
                 }
             }
-            UiEvent::Frame { window, slot } => self.core.frame(window, &slot),
+            UiEvent::Frame { window, slot } => self.present(window, &slot),
+            UiEvent::HostStats { window, host } => self.core.host_stats(window, host),
             UiEvent::Changed(info) => self.changed(info),
             UiEvent::Closed(window) => self.close(window),
             UiEvent::Shutdown(reason) => {
@@ -407,6 +450,33 @@ impl State {
             ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY | ConstraintAdjustment::FlipX | ConstraintAdjustment::FlipY,
         );
         Ok(p)
+    }
+
+    /// Draws a decoded frame and asks the compositor when it reaches the screen. The feedback
+    /// request applies to the next commit, which wgpu makes while presenting.
+    fn present(&mut self, window: WindowId, slot: &crate::ui::FrameSlot) {
+        let feedback = match (&self.presentation, self.nodes.get(&window)) {
+            (Some(p), Some(node)) => {
+                let frame = Arc::new(std::sync::Mutex::new(None));
+                p.feedback(node.shape.wl_surface(), &self.qh, FeedbackData { window, frame: frame.clone() });
+                Some(frame)
+            }
+            _ => None,
+        };
+        let Some(frame) = self.core.frame(window, slot) else { return };
+        match feedback {
+            Some(slot) => *slot.lock().unwrap() = Some(frame),
+            None => self.core.shown(window, frame.0, frame.1, None),
+        }
+        self.apply_titles();
+    }
+
+    fn apply_titles(&mut self) {
+        for (id, title) in self.core.take_titles() {
+            if let Some(Shape::Toplevel(w)) = self.nodes.get(&id).map(|n| &n.shape) {
+                w.set_title(title);
+            }
+        }
     }
 
     fn changed(&mut self, info: WindowInfo) {
@@ -610,6 +680,7 @@ impl KeyboardHandler for State {
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, serial: u32, event: KeyEvent) {
         self.clip.serial = Some(serial);
         self.key(event.raw_code, true);
+        self.apply_titles();
     }
 
     fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {

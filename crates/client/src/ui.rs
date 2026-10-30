@@ -5,12 +5,11 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
     },
-    time::Instant,
 };
 
 use umac_proto::{CursorShape, WindowId, WindowInfo};
 
-use crate::decode::Picture;
+use crate::{decode::Picture, latency::{FrameTiming, HostStages}};
 
 pub enum UiEvent {
     Open(WindowInfo),
@@ -25,6 +24,8 @@ pub enum UiEvent {
     ClipboardRequest(u64),
     /// The Mac cursor changed; `shape` is `None` for a cached image (`CursorKnown`).
     Cursor { id: u64, shape: Option<CursorShape> },
+    /// Host side latency stages of a window (only while stats are on).
+    HostStats { window: WindowId, host: HostStages },
 }
 
 /// The newest decoded picture of one window, waiting for the UI thread. Holding at most one
@@ -32,23 +33,23 @@ pub enum UiEvent {
 /// and the decoder's pool is small.
 #[derive(Default)]
 pub struct FrameSlot {
-    pending: Mutex<Option<(Picture, Instant)>>,
+    pending: Mutex<Option<(Picture, FrameTiming)>>,
     dropped: AtomicU32,
 }
 
 impl FrameSlot {
     /// Stores a picture, replacing one the UI has not taken yet. Returns true if the slot was
     /// empty, i.e. the UI needs a `Frame` event to come and take it.
-    pub fn put(&self, picture: Picture, decoded: Instant) -> bool {
-        let old = self.pending.lock().unwrap().replace((picture, decoded));
+    pub fn put(&self, picture: Picture, timing: FrameTiming) -> bool {
+        let old = self.pending.lock().unwrap().replace((picture, timing));
         if old.is_some() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
         old.is_none()
     }
 
-    /// The waiting picture and when it was decoded.
-    pub fn take(&self) -> Option<(Picture, Instant)> {
+    /// The waiting picture and its arrival and decode times.
+    pub fn take(&self) -> Option<(Picture, FrameTiming)> {
         self.pending.lock().unwrap().take()
     }
 

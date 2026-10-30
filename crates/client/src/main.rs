@@ -86,6 +86,9 @@ enum Cmd {
         /// Windowing backend.
         #[arg(long, value_enum, default_value_t = Backend::Auto)]
         backend: Backend,
+        /// Log latency per stage every 2 s.
+        #[arg(long)]
+        stats: bool,
     },
     /// Open something on the Mac (a new Terminal window, Activity Monitor...) and stream it.
     Launch {
@@ -95,6 +98,9 @@ enum Cmd {
         host: Option<String>,
         #[arg(long, value_enum, default_value_t = Backend::Auto)]
         backend: Backend,
+        /// Log latency per stage every 2 s.
+        #[arg(long)]
+        stats: bool,
     },
     /// Run the tray in the foreground (`umac` alone starts it in the background).
     Daemon,
@@ -120,7 +126,30 @@ enum Cmd {
         bitrate: Option<u32>,
         #[arg(long, value_enum, default_value_t = Backend::Auto)]
         backend: Backend,
+        /// Log latency per stage every 2 s.
+        #[arg(long)]
+        stats: bool,
     },
+    /// Measure latency: streams the desktop for a while, then prints a per-stage summary.
+    Latency {
+        #[arg(long)]
+        host: Option<String>,
+        /// Display index from `umac displays` (default: the main display).
+        #[arg(long)]
+        display: Option<u32>,
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+        #[arg(long, value_enum, default_value_t = Backend::Auto)]
+        backend: Backend,
+    },
+}
+
+/// Latency reporting for a streaming session.
+#[derive(Clone, Copy, Default)]
+struct Stats {
+    show: bool,
+    /// End the session after this long and print a summary (`umac latency`).
+    run_for: Option<std::time::Duration>,
 }
 
 fn main() -> Result<()> {
@@ -189,7 +218,7 @@ fn run(rt: &tokio::runtime::Runtime, store: Store, config_dir: Option<PathBuf>, 
                 println!("{:>8}  {:<24} {:>11}  {}", w.id, w.app_name, size, w.title);
             }
         }
-        Cmd::Launch { what, host, backend } => {
+        Cmd::Launch { what, host, backend, stats } => {
             let entry = store.host(host.as_deref())?;
             let action = LaunchAction::from(what);
             let info = rt.block_on(async {
@@ -202,7 +231,8 @@ fn run(rt: &tokio::runtime::Runtime, store: Store, config_dir: Option<PathBuf>, 
                     r => r,
                 }
             })?;
-            run_streams(rt, store, entry, Targets { windows: vec![info.id], ..Default::default() }, backend)?;
+            let stats = Stats { show: stats, ..Default::default() };
+            run_streams(rt, store, entry, Targets { windows: vec![info.id], ..Default::default() }, backend, stats)?;
         }
         Cmd::Daemon => rt.block_on(daemon::run(store, config_dir))?,
         Cmd::Autostart { action } => {
@@ -240,31 +270,82 @@ fn run(rt: &tokio::runtime::Runtime, store: Store, config_dir: Option<PathBuf>, 
                 println!("{:>5}  {:>11}  {:>5}  {}{}", d.index, size, d.scale, d.name, if d.main { " (main)" } else { "" });
             }
         }
-        Cmd::Desktop { host, display, bitrate, backend } => {
+        Cmd::Desktop { host, display, bitrate, backend, stats } => {
             let entry = store.host(host.as_deref())?;
-            let index = match display {
-                Some(i) => i,
-                None => rt.block_on(async {
-                    let mut s = net::connect(&store, &entry, None).await?;
-                    let list = s.list_displays().await?;
-                    anyhow::Ok(list.iter().find(|d| d.main).or(list.first()).context("host has no displays")?.index)
-                })?,
-            };
+            let index = display_index(rt, &store, &entry, display)?;
             let targets = Targets { displays: vec![index], desktop_bitrate_kbps: bitrate, ..Default::default() };
-            run_streams(rt, store, entry, targets, backend)?;
+            run_streams(rt, store, entry, targets, backend, Stats { show: stats, ..Default::default() })?;
         }
-        Cmd::Open { host, windows, apps, backend } => {
+        Cmd::Latency { host, display, seconds, backend } => {
+            let entry = store.host(host.as_deref())?;
+            let index = display_index(rt, &store, &entry, display)?;
+            let targets = Targets { displays: vec![index], ..Default::default() };
+            let stats = Stats { show: true, run_for: Some(std::time::Duration::from_secs(seconds.max(1))) };
+            run_streams(rt, store, entry, targets, backend, stats)?;
+            print_summary(seconds);
+        }
+        Cmd::Open { host, windows, apps, backend, stats } => {
             anyhow::ensure!(!windows.is_empty() || !apps.is_empty(), "give at least one --window or --app");
             let entry = store.host(host.as_deref())?;
-            run_streams(rt, store, entry, Targets { windows, apps, ..Default::default() }, backend)?;
+            run_streams(rt, store, entry, Targets { windows, apps, ..Default::default() }, backend, Stats { show: stats, ..Default::default() })?;
         }
     }
     Ok(())
 }
 
-/// Streams `targets` until every window is closed.
-fn run_streams(rt: &tokio::runtime::Runtime, store: Store, entry: HostEntry, targets: Targets, backend: Backend) -> Result<()> {
-    let cfg = store.config()?;
+fn display_index(rt: &tokio::runtime::Runtime, store: &Store, entry: &HostEntry, display: Option<u32>) -> Result<u32> {
+    if let Some(i) = display {
+        return Ok(i);
+    }
+    rt.block_on(async {
+        let mut s = net::connect(store, entry, None).await?;
+        let list = s.list_displays().await?;
+        anyhow::Ok(list.iter().find(|d| d.main).or(list.first()).context("host has no displays")?.index)
+    })
+}
+
+fn print_summary(seconds: u64) {
+    let runs = umac_client::core::SUMMARY.lock().map(|s| s.clone()).unwrap_or_default();
+    if runs.is_empty() {
+        println!("no frames were shown; nothing to report");
+        return;
+    }
+    let pair = |x: Option<(f64, f64)>| x.map_or("-".to_owned(), |(a, b)| format!("{a:>6.1} {b:>6.1}"));
+    let one = |x: Option<f64>| x.map_or("-".to_owned(), |a| format!("{a:>6.1}"));
+    for (title, r) in runs {
+        println!("\n{title}: {} frames in {seconds} s (milliseconds)", r.frames);
+        println!("  {:<34} {:>6} {:>6}", "stage", "p50", "p95");
+        println!("  {:<34} {}", "glass to glass (Mac shown -> here)", pair(r.glass));
+        println!("  {:<34} {}", "  host capture -> encoded", pair(r.encode));
+        println!("  {:<34} {}", "  host encoded -> sent", one(r.send));
+        println!("  {:<34} {}", "  network + reassembly", one(r.network));
+        println!("  {:<34} {}", "  frame transfer (first -> last)", pair(r.transfer));
+        println!("  {:<34} {}", "  decode", pair(r.decode));
+        println!("  {:<34} {}", "  render and submit", pair(r.render));
+        println!("  {:<34} {}", "  submit -> on screen", pair(r.display));
+        println!("  clock sync uncertainty: ±{} ms", one(r.uncertainty).trim());
+    }
+}
+
+/// Streams `targets` until every window is closed (or `stats.run_for` passed).
+fn run_streams(
+    rt: &tokio::runtime::Runtime,
+    store: Store,
+    entry: HostEntry,
+    targets: Targets,
+    backend: Backend,
+    stats: Stats,
+) -> Result<()> {
+    let mut cfg = store.config()?;
+    cfg.show_stats |= stats.show;
+    cfg.latency_summary = stats.run_for.is_some();
+    if let Some(after) = stats.run_for {
+        // The session already ends cleanly on SIGTERM.
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) };
+        });
+    }
     let shell = Shell::new(backend)?;
     let ui = shell.sender();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();

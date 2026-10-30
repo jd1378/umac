@@ -35,6 +35,11 @@ pub struct Config {
     /// Open the window the Mac focuses when it is not shown yet: an app started from a
     /// streamed window, a password prompt or alert that pops up, a Cmd+Tab switch.
     pub follow_focus: bool,
+    /// Log per-window latency stages every 2 s (also `--stats`).
+    pub show_stats: bool,
+    /// Keep every frame's stages for a summary when the session ends (`umac latency`).
+    #[serde(skip)]
+    pub latency_summary: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +65,8 @@ impl Default for Config {
             tray_icon_color: TrayIconColor::Auto,
             follow_new_windows: true,
             follow_focus: true,
+            show_stats: false,
+            latency_summary: false,
         }
     }
 }

@@ -139,6 +139,10 @@ pub enum ClientMsg {
     /// Runs one of a fixed set of Mac actions and reports the window it opened, which the
     /// client then subscribes to. Never arbitrary commands.
     Launch { nonce: u64, action: LaunchAction },
+    /// Clock sync probe: `client_us` is the client's clock at send time.
+    TimeProbe { nonce: u64, client_us: u64 },
+    /// Turns per-stream `StreamStats` from the host on or off.
+    WantStats { on: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -170,6 +174,11 @@ pub enum HostMsg {
     CursorKnown { id: u64 },
     /// Answer to `Launch`: the new (or reused) window to stream, or why it failed.
     Launched { nonce: u64, result: Result<WindowInfo, String> },
+    /// Answer to `TimeProbe`; `host_us` is on the clock of the video `capture_us`.
+    TimeReply { nonce: u64, client_us: u64, host_us: u64 },
+    /// Host side latency of one stream over the last interval, in microseconds:
+    /// capture to encoded, and encoded to the last datagram queued.
+    StreamStats { window: WindowId, encode_p50_us: u32, encode_p95_us: u32, send_p50_us: u32, frames: u32 },
 }
 
 /// Largest cursor image accepted, per side, in pixels.

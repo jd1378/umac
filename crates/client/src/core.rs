@@ -15,6 +15,7 @@ use crate::{
     config::Config,
     cursor::{Cursors, Shape},
     net::NetCmd,
+    latency::{FrameTiming, HostStages, Recorder, Report, Stages},
     render::{Gpu, WindowRenderer},
     shortcuts::{Profile, Translator, is_terminal},
     ui::FrameSlot,
@@ -40,7 +41,16 @@ struct Remote {
     present_lag: Duration,
     ui_time: Duration,
     stats_since: Instant,
+    latency: Recorder,
+    latency_since: Instant,
+    latency_frames: u32,
 }
+
+/// How often latency stages are logged and the title readout refreshed.
+const LATENCY_EVERY: Duration = Duration::from_secs(2);
+
+/// Per-window latency over a whole `umac latency` run, collected when the client closes.
+pub static SUMMARY: std::sync::Mutex<Vec<(String, Report)>> = std::sync::Mutex::new(Vec::new());
 
 pub struct Core {
     cfg: Config,
@@ -52,6 +62,12 @@ pub struct Core {
     paste: PasteFlow,
     keys: Translator,
     cursors: Cursors,
+    /// Ctrl+Alt+Shift+S: latency and fps in window titles.
+    title_stats: bool,
+    /// Positional modifiers held, to spot the stats hotkey before translation.
+    held: std::collections::BTreeSet<u16>,
+    swallow_s: bool,
+    titles: Vec<(WindowId, String)>,
     pub error: Option<String>,
 }
 
@@ -100,7 +116,44 @@ impl Core {
             paste: PasteFlow::new(cfg.clipboard_to_mac),
             keys: Translator::new(cfg.swap_ctrl_cmd),
             cursors: Cursors::default(),
+            title_stats: false,
+            held: Default::default(),
+            swallow_s: false,
+            titles: Vec::new(),
             error: None,
+        }
+    }
+
+    /// Window titles to set, after the latency readout was toggled or refreshed.
+    pub fn take_titles(&mut self) -> Vec<(WindowId, String)> {
+        std::mem::take(&mut self.titles)
+    }
+
+    pub fn host_stats(&mut self, window: WindowId, host: HostStages) {
+        if let Some(r) = self.remotes.get_mut(&window) {
+            r.latency.host = Some(host);
+        }
+    }
+
+    /// Records a presented frame: `shown` is when it reached the screen if the compositor
+    /// said so, else `None` and the submit time stands in.
+    pub fn shown(&mut self, window: WindowId, timing: FrameTiming, submit: Instant, shown: Option<Instant>) {
+        let Some(r) = self.remotes.get_mut(&window) else { return };
+        r.latency.record(Stages::of(&timing, submit, shown));
+        r.latency_frames += 1;
+        let elapsed = r.latency_since.elapsed();
+        if elapsed < LATENCY_EVERY {
+            return;
+        }
+        let fps = r.latency_frames as f64 / elapsed.as_secs_f64();
+        let report = r.latency.take();
+        (r.latency_since, r.latency_frames) = (Instant::now(), 0);
+        if self.cfg.show_stats {
+            tracing::info!(window, fps = format_args!("{fps:.0}"), "latency ms p50/p95: {}", report.line());
+        }
+        if self.title_stats {
+            let glass = report.glass.map_or("?".into(), |g| format!("{:.0} ms", g.0));
+            self.titles.push((window, format!("{} ({glass}, {fps:.0} fps)", title(&r.info))));
         }
     }
 
@@ -175,6 +228,9 @@ impl Core {
                 present_lag: Duration::ZERO,
                 ui_time: Duration::ZERO,
                 stats_since: Instant::now(),
+                latency: Recorder::new(self.cfg.latency_summary),
+                latency_since: Instant::now(),
+                latency_frames: 0,
             },
         );
         Ok(())
@@ -182,10 +238,19 @@ impl Core {
 
     /// Drops the window's renderer. Call before destroying the native surface.
     pub fn remove(&mut self, window: WindowId) {
-        if self.remotes.remove(&window).is_some()
-            && let Some(gpu) = self.gpu.as_mut()
+        if let Some(r) = self.remotes.remove(&window) {
+            self.keep_summary(&r);
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.forget(window as u64);
+            }
+        }
+    }
+
+    fn keep_summary(&self, r: &Remote) {
+        if self.cfg.latency_summary
+            && let Ok(mut s) = SUMMARY.lock()
         {
-            gpu.forget(window as u64);
+            s.push((title(&r.info), r.latency.run_report()));
         }
     }
 
@@ -210,10 +275,12 @@ impl Core {
     }
 
     /// Draws the picture waiting in `slot`, if the decoder has not already replaced it with a
-    /// newer one that a later event will bring.
-    pub fn frame(&mut self, window: WindowId, slot: &FrameSlot) {
-        let (Some(r), Some(gpu)) = (self.remotes.get_mut(&window), self.gpu.as_mut()) else { return };
-        let Some((frame, decoded)) = slot.take() else { return };
+    /// newer one that a later event will bring. Returns its timing and submit time, for
+    /// `shown` once the shell knows when it reached the screen.
+    pub fn frame(&mut self, window: WindowId, slot: &FrameSlot) -> Option<(FrameTiming, Instant)> {
+        let (Some(r), Some(gpu)) = (self.remotes.get_mut(&window), self.gpu.as_mut()) else { return None };
+        let (frame, timing) = slot.take()?;
+        let decoded = timing.decoded;
         let start = Instant::now();
         r.renderer.upload(gpu, frame);
         r.renderer.render(gpu);
@@ -233,6 +300,7 @@ impl Core {
             );
             (r.presented, r.ui_time, r.present_lag, r.stats_since) = (0, Duration::ZERO, Duration::ZERO, Instant::now());
         }
+        Some((timing, end))
     }
 
     pub fn redraw(&mut self, window: WindowId) {
@@ -351,6 +419,9 @@ impl Core {
     /// Keys always go to the normal window; the Mac routes them to an open menu itself.
     /// `keycode` is positional (Linux Ctrl is `kVK_Control`); see `shortcuts`.
     pub fn key(&mut self, window: WindowId, keycode: u16, pressed: bool) {
+        if self.stats_hotkey(keycode, pressed) {
+            return;
+        }
         let Some(window) = self.root(window) else { return };
         let profile = match self.info(window) {
             _ if !self.cfg.linux_shortcuts => Profile::Native,
@@ -360,6 +431,37 @@ impl Core {
         for (keycode, pressed) in self.keys.key(keycode, pressed, profile) {
             self.input(InputEvent::Key { window, keycode, pressed });
         }
+    }
+
+    /// Ctrl+Alt+Shift+S toggles the latency readout in window titles; that S never reaches the
+    /// Mac. Returns true if the key was consumed.
+    fn stats_hotkey(&mut self, keycode: u16, pressed: bool) -> bool {
+        use umac_proto::keys::*;
+        if is_modifier(keycode) {
+            if pressed {
+                self.held.insert(keycode);
+            } else {
+                self.held.remove(&keycode);
+            }
+            return false;
+        }
+        if keycode != kVK_ANSI_S {
+            return false;
+        }
+        if !pressed {
+            return std::mem::take(&mut self.swallow_s);
+        }
+        let has = |a, b| self.held.contains(&a) || self.held.contains(&b);
+        if !(has(kVK_Control, kVK_RightControl) && has(kVK_Option, kVK_RightOption) && has(kVK_Shift, kVK_RightShift)) {
+            return false;
+        }
+        self.swallow_s = true;
+        self.title_stats = !self.title_stats;
+        if !self.title_stats {
+            self.titles.extend(self.remotes.values().map(|r| (r.info.id, title(&r.info))));
+        }
+        tracing::info!(on = self.title_stats, "latency readout in window titles");
+        true
     }
 
     /// Applies a cursor change from the host; true if the shown shape should change.
@@ -399,6 +501,7 @@ impl Core {
             self.paste.focused();
         } else {
             self.keys.reset();
+            self.held.clear();
             self.input(InputEvent::ReleaseAll);
         }
     }
@@ -417,9 +520,36 @@ pub fn popup_anchor(offset: (i32, i32), parent: (u32, u32)) -> ((i32, i32), (i32
     (anchor, (offset.0 - anchor.0, offset.1 - anchor.1))
 }
 
+impl Drop for Core {
+    fn drop(&mut self) {
+        for r in self.remotes.values() {
+            self.keep_summary(r);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stats_hotkey_toggles_and_swallows_the_s() {
+        use umac_proto::keys::*;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut core = Core::new(Config::default(), tx);
+        for k in [kVK_Control, kVK_Option, kVK_Shift] {
+            core.key(1, k, true);
+        }
+        while rx.try_recv().is_ok() {}
+        core.key(1, kVK_ANSI_S, true);
+        core.key(1, kVK_ANSI_S, false);
+        assert!(core.title_stats);
+        // Modifiers go to the Mac as usual; the S itself never does.
+        assert!(rx.try_recv().is_err());
+        core.key(1, kVK_Shift, false);
+        core.key(1, kVK_ANSI_S, true);
+        assert!(core.title_stats, "plain Ctrl+Alt+S is not the hotkey");
+    }
 
     fn info(kind: WindowKind, width: u32, height: u32) -> WindowInfo {
         WindowInfo {

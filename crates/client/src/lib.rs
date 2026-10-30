@@ -12,6 +12,7 @@ pub mod daemon;
 pub mod decode;
 pub mod gate;
 pub mod keymap;
+pub mod latency;
 pub mod net;
 pub mod render;
 pub mod sample;

@@ -39,16 +39,20 @@ use super::{
 };
 use crate::{
     auth::AuthStore,
-    clipboard, config,
+    clipboard, clock, config,
     config::Settings,
     encode::EncodedFrame,
+    latency::StageStats,
     input_state::Placement,
     newwin,
+    owners::{self, ClientId, Owners},
     popup::{self, Candidate},
     status::Status,
 };
 
 const SUPPORTED: [Codec; 2] = [Codec::Hevc, Codec::H264];
+/// How often per-stream latency stats are reported.
+const STATS_EVERY: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(250);
 /// Popups (menus, tooltips) must show up fast, so they get their own cheap, quick poll.
 const POPUP_POLL: Duration = Duration::from_millis(40);
@@ -68,6 +72,16 @@ struct Shared {
     /// The Mac cursor shape over streamed windows; each session forwards changes.
     cursor: watch::Receiver<Option<Arc<Cursor>>>,
     host_name: String,
+    /// Which session shows each window, so a client never gets the same window twice.
+    owners: Mutex<Owners>,
+    /// Lets a session take a window over from another one.
+    sessions: Mutex<HashMap<u64, mpsc::UnboundedSender<SessionCmd>>>,
+}
+
+/// Work one session asks of another.
+enum SessionCmd {
+    /// Another session of the same client now shows this window: stop it here.
+    Release(WindowId),
 }
 
 pub async fn run(settings: Settings) -> anyhow::Result<()> {
@@ -120,6 +134,8 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         clipboard: clipboard_tx,
         auth: AuthStore::new(&config::support_dir()),
         host_name: host_name(),
+        owners: Mutex::default(),
+        sessions: Mutex::default(),
         settings,
     });
     while let Some(incoming) = endpoint.accept().await {
@@ -206,14 +222,20 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
     tracing::info!(client = %hello.client_name, remote = %conn.remote_address(), ?codec, "client connected");
 
     let (frames_tx, frames_rx) = mpsc::channel::<(WindowId, EncodedFrame)>(FRAME_QUEUE);
-    let sender = tokio::spawn(send_frames(conn.clone(), frames_rx, shared.settings.fec_percent));
+    let stats = Arc::new(Mutex::new(StageStats::default()));
+    let sender = tokio::spawn(send_frames(conn.clone(), frames_rx, shared.settings.fec_percent, stats.clone()));
     static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
     let (reply_tx, reply_rx) = mpsc::unbounded_channel::<HostMsg>();
-    let input_task = tokio::spawn(read_input(conn.clone(), shared.clone(), id, reply_tx.clone()));
+    let client: ClientId = fp.0;
+    let input_task = tokio::spawn(read_input(conn.clone(), shared.clone(), client, id, reply_tx.clone()));
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+    shared.sessions.lock().unwrap().insert(id, cmd_tx);
+    shared.owners.lock().unwrap().open(client, id);
 
     let mut session = Session {
         id,
+        client,
         shared: shared.clone(),
         codec,
         streams: HashMap::new(),
@@ -223,11 +245,15 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
         focus: newwin::FocusFollower::default(),
         frames_tx,
         replies: reply_tx,
+        stats,
+        want_stats: false,
     };
-    let result = session.control_loop(&mut send, recv, reply_rx).await;
+    let result = session.control_loop(&mut send, recv, reply_rx, cmd_rx).await;
 
     let windows: Vec<WindowId> = session.streams.keys().copied().collect();
     drop(session);
+    shared.sessions.lock().unwrap().remove(&id);
+    shared.owners.lock().unwrap().close(client, id);
     if let Ok(mut t) = shared.targets.write() {
         for w in windows {
             t.remove(&w);
@@ -267,7 +293,12 @@ fn authorize(shared: &Shared, hello: &Hello, fp: &Fingerprint) -> Result<(), &'s
     }
 }
 
-async fn send_frames(conn: quinn::Connection, mut rx: mpsc::Receiver<(WindowId, EncodedFrame)>, fec_percent: u8) {
+async fn send_frames(
+    conn: quinn::Connection,
+    mut rx: mpsc::Receiver<(WindowId, EncodedFrame)>,
+    fec_percent: u8,
+    stats: Arc<Mutex<StageStats>>,
+) {
     let mut seqs: HashMap<WindowId, u32> = HashMap::new();
     while let Some((window, frame)) = rx.recv().await {
         let Some(max) = conn.max_datagram_size() else {
@@ -289,10 +320,14 @@ async fn send_frames(conn: quinn::Connection, mut rx: mpsc::Receiver<(WindowId, 
                 return;
             }
         }
+        let sent = clock::now_us();
+        if let Ok(mut s) = stats.lock() {
+            s.record(window, frame.encoded_us.saturating_sub(frame.capture_us), sent.saturating_sub(frame.encoded_us));
+        }
     }
 }
 
-async fn read_input(conn: quinn::Connection, shared: Arc<Shared>, session: u64, reply: Reply) {
+async fn read_input(conn: quinn::Connection, shared: Arc<Shared>, client: ClientId, session: u64, reply: Reply) {
     while let Ok(mut recv) = conn.accept_uni().await {
         let (shared, reply) = (shared.clone(), reply.clone());
         tokio::spawn(async move {
@@ -300,6 +335,7 @@ async fn read_input(conn: quinn::Connection, shared: Arc<Shared>, session: u64, 
                 match ev {
                     InputEvent::MouseButton { window, pressed: true, .. } | InputEvent::Key { window, pressed: true, .. } => {
                         *shared.active.lock().unwrap() = Some(window);
+                        shared.owners.lock().unwrap().touch(client, session);
                     }
                     // Sent when the client window loses focus.
                     InputEvent::ReleaseAll => shared.clip.with_focus(|f| f.unfocus(session)),
@@ -329,6 +365,7 @@ struct ActiveStream {
 
 struct Session {
     id: u64,
+    client: ClientId,
     shared: Arc<Shared>,
     codec: Codec,
     streams: HashMap<WindowId, ActiveStream>,
@@ -344,6 +381,9 @@ struct Session {
     frames_tx: mpsc::Sender<(WindowId, EncodedFrame)>,
     /// Messages from background work (input thread, launches) to this session's client.
     replies: Reply,
+    /// Per stream encode and send times, reported while the client wants stats.
+    stats: Arc<Mutex<StageStats>>,
+    want_stats: bool,
 }
 
 type Ctl = quinn::SendStream;
@@ -354,6 +394,7 @@ impl Session {
         send: &mut Ctl,
         mut recv: quinn::RecvStream,
         mut replies: mpsc::UnboundedReceiver<HostMsg>,
+        mut cmds: mpsc::UnboundedReceiver<SessionCmd>,
     ) -> anyhow::Result<()> {
         let mut clipboard = self.shared.clipboard.subscribe();
         let mut cursor = self.shared.cursor.clone();
@@ -367,10 +408,17 @@ impl Session {
         let mut popup_poll = tokio::time::interval(POPUP_POLL);
         popup_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let (msg_tx, mut msg_rx) = mpsc::channel::<anyhow::Result<Option<ClientMsg>>>(16);
+        let mut stats_tick = tokio::time::interval(STATS_EVERY);
+        let time_replies = self.replies.clone();
         // Reading in a separate task keeps `read_msg` cancellation-safe.
         let reader = tokio::spawn(async move {
             loop {
                 let r = read_msg::<_, ClientMsg>(&mut recv).await.map_err(anyhow::Error::from);
+                // Clock probes are stamped on arrival, before any queueing in this session.
+                if let Ok(Some(ClientMsg::TimeProbe { nonce, client_us })) = r {
+                    let _ = time_replies.send(HostMsg::TimeReply { nonce, client_us, host_us: clock::now_us() });
+                    continue;
+                }
                 let done = !matches!(r, Ok(Some(_)));
                 if msg_tx.send(r).await.is_err() || done {
                     return;
@@ -398,6 +446,14 @@ impl Session {
                         break Err(e.into());
                     }
                 }
+                Some(SessionCmd::Release(window)) = cmds.recv() => {
+                    if self.streams.contains_key(&window) {
+                        tracing::info!(window, "window moved to another session of this client");
+                        if let Err(e) = self.close(window, send).await {
+                            break Err(e);
+                        }
+                    }
+                }
                 text = clipboard.recv() => match text {
                     Ok(text) => {
                         if let Err(e) = write_msg(send, &HostMsg::Clipboard { text }).await {
@@ -420,6 +476,19 @@ impl Session {
                         break Err(e);
                     }
                 }
+                _ = stats_tick.tick() => {
+                    let msgs = self.stats.lock().map(|mut s| s.drain()).unwrap_or_default();
+                    let mut failed = None;
+                    for msg in msgs.iter().filter(|_| self.want_stats) {
+                        if let Err(e) = write_msg(send, msg).await {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                    if let Some(e) = failed {
+                        break Err(e.into());
+                    }
+                }
             }
         };
         reader.abort();
@@ -429,14 +498,21 @@ impl Session {
     async fn on_message(&mut self, msg: ClientMsg, send: &mut Ctl) -> anyhow::Result<()> {
         match msg {
             ClientMsg::Ping { nonce } => write_msg(send, &HostMsg::Pong { nonce }).await?,
+            ClientMsg::WantStats { on } => self.want_stats = on,
+            // Answered by the reader task as soon as it arrives.
+            ClientMsg::TimeProbe { .. } => {}
             ClientMsg::Launch { nonce, action } => {
+                self.touch();
                 // Launches wait seconds for a window; run them aside so the session stays live.
-                let replies = self.replies.clone();
+                let (replies, shared, client) = (self.replies.clone(), self.shared.clone(), self.client);
                 tokio::spawn(async move {
                     let result = match tokio::task::spawn_blocking(move || launch::run(action)).await {
                         Ok(r) => r.map_err(|e| format!("{e:#}")),
                         Err(e) => Err(format!("launch task: {e}")),
                     };
+                    if let Ok(info) = &result {
+                        shared.owners.lock().unwrap().hold(client, info.id, Instant::now() + owners::LAUNCH_HOLD);
+                    }
                     if let Err(e) = &result {
                         tracing::warn!(?action, "launch failed: {e}");
                     }
@@ -451,11 +527,11 @@ impl Session {
                 write_msg(send, &reply).await?;
             }
             ClientMsg::Subscribe { window, max_fps, bitrate_kbps } => {
-                let reply = match self.subscribe(window, max_fps, bitrate_kbps).await {
-                    Ok(info) => HostMsg::StreamStarted { window, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info },
-                    Err(e) => HostMsg::Error { window: Some(window), message: format!("{e:#}") },
-                };
-                write_msg(send, &reply).await?;
+                self.touch();
+                // On success StreamStarted was already sent, before capture started.
+                if let Err(e) = self.subscribe(window, max_fps, bitrate_kbps, send).await {
+                    write_msg(send, &HostMsg::Error { window: Some(window), message: format!("{e:#}") }).await?;
+                }
             }
             ClientMsg::ListDisplays => {
                 let reply = match tokio::task::spawn_blocking(capture::displays).await? {
@@ -489,6 +565,7 @@ impl Session {
             }
             ClientMsg::Focus { window } => {
                 *self.shared.active.lock().unwrap() = Some(window);
+                self.touch();
                 let Some(s) = self.streams.get(&window) else { return Ok(()) };
                 if s.popup_of.is_none() {
                     // A desktop has no window to raise; the user picks windows on the Mac.
@@ -516,10 +593,12 @@ impl Session {
         Ok(())
     }
 
-    async fn subscribe(&mut self, window: WindowId, max_fps: u16, bitrate_kbps: u32) -> anyhow::Result<WindowInfo> {
+    async fn subscribe(&mut self, window: WindowId, max_fps: u16, bitrate_kbps: u32, send: &mut Ctl) -> anyhow::Result<()> {
         if let Some(s) = self.streams.get(&window) {
             s.stream.request_keyframe();
-            return Ok(s.info.clone());
+            let info = s.info.clone();
+            write_msg(send, &HostMsg::StreamStarted { window, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info }).await?;
+            return Ok(());
         }
         let params = StreamParams {
             window,
@@ -527,45 +606,109 @@ impl Session {
             fps: (max_fps as u32).clamp(1, 120),
             bitrate_kbps: self.shared.settings.clamp_bitrate(bitrate_kbps),
         };
-        self.start_window(params, WindowKind::Normal, None, false).await
+        self.start_window(params, WindowKind::Normal, None, false, send).await.map(|_| ())
     }
 
-    /// Captures one Mac window with its title bar cropped. `parent` places dialogs.
+    /// This session is the one the user works in now (it follows the Mac's focus).
+    fn touch(&self) {
+        self.shared.owners.lock().unwrap().touch(self.client, self.id);
+    }
+
+    /// Another session of this client already shows `window`.
+    fn taken_elsewhere(&self, window: WindowId) -> bool {
+        self.shared.owners.lock().unwrap().taken_elsewhere(self.client, window, self.id)
+    }
+
+    /// Takes `window` for this session, making any other session of this client drop it.
+    fn claim(&self, window: WindowId) {
+        let old = self.shared.owners.lock().unwrap().claim(self.client, window, self.id);
+        if let Some(old) = old
+            && let Some(tx) = self.shared.sessions.lock().unwrap().get(&old)
+        {
+            let _ = tx.send(SessionCmd::Release(window));
+        }
+    }
+
+    /// Captures one Mac window with its title bar cropped. `parent` places dialogs. The client
+    /// is told as soon as the window is known (its window opens black), and capture starts
+    /// after; if that fails the window is closed again.
     async fn start_window(
         &mut self,
         params: StreamParams,
         kind: WindowKind,
         parent: Option<WindowId>,
         auto: bool,
+        send: &mut Ctl,
     ) -> anyhow::Result<WindowInfo> {
         let window = params.window;
-        let tx = self.frames_tx.clone();
-        let on_encoded = Arc::new(move |w: WindowId, f: EncodedFrame| tx.try_send((w, f)).is_ok());
-        let (stream, sc_info, inset) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let started = Instant::now();
+        let (sc, app, inset, (scale, size)) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let sc = find_window(window)?;
             let app = sc.owning_application().ok_or_else(|| anyhow!("window has no owning app"))?;
-            let info = (app.process_id(), app.application_name(), app.bundle_identifier(), sc.title().unwrap_or_default());
-            let inset = AxWindow::find(info.0, window).map(|w| w.titlebar_inset()).unwrap_or(0.0);
-            Ok((WindowStream::start(&sc, params, inset, on_encoded)?, info, inset))
+            let app = (app.process_id(), app.application_name(), app.bundle_identifier(), sc.title().unwrap_or_default());
+            let inset = AxWindow::find(app.0, window).map(|w| w.titlebar_inset()).unwrap_or(0.0);
+            let size = capture::window_size(&sc, inset)?;
+            Ok((sc, app, inset, size))
         })
         .await??;
         let geometry = windows::geometry(window).ok_or_else(|| anyhow!("window {window} vanished"))?;
         let offset = parent.and_then(|p| self.dialog_offset(p, &geometry, inset)).unwrap_or((0, 0));
-        let info = WindowInfo {
+        let mut info = WindowInfo {
             id: window,
-            pid: sc_info.0,
-            app_name: sc_info.1,
-            bundle_id: Some(sc_info.2).filter(|b| !b.is_empty()),
-            title: sc_info.3,
-            width: stream.size.0,
-            height: stream.size.1,
-            scale: stream.scale(),
+            pid: app.0,
+            app_name: app.1,
+            bundle_id: Some(app.2).filter(|b| !b.is_empty()),
+            title: app.3,
+            width: size.0,
+            height: size.1,
+            scale,
             parent,
             offset,
             kind,
         };
+        self.claim(window);
+        write_msg(send, &HostMsg::StreamStarted { window, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info: info.clone() })
+            .await?;
+        let announced_ms = started.elapsed().as_millis() as u64;
+
+        let tx = self.frames_tx.clone();
+        let first = AtomicBool::new(false);
+        let on_encoded = Arc::new(move |w: WindowId, f: EncodedFrame| {
+            if !first.swap(true, Ordering::Relaxed) {
+                tracing::info!(window = w, ms = started.elapsed().as_millis() as u64, "first frame encoded");
+            }
+            tx.try_send((w, f)).is_ok()
+        });
+        let started_capture = tokio::task::spawn_blocking(move || WindowStream::start(&sc, params, inset, on_encoded))
+            .await
+            .map_err(|e| anyhow!("capture task: {e}"))
+            .and_then(|r| r);
+        let stream = match started_capture {
+            Ok(stream) => stream,
+            Err(e) => {
+                self.shared.owners.lock().unwrap().release(self.client, window, self.id);
+                write_msg(send, &HostMsg::WindowClosed { window }).await?;
+                return Err(e.context("starting capture"));
+            }
+        };
+        if stream.size != size {
+            (info.width, info.height) = stream.size;
+            write_msg(send, &HostMsg::WindowChanged(info.clone())).await?;
+        }
         self.set_target(&info, &geometry, inset);
-        tracing::info!(window, app = %info.app_name, ?kind, ?parent, auto, size = ?stream.size, inset, ?params, "stream started");
+        tracing::info!(
+            window,
+            app = %info.app_name,
+            ?kind,
+            ?parent,
+            auto,
+            size = ?stream.size,
+            inset,
+            announced_ms,
+            capture_ms = started.elapsed().as_millis() as u64,
+            ?params,
+            "stream started"
+        );
         self.streams.insert(window, ActiveStream { stream, info: info.clone(), geometry, inset, popup_of: None, display: None, auto });
         Ok(info)
     }
@@ -579,7 +722,7 @@ impl Session {
     /// Follows a window the app opened by itself, once Accessibility can describe it.
     /// Returns false while it should be retried on a later poll.
     async fn follow_new(&mut self, w: OnScreen, seen: Instant, pids: &HashSet<i32>, send: &mut Ctl) -> anyhow::Result<bool> {
-        if w.width < newwin::MIN_SIZE || w.height < newwin::MIN_SIZE || self.dismissed.contains(&w.id) {
+        if w.width < newwin::MIN_SIZE || w.height < newwin::MIN_SIZE || self.dismissed.contains(&w.id) || self.taken_elsewhere(w.id) {
             return Ok(true);
         }
         let panel = !pids.contains(&w.pid);
@@ -612,10 +755,8 @@ impl Session {
             .or_else(|| self.streams.values().find(|s| s.info.pid == pid && s.popup_of.is_none() && s.display.is_none()))
             .map(|s| s.stream.params())
             .ok_or_else(|| anyhow!("no stream to copy settings from"))?;
-        let info = self.start_window(StreamParams { window: id, ..template }, kind, parent, true).await?;
+        self.start_window(StreamParams { window: id, ..template }, kind, parent, true, send).await?;
         tracing::info!(window = id, ?kind, ?parent, ?ax, ms = seen.elapsed().as_millis() as u64, "following new window");
-        write_msg(send, &HostMsg::StreamStarted { window: id, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info })
-            .await?;
         Ok(true)
     }
 
@@ -632,16 +773,23 @@ impl Session {
         if self.streams.values().any(|s| s.display.is_some()) {
             return Ok(());
         }
+        // Only the client's most recently active session opens newly focused windows.
+        let follows = self.shared.owners.lock().unwrap().follows_focus(self.client, self.id);
         let windows: Vec<(WindowId, i32, i32, f64, f64)> = ordered.iter().map(|w| (w.id, w.pid, w.layer, w.width, w.height)).collect();
         let focused = tokio::task::spawn_blocking(ax::focused_window)
             .await?
             .and_then(|(pid, id)| id.filter(|id| list.contains_key(id)).or_else(|| newwin::front_window(pid, &windows)));
         let own = std::process::id() as i32;
-        let streams = &self.streams;
-        let candidate = self.focus.update(focused, |id| streams.contains_key(&id), |id| {
-            list.get(&id).is_some_and(|w| w.pid != own && newwin::focus_eligible(w.layer, w.width, w.height))
-        });
-        let Some(id) = candidate else { return Ok(()) };
+        let candidate = {
+            let streams = &self.streams;
+            let owners = self.shared.owners.lock().unwrap();
+            let shown = |id: WindowId| streams.contains_key(&id) || owners.taken_elsewhere(self.client, id, self.id);
+            self.focus.update(focused, shown, |id| {
+                list.get(&id).is_some_and(|w| w.pid != own && newwin::focus_eligible(w.layer, w.width, w.height))
+            })
+        };
+        // Other sessions keep their follower state current but leave the opening to the active one.
+        let Some(id) = candidate.filter(|_| follows) else { return Ok(()) };
         let w = list[&id];
         let owner = tokio::task::spawn_blocking(move || windows::owner_name(id)).await?.unwrap_or_default();
         if newwin::is_system_ui(&owner) {
@@ -671,9 +819,8 @@ impl Session {
             .find(|s| s.popup_of.is_none() && s.display.is_none())
             .map(|s| s.stream.params())
             .ok_or_else(|| anyhow!("no stream to copy settings from"))?;
-        let info = self.start_window(StreamParams { window: id, ..template }, kind, parent, true).await?;
+        let info = self.start_window(StreamParams { window: id, ..template }, kind, parent, true, send).await?;
         tracing::info!(app = %info.app_name, pid = w.pid, window = id, ?kind, ?parent, "following the focused window");
-        write_msg(send, &HostMsg::StreamStarted { window: id, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info }).await?;
         Ok(())
     }
 
@@ -741,6 +888,7 @@ impl Session {
 
     fn remove(&mut self, window: WindowId) {
         if self.streams.remove(&window).is_some() {
+            self.shared.owners.lock().unwrap().release(self.client, window, self.id);
             self.shared.clip.with_focus(|f| f.window_gone(self.id, window));
             if let Ok(mut t) = self.shared.targets.write() {
                 t.remove(&window);
@@ -921,7 +1069,12 @@ impl Session {
         Some(((p.geometry.x, p.geometry.y + p.inset), p.info.scale as f64))
     }
 
+    /// Popups are announced only once capture runs: a menu that flashes black first looks
+    /// worse than one that appears some 60 ms later.
     async fn start_popup(&mut self, w: OnScreen, seen: Instant, send: &mut Ctl) -> anyhow::Result<()> {
+        if self.taken_elsewhere(w.id) {
+            return Ok(());
+        }
         let parent = self.popup_parent(w.pid).ok_or_else(|| anyhow!("no parent window"))?;
         let (origin, scale) = self.parent_origin(parent).ok_or_else(|| anyhow!("parent gone"))?;
         let p = &self.streams[&parent];
@@ -966,6 +1119,7 @@ impl Session {
         }
         let geometry = Geometry { x: w.x, y: w.y, width: w.width, height: w.height, title: String::new(), on_screen: true };
         self.set_popup_target(&info, &geometry);
+        self.claim(id);
         self.streams.insert(id, ActiveStream { stream, info: info.clone(), geometry, inset: 0.0, popup_of: Some(parent), display: None, auto: false });
         write_msg(send, &HostMsg::StreamStarted { window: id, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info })
             .await?;

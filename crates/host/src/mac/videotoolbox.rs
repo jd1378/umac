@@ -16,6 +16,7 @@ use umac_proto::Codec;
 use super::ffi::*;
 use crate::{
     annexb::avcc_to_annexb,
+    clock,
     encode::{EncodedFrame, Encoder, EncoderConfig, FrameSink},
 };
 
@@ -185,7 +186,7 @@ unsafe extern "C" fn output_callback(
         return;
     }
     match unsafe { extract(sample, shared.codec) } {
-        Ok((data, keyframe)) => (shared.sink)(EncodedFrame { data, keyframe, capture_us: frame_refcon as usize as u64 }),
+        Ok((data, keyframe)) => (shared.sink)(EncodedFrame { data, keyframe, capture_us: frame_refcon as usize as u64, encoded_us: clock::now_us() }),
         Err(e) => tracing::warn!("bad encoder output: {e}"),
     }
 }
@@ -249,7 +250,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::clock;
 
     /// IOSurface-backed NV12 frame with a moving gradient, like a capture would deliver.
     fn frame(w: usize, h: usize, t: usize) -> CVPixelBufferRef {

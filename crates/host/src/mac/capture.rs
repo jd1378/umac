@@ -36,6 +36,22 @@ pub struct WindowCapture {
     display_origin: Option<(f64, f64)>,
 }
 
+fn window_filter(window: &SCWindow) -> anyhow::Result<SCContentFilter> {
+    SCContentFilter::create().with_window(window).build().map_err(|e| anyhow!("content filter: {e}"))
+}
+
+fn window_pixels(width: f64, height: f64, scale: f32) -> (u32, u32) {
+    ((width * scale as f64).round() as u32, (height * scale as f64).round() as u32)
+}
+
+/// Backing scale and pixel size a capture of `window` with `inset` will have, without
+/// starting it, so the client can open the window before capture runs.
+pub fn window_size(window: &SCWindow, inset: f64) -> anyhow::Result<(f32, (u32, u32))> {
+    let scale = window_filter(window)?.point_pixel_scale().max(1.0);
+    let frame = window.frame();
+    Ok((scale, window_pixels(frame.size.width, (frame.size.height - inset).max(1.0), scale)))
+}
+
 pub fn find_window(id: WindowId) -> anyhow::Result<SCWindow> {
     SCShareableContent::get()
         .map_err(|e| anyhow!("listing shareable content: {e}"))?
@@ -114,7 +130,14 @@ fn open_stream(filter: &SCContentFilter, config: &SCStreamConfiguration, on_fram
                 }
                 let buffer = sample.image_buffer_ptr_borrowed();
                 if !buffer.is_null() {
-                    on_frame(buffer, clock::now_us());
+                    // Latency is measured from the display refresh the frame belongs to, not
+                    // from when ScreenCaptureKit got around to delivering it.
+                    let arrival = clock::now_us();
+                    let shown = sample.display_time().and_then(clock::from_mach);
+                    if let Some(t) = shown {
+                        note_display_offset(arrival as i64 - t as i64);
+                    }
+                    on_frame(buffer, shown.unwrap_or(arrival));
                 }
             },
             SCStreamOutputType::Screen,
@@ -128,11 +151,11 @@ impl WindowCapture {
     /// Starts capturing `window` at its native pixel size, minus `inset` points at the top.
     /// Returns the capture and the pixel size it was configured for.
     pub fn start(window: &SCWindow, fps: u32, inset: f64, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
-        let filter = SCContentFilter::create().with_window(window).build().map_err(|e| anyhow!("content filter: {e}"))?;
+        let filter = window_filter(window)?;
         let scale = filter.point_pixel_scale().max(1.0);
         let frame = window.frame();
         let (w, h) = (frame.size.width, (frame.size.height - inset).max(1.0));
-        let size = ((w * scale as f64).round() as u32, (h * scale as f64).round() as u32);
+        let size = window_pixels(w, h, scale);
         let config = stream_config(size.0, size.1, fps)?.with_source_rect(CGRect::new(0.0, inset, w, h));
         let stream = open_stream(&filter, &config, on_frame)?;
         Ok((Self { stream, config, scale, inset, display_origin: None }, size))
@@ -184,5 +207,19 @@ impl Drop for WindowCapture {
         if let Err(e) = self.stream.stop_capture() {
             tracing::debug!("stop_capture: {e}");
         }
+    }
+}
+
+/// Logs how far frame delivery is from the frame's display time (negative: delivered before
+/// the refresh it is shown at), at debug level every 300 frames.
+fn note_display_offset(us: i64) {
+    static OFFSETS: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut v) = OFFSETS.lock() else { return };
+    v.push(us);
+    if v.len() >= 300 {
+        v.sort_unstable();
+        let (p50, p95) = (v[v.len() / 2], v[v.len() * 95 / 100]);
+        tracing::debug!(p50_us = p50, p95_us = p95, "capture delivery relative to display time");
+        v.clear();
     }
 }
