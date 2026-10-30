@@ -133,7 +133,7 @@ impl Reassembler {
             return Vec::new();
         }
         let total_bytes = payload.len() * (h.data_shards as usize + h.parity_shards as usize);
-        if payload.len() % 2 != 0 || total_bytes > 2 * MAX_FRAME_BYTES {
+        if !payload.len().is_multiple_of(2) || total_bytes > 2 * MAX_FRAME_BYTES {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -163,7 +163,7 @@ impl Reassembler {
 
         let partial = self.pending.remove(&h.frame_seq).unwrap();
         // Anything older that is still pending can no longer be delivered in order.
-        let gap = self.last_done.map_or(false, |d| h.frame_seq != d.wrapping_add(1));
+        let gap = self.last_done.is_some_and(|d| h.frame_seq != d.wrapping_add(1));
         let had_older = self.pending.keys().any(|&s| !newer(s, h.frame_seq));
         self.pending.retain(|&s, _| newer(s, h.frame_seq));
         self.last_done = Some(h.frame_seq);
