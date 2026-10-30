@@ -141,6 +141,12 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::Changed(info) => {
                 if let Some(r) = self.by_remote.get(&info.id).and_then(|l| self.windows.get_mut(l)) {
                     r.window.set_title(&title(&info));
+                    // Apps snap to their own size steps (Terminal cells, minimum sizes), so adopt
+                    // the size the Mac settled on unless the user is still resizing.
+                    let size = PhysicalSize::new(info.width.max(1), info.height.max(1));
+                    if r.resize_due.is_none() && r.window.inner_size() != size {
+                        let _ = r.window.request_inner_size(size);
+                    }
                     r.info = info;
                 }
             }

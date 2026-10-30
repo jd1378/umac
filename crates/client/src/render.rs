@@ -368,7 +368,9 @@ mod tests {
         buf.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
         gpu.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         let data = buf.slice(..).get_mapped_range().unwrap();
-        let o = (h / 2 * 256 + w / 2 * 4) as usize;
+        // Frames draw 1:1 from the top-left, so sample inside the frame.
+        let (x, y) = (f.width / 2, f.height / 2);
+        let o = (y * 256 + x * 4) as usize;
         [data[o], data[o + 1], data[o + 2], data[o + 3]]
     }
 
