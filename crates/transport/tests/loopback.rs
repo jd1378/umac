@@ -34,6 +34,7 @@ async fn pinned_handshake_stream_and_datagrams() {
 
     let ep = client_endpoint(&client, host.fingerprint()).unwrap();
     let conn = ep.connect(addr, umac_transport::SERVER_NAME).unwrap().await.unwrap();
+    assert_eq!(umac_transport::negotiated_version(&conn), Some(umac_proto::PROTOCOL_VERSION));
     let (mut send, _recv) = conn.open_bi().await.unwrap();
     write_msg(&mut send, &ClientMsg::Ping { nonce: 1 }).await.unwrap();
 

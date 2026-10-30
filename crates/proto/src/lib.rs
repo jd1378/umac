@@ -9,10 +9,23 @@ pub mod video;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible wire change. Peers with different versions refuse to talk.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// ALPN advertised on the QUIC handshake.
-pub const ALPN: &[u8] = b"umac/2";
+pub const ALPN: &[u8] = b"umac/3";
+
+/// Older protocols still accepted at the TLS layer, only so a peer of another version gets a
+/// readable "update the other side" message instead of a handshake failure. `Hello` and
+/// `HelloReply` keep their layout across versions for exactly this.
+pub const LEGACY_ALPNS: &[&[u8]] = &[b"umac/2"];
+
+/// What both sides say when the Mac and the PC speak different protocol versions.
+pub fn version_mismatch(mac: u32, pc: u32) -> String {
+    format!(
+        "protocol version mismatch: the Mac runs umac protocol {mac}, this PC {pc}; \
+         update the older side (re-run its install command)"
+    )
+}
 
 pub const DEFAULT_PORT: u16 = 47_810;
 
@@ -80,6 +93,8 @@ pub struct WindowInfo {
     /// pixels. Can be negative or extend past the parent. Zero when there is no parent.
     pub offset: (i32, i32),
     pub kind: WindowKind,
+    /// The user can resize the Mac window; fixed size ones (Calculator) keep a fixed size here.
+    pub resizable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

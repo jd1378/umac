@@ -118,13 +118,18 @@ impl ClientCertVerifier for AnyClientCert {
     }
 }
 
+/// The current protocol first, so two current peers always agree on it.
+fn alpns() -> Vec<Vec<u8>> {
+    std::iter::once(umac_proto::ALPN).chain(umac_proto::LEGACY_ALPNS.iter().copied()).map(<[u8]>::to_vec).collect()
+}
+
 pub fn server_config(id: &Identity) -> Result<rustls::ServerConfig, Error> {
     let (chain, key) = cert_chain(id);
     let mut cfg = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(AnyClientCert { algs: algorithms() }))
         .with_single_cert(chain, key)?;
-    cfg.alpn_protocols = vec![umac_proto::ALPN.to_vec()];
+    cfg.alpn_protocols = alpns();
     Ok(cfg)
 }
 
@@ -135,6 +140,6 @@ pub fn client_config(id: &Identity, host: Fingerprint) -> Result<rustls::ClientC
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedServer { fingerprint: host, algs: algorithms() }))
         .with_client_auth_cert(chain, key)?;
-    cfg.alpn_protocols = vec![umac_proto::ALPN.to_vec()];
+    cfg.alpn_protocols = alpns();
     Ok(cfg)
 }

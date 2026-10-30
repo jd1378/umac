@@ -92,6 +92,10 @@ pub async fn connect(store: &Store, host: &HostEntry, pairing_token: Option<Stri
         .await
         .context("connection timed out")?
         .context("connecting (wrong host fingerprint or host not running?)")?;
+    if let Some(peer) = umac_transport::negotiated_version(&conn).filter(|&v| v != PROTOCOL_VERSION) {
+        conn.close(0u32.into(), b"protocol version mismatch");
+        bail!("{}", umac_proto::version_mismatch(peer, PROTOCOL_VERSION));
+    }
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
     let hello = Hello {
         version: PROTOCOL_VERSION,
@@ -792,6 +796,7 @@ mod tests {
             parent: None,
             offset: (0, 0),
             kind,
+            resizable: true,
         }
     }
 

@@ -66,7 +66,10 @@ impl App {
     fn open(&mut self, el: &ActiveEventLoop, info: WindowInfo) -> anyhow::Result<()> {
         let output = el.primary_monitor().map(|m| (m.size().width, m.size().height));
         let (w, h) = core::initial_size(&info, output);
-        let mut attrs = Window::default_attributes().with_title(core::title(&info)).with_inner_size(PhysicalSize::new(w, h));
+        let mut attrs = Window::default_attributes()
+            .with_title(core::title(&info))
+            .with_inner_size(PhysicalSize::new(w, h))
+            .with_resizable(core::fixed_size(&info).is_none());
         if info.kind == WindowKind::Popup {
             let parent = info.parent.and_then(|p| self.window(p)).context("popup parent is not shown")?;
             let origin = parent.inner_position().unwrap_or_default();
@@ -154,9 +157,13 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::HostStats { window, host } => self.core.host_stats(window, host),
             UiEvent::Changed(info) => {
                 let (id, kind, offset, parent) = (info.id, info.kind, core::popup_offset(&info), info.parent);
+                let fixed = core::fixed_size(&info);
                 let Some(change) = self.core.changed(info) else { return };
                 let Some(window) = self.window(id).cloned() else { return };
                 window.set_title(&change.title);
+                if kind != WindowKind::Desktop {
+                    window.set_resizable(fixed.is_none());
+                }
                 if let Some((w, h)) = change.snap {
                     let _ = window.request_inner_size(PhysicalSize::new(w, h));
                 }

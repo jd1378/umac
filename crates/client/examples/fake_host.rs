@@ -129,6 +129,7 @@ async fn serve(
         parent: None,
         offset: (0, 0),
         kind: WindowKind::Normal,
+        resizable: true,
     };
     let popups = [(POPUP_IN, (100, 80)), (POPUP_OUT, (clip_w as i32 - POPUP_SIZE.0 as i32 / 2, -60))].map(|(id, offset)| WindowInfo {
         id,

@@ -321,6 +321,18 @@ fn mouse_button(code: u32) -> MouseButton {
     }
 }
 
+/// A fixed size Mac window gets min size == max size, so the compositor offers no resize or
+/// maximize; a resizable one has no limits.
+fn lock_size(window: &Window, info: &WindowInfo) {
+    if info.kind == WindowKind::Desktop {
+        return;
+    }
+    let fixed = core::fixed_size(info);
+    tracing::debug!(window = info.id, ?fixed, "toplevel size limits");
+    window.set_min_size(fixed);
+    window.set_max_size(fixed);
+}
+
 impl State {
     fn id_of(&self, surface: &wl_surface::WlSurface) -> Option<WindowId> {
         self.surfaces.get(&surface.id()).copied()
@@ -419,6 +431,7 @@ impl State {
                 let window = self.xdg.create_window(surface, WindowDecorations::RequestServer, &self.qh);
                 window.set_title(core::title(&info));
                 window.set_app_id(APP_ID);
+                lock_size(&window, &info);
                 // Dialogs stay above their parent, grouped with it like native dialogs.
                 if info.kind == WindowKind::Dialog
                     && let Some(Shape::Toplevel(parent)) = info.parent.and_then(|p| self.nodes.get(&p)).map(|n| &n.shape)
@@ -494,6 +507,7 @@ impl State {
             Some(Shape::Toplevel(w)) => {
                 // A snapped size was already applied to the renderer; the next commit carries it.
                 w.set_title(change.title);
+                lock_size(w, &info);
             }
             Some(Shape::Popup(p)) if change.reposition => match self.positioner(&info) {
                 Ok(pos) if p.xdg_popup().version() >= 3 => p.reposition(&pos, 0),

@@ -91,6 +91,13 @@ fn endpoint(addr: SocketAddr, server: Option<quinn::ServerConfig>) -> Result<qui
     Ok(quinn::Endpoint::new(quinn::EndpointConfig::default(), server, socket.into(), runtime)?)
 }
 
+/// Protocol version the handshake settled on (`umac/N`); a legacy one is only accepted so the
+/// peer can be told to update.
+pub fn negotiated_version(conn: &quinn::Connection) -> Option<u32> {
+    let alpn = conn.handshake_data()?.downcast::<quinn::crypto::rustls::HandshakeData>().ok()?.protocol?;
+    std::str::from_utf8(alpn.strip_prefix(b"umac/")?).ok()?.parse().ok()
+}
+
 /// Fingerprint of the certificate the peer presented, if any.
 pub fn peer_fingerprint(conn: &quinn::Connection) -> Option<Fingerprint> {
     let certs = conn

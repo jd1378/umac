@@ -103,6 +103,12 @@ pub fn initial_size(info: &WindowInfo, output: Option<(u32, u32)>) -> (u32, u32)
     (((size.0 as f64 * scale).round() as u32).max(1), ((size.1 as f64 * scale).round() as u32).max(1))
 }
 
+/// Size a window must keep because the Mac window cannot be resized (Calculator); `None`
+/// leaves it resizable. Popups and desktops are sized by other rules.
+pub fn fixed_size(info: &WindowInfo) -> Option<(u32, u32)> {
+    (matches!(info.kind, WindowKind::Normal | WindowKind::Dialog) && !info.resizable).then(|| (info.width.max(1), info.height.max(1)))
+}
+
 /// What a shell should do after the host changed a window.
 pub struct Changed {
     pub title: String,
@@ -338,7 +344,7 @@ impl Core {
     /// to follow once the size has been stable for a moment; desktops just rescale.
     pub fn resized(&mut self, window: WindowId, size: (u32, u32)) {
         let Some(r) = self.apply_size(window, size) else { return };
-        if r.info.kind != WindowKind::Normal {
+        if r.info.kind != WindowKind::Normal || !r.info.resizable {
             return;
         }
         let (fw, fh) = r.renderer.frame_size().unwrap_or((r.info.width, r.info.height));
@@ -593,6 +599,20 @@ mod tests {
             parent: None,
             offset: (0, 0),
             kind,
+            resizable: true,
+        }
+    }
+
+    #[test]
+    fn fixed_size_only_for_non_resizable_windows_and_dialogs() {
+        let mut calc = info(WindowKind::Normal, 230, 408);
+        assert_eq!(fixed_size(&calc), None);
+        calc.resizable = false;
+        assert_eq!(fixed_size(&calc), Some((230, 408)));
+        let dialog = WindowInfo { kind: WindowKind::Dialog, ..calc.clone() };
+        assert_eq!(fixed_size(&dialog), Some((230, 408)));
+        for kind in [WindowKind::Popup, WindowKind::Desktop] {
+            assert_eq!(fixed_size(&WindowInfo { kind, ..calc.clone() }), None);
         }
     }
 

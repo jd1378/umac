@@ -46,6 +46,10 @@ fn point(el: AXUIElementRef) -> Option<(f64, f64)> {
         .then_some((p.x, p.y))
 }
 
+fn enabled(el: AXUIElementRef) -> bool {
+    attr(el, "AXEnabled").and_then(|v| v.downcast::<CFBoolean>()).is_some_and(bool::from)
+}
+
 fn role(el: AXUIElementRef) -> String {
     attr(el, "AXRole").and_then(|v| v.downcast::<CFString>()).map(|s| s.to_string()).unwrap_or_default()
 }
@@ -230,6 +234,17 @@ impl AxWindow {
             bail!("AXRaise: AXError {err}");
         }
         Ok(())
+    }
+
+    /// Whether the user can resize the window: its size is settable and its zoom (green)
+    /// button, when it has one, is enabled. Fixed size windows such as Calculator fail this.
+    pub fn resizable(&self) -> bool {
+        let mut settable = 0u8;
+        let name = CFString::new("AXSize");
+        let size_settable = unsafe { AXUIElementIsAttributeSettable(self.el(), name.as_concrete_TypeRef(), &mut settable) } == 0 && settable != 0;
+        let zoom = attr(self.el(), "AXZoomButton").map(|b| enabled(b.as_CFTypeRef()));
+        tracing::debug!(size_settable, ?zoom, "window resizability");
+        size_settable && zoom.unwrap_or(true)
     }
 
     /// Presses the window's close button, as a click on the red traffic light would.

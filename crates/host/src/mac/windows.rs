@@ -47,6 +47,7 @@ pub fn list() -> anyhow::Result<Vec<WindowInfo>> {
                 parent: None,
                 offset: (0, 0),
                 kind: WindowKind::Normal,
+                resizable: super::ax::AxWindow::find(app.process_id(), w.window_id()).is_ok_and(|ax| ax.resizable()),
             })
         })
         .collect())

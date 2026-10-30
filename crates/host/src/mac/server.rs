@@ -215,7 +215,7 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
 
     if let Err(reason) = authorize(&shared, &hello, &fp) {
         tracing::warn!(fingerprint = %fp, client = %hello.client_name, "rejected: {reason}");
-        write_msg(&mut send, &HelloReply::Rejected { reason: reason.into() }).await?;
+        write_msg(&mut send, &HelloReply::Rejected { reason }).await?;
         let _ = send.finish();
         tokio::time::sleep(Duration::from_millis(200)).await;
         conn.close(1u32.into(), b"rejected");
@@ -285,9 +285,9 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
     }
 }
 
-fn authorize(shared: &Shared, hello: &Hello, fp: &Fingerprint) -> Result<(), &'static str> {
+fn authorize(shared: &Shared, hello: &Hello, fp: &Fingerprint) -> Result<(), String> {
     if hello.version != PROTOCOL_VERSION {
-        return Err("protocol version mismatch");
+        return Err(umac_proto::version_mismatch(PROTOCOL_VERSION, hello.version));
     }
     if shared.auth.is_authorized(fp) {
         return Ok(());
@@ -298,13 +298,13 @@ fn authorize(shared: &Shared, hello: &Hello, fp: &Fingerprint) -> Result<(), &'s
                 tracing::info!(fingerprint = %fp, client = %hello.client_name, "paired new client");
                 Ok(())
             }
-            Ok(false) => Err("invalid or expired pairing token"),
+            Ok(false) => Err("invalid or expired pairing token".into()),
             Err(e) => {
                 tracing::error!("saving paired client: {e}");
-                Err("host could not store pairing")
+                Err("host could not store pairing".into())
             }
         },
-        None => Err("client is not paired; run `umac-host pair` on the Mac"),
+        None => Err("client is not paired; run `umac-host pair` on the Mac".into()),
     }
 }
 
@@ -822,13 +822,15 @@ impl Session {
     ) -> anyhow::Result<WindowInfo> {
         let window = params.window;
         let started = Instant::now();
-        let (sc, app, inset, (scale, size)) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let (sc, app, inset, (scale, size), resizable) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let sc = find_window(window)?;
             let app = sc.owning_application().ok_or_else(|| anyhow!("window has no owning app"))?;
             let app = (app.process_id(), app.application_name(), app.bundle_identifier(), sc.title().unwrap_or_default());
-            let inset = AxWindow::find(app.0, window).map(|w| w.titlebar_inset()).unwrap_or(0.0);
+            let ax = AxWindow::find(app.0, window).ok();
+            let inset = ax.as_ref().map_or(0.0, |w| w.titlebar_inset());
+            let resizable = ax.as_ref().is_some_and(|w| w.resizable());
             let size = capture::window_size(&sc, inset)?;
-            Ok((sc, app, inset, size))
+            Ok((sc, app, inset, size, resizable))
         })
         .await??;
         let geometry = windows::geometry(window).ok_or_else(|| anyhow!("window {window} vanished"))?;
@@ -845,6 +847,7 @@ impl Session {
             parent,
             offset,
             kind,
+            resizable,
         };
         self.claim(window);
         write_msg(send, &HostMsg::StreamStarted { window, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info: info.clone() })
@@ -1052,6 +1055,7 @@ impl Session {
             parent: None,
             offset: (0, 0),
             kind: WindowKind::Desktop,
+            resizable: false,
         };
         self.set_target(&info, &geometry, 0.0);
         tracing::info!(window, display = display_id, size = ?stream.size, ?params, "desktop stream started");
@@ -1276,6 +1280,7 @@ impl Session {
             parent: Some(parent),
             offset: popup::offset((w.x, w.y), origin, scale),
             kind: WindowKind::Popup,
+            resizable: false,
         };
         let tx = self.frames_tx.clone();
         let first = AtomicBool::new(false);

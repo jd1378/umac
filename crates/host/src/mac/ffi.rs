@@ -166,6 +166,7 @@ unsafe extern "C" {
     pub fn AXUIElementCopyElementAtPosition(el: AXUIElementRef, x: f32, y: f32, out: *mut AXUIElementRef) -> AXError;
     pub fn AXUIElementCopyAttributeValue(el: AXUIElementRef, attr: CFStringRef, out: *mut CFTypeRef) -> AXError;
     pub fn AXUIElementSetAttributeValue(el: AXUIElementRef, attr: CFStringRef, value: CFTypeRef) -> AXError;
+    pub fn AXUIElementIsAttributeSettable(el: AXUIElementRef, attr: CFStringRef, settable: *mut u8) -> AXError;
     pub fn AXUIElementPerformAction(el: AXUIElementRef, action: CFStringRef) -> AXError;
     pub fn AXValueCreate(kind: u32, value: *const c_void) -> CFTypeRef;
     pub fn AXValueGetValue(value: CFTypeRef, kind: u32, out: *mut c_void) -> bool;
