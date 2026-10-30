@@ -672,7 +672,8 @@ impl Session {
     fn set_target(&self, info: &WindowInfo, g: &Geometry, inset: f64) {
         if let Ok(mut t) = self.shared.targets.write() {
             let desktop = info.kind == WindowKind::Desktop;
-            t.insert(info.id, Target { pid: info.pid, placement: g.placement(info.scale as f64, inset), popup: false, desktop });
+            let parent_pid = info.parent.and_then(|p| self.streams.get(&p)).map(|s| s.info.pid).filter(|&p| p != info.pid);
+            t.insert(info.id, Target { pid: info.pid, placement: g.placement(info.scale as f64, inset), popup: false, desktop, parent_pid });
         }
     }
 
@@ -907,7 +908,7 @@ impl Session {
     fn set_popup_target(&self, info: &WindowInfo, g: &Geometry) {
         if let Ok(mut t) = self.shared.targets.write() {
             let placement = Placement { x: g.x, y: g.y, width: g.width, height: g.height, scale: info.scale as f64 };
-            t.insert(info.id, Target { pid: info.pid, placement, popup: true, desktop: false });
+            t.insert(info.id, Target { pid: info.pid, placement, popup: true, desktop: false, parent_pid: None });
         }
     }
 

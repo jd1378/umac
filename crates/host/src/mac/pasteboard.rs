@@ -26,6 +26,20 @@ unsafe extern "C" {
     static NSPasteboardTypeString: CFStringRef;
 }
 
+/// Pid of the frontmost app (`NSWorkspace.frontmostApplication`), the one keys go to.
+pub fn frontmost_pid() -> Option<i32> {
+    unsafe {
+        let pool = objc_autoreleasePoolPush();
+        let send: extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let send_pid: extern "C" fn(Id, Sel) -> i32 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let ws = send(objc_getClass(c"NSWorkspace".as_ptr()), sel(c"sharedWorkspace"));
+        let app = if ws.is_null() { std::ptr::null_mut() } else { send(ws, sel(c"frontmostApplication")) };
+        let pid = (!app.is_null()).then(|| send_pid(app, sel(c"processIdentifier")));
+        objc_autoreleasePoolPop(pool);
+        pid
+    }
+}
+
 /// `NSEvent.keyRepeatDelay` and `keyRepeatInterval` in seconds.
 pub fn key_repeat_seconds() -> (f64, f64) {
     unsafe {

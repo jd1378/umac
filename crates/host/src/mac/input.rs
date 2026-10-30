@@ -17,7 +17,7 @@ use core_graphics::{
     geometry::CGPoint,
 };
 use tokio::sync::{Notify, mpsc::UnboundedSender};
-use umac_proto::{HostMsg, InputEvent, MAX_CLIPBOARD_BYTES, WindowId};
+use umac_proto::{HostMsg, InputEvent, MAX_CLIPBOARD_BYTES, WindowId, keys::is_modifier};
 
 use super::{ax, ax::AxWindow, pasteboard};
 use crate::{
@@ -33,7 +33,13 @@ pub struct Target {
     pub popup: bool,
     /// A whole display: menus are part of the picture, so any click may hit one.
     pub desktop: bool,
+    /// The parent window's app, for dialogs run by another process (the Open and Save panel
+    /// service shows its panels while the parent app stays frontmost).
+    pub parent_pid: Option<i32>,
 }
+
+/// How long a key press waits for the target app to come to the front after refocusing.
+const FRONT_WAIT: Duration = Duration::from_millis(150);
 
 pub type Targets = Arc<RwLock<HashMap<WindowId, Target>>>;
 
@@ -329,7 +335,15 @@ impl Injector {
                 }
                 ev.post(CGEventTapLocation::HID);
             }
-            InputEvent::Key { keycode, pressed, .. } => self.key(keycode, pressed),
+            InputEvent::Key { window, keycode, pressed } => {
+                // Releases and modifiers always pass so nothing stays held; a press only goes
+                // out when the target app is in front, never to whatever app happens to be.
+                if pressed && !is_modifier(keycode) && !self.key_reaches(window) {
+                    tracing::warn!(window, "dropped a key press: the window's app is not frontmost and could not be focused");
+                    return;
+                }
+                self.key(keycode, pressed)
+            }
             InputEvent::ReleaseAll => self.release_all(),
             InputEvent::SetClipboard { .. } => {}
         }
@@ -384,6 +398,26 @@ impl Injector {
                 ev.post(CGEventTapLocation::HID);
             }
         }
+    }
+
+    fn key_reaches(&mut self, w: WindowId) -> bool {
+        let Some(t) = self.target(w) else { return false };
+        if t.desktop {
+            return true;
+        }
+        let in_front = || pasteboard::frontmost_pid().is_some_and(|p| p == t.pid || Some(p) == t.parent_pid);
+        if in_front() {
+            return true;
+        }
+        self.focus(w);
+        let deadline = Instant::now() + FRONT_WAIT;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            if in_front() {
+                return true;
+            }
+        }
+        false
     }
 
     fn focus(&mut self, w: WindowId) {
