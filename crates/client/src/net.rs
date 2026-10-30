@@ -298,7 +298,7 @@ pub async fn run_open(
                         if streams.contains_key(&window) {
                             continue;
                         }
-                        if !requested && !accept_unsolicited(&info, &streams, cfg.follow_new_windows) {
+                        if !requested && !accept_unsolicited(&info, &streams, Follow { new_windows: cfg.follow_new_windows, focus: cfg.follow_focus }) {
                             tracing::debug!(window, kind = ?info.kind, parent = ?info.parent, "refusing unsolicited stream");
                             write_msg(&mut ctrl_send, &ClientMsg::Unsubscribe { window }).await?;
                             continue;
@@ -419,16 +419,18 @@ pub async fn run_open(
 
 /// Windows the host opens on its own (each kind capped). Popups need a streamed parent. New
 /// windows and dialogs need `follow_new_windows` and either a streamed parent (file panels
-/// come from another process) or another streamed window of the same app.
-fn accept_unsolicited(info: &WindowInfo, streams: &HashMap<WindowId, Stream>, follow_new_windows: bool) -> bool {
+/// come from another process) or another streamed window of the same app. With
+/// `follow_focus`, any normal window the Mac focuses (an app opened from a streamed window,
+/// a password prompt, an alert) is accepted too.
+fn accept_unsolicited(info: &WindowInfo, streams: &HashMap<WindowId, Stream>, follow: Follow) -> bool {
     let parent_streamed = info.parent.is_some_and(|p| streams.contains_key(&p));
     let count = |kinds: &[WindowKind]| streams.values().filter(|s| s.auto && kinds.contains(&s.kind)).count();
     match info.kind {
         WindowKind::Popup => parent_streamed && count(&[WindowKind::Popup]) < MAX_POPUPS,
         WindowKind::Normal | WindowKind::Dialog => {
             let app_streamed = streams.values().any(|s| s.pid == info.pid && s.kind != WindowKind::Popup);
-            follow_new_windows
-                && (parent_streamed || app_streamed)
+            let focused = follow.focus && info.kind == WindowKind::Normal && info.parent.is_none();
+            ((follow.new_windows && (parent_streamed || app_streamed)) || focused)
                 && count(&[WindowKind::Normal, WindowKind::Dialog]) < MAX_AUTO_WINDOWS
         }
         WindowKind::Desktop => false,
@@ -437,6 +439,12 @@ fn accept_unsolicited(info: &WindowInfo, streams: &HashMap<WindowId, Stream>, fo
 
 /// New windows and dialogs followed at once.
 const MAX_AUTO_WINDOWS: usize = 16;
+
+#[derive(Debug, Clone, Copy)]
+struct Follow {
+    new_windows: bool,
+    focus: bool,
+}
 
 /// Removes `window` and every popup below it; returns the ids that were streaming.
 fn remove_with_popups(streams: &mut HashMap<WindowId, Stream>, window: WindowId) -> Vec<WindowId> {
@@ -539,12 +547,12 @@ mod tests {
         let mut streams = HashMap::from([(1, stream(None)), (2, stream(Some(1))), (3, stream(Some(2))), (9, stream(None))]);
         let mut popup = win(4, "Safari", WindowKind::Popup);
         popup.parent = Some(1);
-        assert!(accept_unsolicited(&popup, &streams, true));
+        assert!(accept_unsolicited(&popup, &streams, follow(true, false)));
         popup.parent = Some(77);
-        assert!(!accept_unsolicited(&popup, &streams, true));
+        assert!(!accept_unsolicited(&popup, &streams, follow(true, false)));
         popup.parent = None;
-        assert!(!accept_unsolicited(&popup, &streams, true));
-        assert!(!accept_unsolicited(&win(6, "Safari", WindowKind::Desktop), &streams, true));
+        assert!(!accept_unsolicited(&popup, &streams, follow(true, false)));
+        assert!(!accept_unsolicited(&win(6, "Safari", WindowKind::Desktop), &streams, follow(true, false)));
 
         let mut removed = remove_with_popups(&mut streams, 1);
         removed.sort();
@@ -560,7 +568,24 @@ mod tests {
         }
         let mut popup = win(4, "Safari", WindowKind::Popup);
         popup.parent = Some(1);
-        assert!(!accept_unsolicited(&popup, &streams, true));
+        assert!(!accept_unsolicited(&popup, &streams, follow(true, false)));
+    }
+
+    fn follow(new_windows: bool, focus: bool) -> Follow {
+        Follow { new_windows, focus }
+    }
+
+    #[test]
+    fn focused_windows_are_followed_as_normal_windows_only() {
+        let streams: HashMap<WindowId, Stream> = HashMap::from([(1, stream(None))]);
+        let mut calc = win(5, "Calculator", WindowKind::Normal);
+        calc.pid = 9;
+        assert!(accept_unsolicited(&calc, &streams, follow(true, true)));
+        assert!(!accept_unsolicited(&calc, &streams, follow(true, false)));
+        assert!(accept_unsolicited(&calc, &streams, follow(false, true)));
+        let mut dialog = win(6, "Calculator", WindowKind::Dialog);
+        dialog.pid = 9;
+        assert!(!accept_unsolicited(&dialog, &streams, follow(true, true)));
     }
 
     #[test]
@@ -569,22 +594,22 @@ mod tests {
         let mut other_app = win(5, "Notes", WindowKind::Normal);
         other_app.pid = 2;
         // Same app (pid 1) as the streamed window: followed unless disabled.
-        assert!(accept_unsolicited(&win(5, "Safari", WindowKind::Normal), &streams, true));
-        assert!(!accept_unsolicited(&win(5, "Safari", WindowKind::Normal), &streams, false));
-        assert!(!accept_unsolicited(&other_app, &streams, true));
+        assert!(accept_unsolicited(&win(5, "Safari", WindowKind::Normal), &streams, follow(true, false)));
+        assert!(!accept_unsolicited(&win(5, "Safari", WindowKind::Normal), &streams, follow(false, false)));
+        assert!(!accept_unsolicited(&other_app, &streams, follow(true, false)));
         // A file panel comes from another process but names a streamed parent.
         let mut panel = win(6, "Open and Save Panel Service", WindowKind::Dialog);
         panel.pid = 3;
-        assert!(!accept_unsolicited(&panel, &streams, true));
+        assert!(!accept_unsolicited(&panel, &streams, follow(true, false)));
         panel.parent = Some(1);
-        assert!(accept_unsolicited(&panel, &streams, true));
+        assert!(accept_unsolicited(&panel, &streams, follow(true, false)));
         // Capped.
         for i in 0..MAX_AUTO_WINDOWS as u32 {
             let mut s = stream(None);
             s.auto = true;
             streams.insert(200 + i, s);
         }
-        assert!(!accept_unsolicited(&panel, &streams, true));
+        assert!(!accept_unsolicited(&panel, &streams, follow(true, false)));
     }
 
     #[test]

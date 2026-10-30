@@ -55,6 +55,14 @@ true`, default). New documents become their own windows; dialogs, sheets, file p
 settings windows stay above the window they belong to. Closing one of these on the PC only
 stops streaming it; dismiss it on the Mac side (its buttons, Escape) to close it there.
 
+The window the Mac focuses opens on the PC too when it is not shown yet (`"follow_focus":
+true`, default): an app you start from a streamed window (double-clicking it in Finder), a
+window you switch to with Cmd+Tab, or a password prompt or alert that pops up by itself.
+Windows of apps already shown follow the dialog rules above; others open as their own
+windows. Closing such a window on the PC keeps it closed while it stays focused on the Mac;
+it opens again once focus moves away and comes back. Overlays, the menu bar, the Dock and
+the window that was focused when you connected are left alone.
+
 ## Clipboard
 
 Text only, up to about 900 KB.

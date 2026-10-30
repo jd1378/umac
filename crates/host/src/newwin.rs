@@ -60,12 +60,125 @@ pub fn fresh(known: &mut Option<HashSet<WindowId>>, now: &[(WindowId, i32)]) -> 
     fresh
 }
 
+/// Window levels the focused window may have to be followed: normal (0), floating panels (3)
+/// and modal panels such as password prompts (8). Menus (101) are popups; overlays like the
+/// Siri panel (23), the menu bar (24, 25) and the Dock sit above and are left alone.
+pub fn focus_eligible(layer: i32, width: f64, height: f64) -> bool {
+    (0..=8).contains(&layer) && width >= MIN_SIZE && height >= MIN_SIZE
+}
+
+/// System UI processes whose windows are never followed even when they take focus.
+const SYSTEM_UI: &[&str] = &["Dock", "SystemUIServer", "Siri AI", "Control Center", "Notification Center", "Spotlight", "WindowManager", "Window Server"];
+
+pub fn is_system_ui(owner: &str) -> bool {
+    SYSTEM_UI.contains(&owner)
+}
+
+/// Follows the Mac's focused window: reports it when focus moves to a window this session
+/// does not show. The window focused when following starts, one the client closed while it
+/// stays focused, and one that could not be started are skipped until focus leaves them.
+#[derive(Debug, Default)]
+pub struct FocusFollower {
+    started: bool,
+    focused: Option<WindowId>,
+    skip: Option<WindowId>,
+}
+
+impl FocusFollower {
+    pub fn update(
+        &mut self,
+        focused: Option<WindowId>,
+        streamed: impl Fn(WindowId) -> bool,
+        eligible: impl Fn(WindowId) -> bool,
+    ) -> Option<WindowId> {
+        if !self.started {
+            (self.started, self.focused, self.skip) = (true, focused, focused);
+            return None;
+        }
+        if focused != self.focused {
+            self.focused = focused;
+            if self.skip != focused {
+                self.skip = None;
+            }
+        }
+        focused.filter(|&w| self.skip != Some(w) && !streamed(w) && eligible(w))
+    }
+
+    /// The client closed `window`: do not bring it back while it keeps focus.
+    pub fn dismissed(&mut self, window: WindowId) {
+        if self.focused == Some(window) {
+            self.skip = Some(window);
+        }
+    }
+
+    /// Following the focused window failed or was refused: wait until focus moves.
+    pub fn failed(&mut self) {
+        self.skip = self.focused;
+    }
+}
+
+/// The app's front window when Accessibility names none: its first window, in front-to-back
+/// order, that focus following accepts.
+pub fn front_window(pid: i32, front_to_back: &[(WindowId, i32, i32, f64, f64)]) -> Option<WindowId> {
+    front_to_back.iter().find(|&&(_, owner, layer, w, h)| owner == pid && focus_eligible(layer, w, h)).map(|&(id, ..)| id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ax(role: &str, subrole: &str, sheet: bool) -> AxKind {
         AxKind { role: role.into(), subrole: subrole.into(), sheet, modal: false, minimizable: true }
+    }
+
+    #[test]
+    fn follows_focus_changes_but_not_the_starting_window() {
+        let mut f = FocusFollower::default();
+        let none = |_| false;
+        let all = |_| true;
+        // Whatever is focused when following starts stays where it is.
+        assert_eq!(f.update(Some(1), none, all), None);
+        assert_eq!(f.update(Some(1), none, all), None);
+        // Calculator (2) takes focus: streamed until it shows up as streamed.
+        assert_eq!(f.update(Some(2), none, all), Some(2));
+        assert_eq!(f.update(Some(2), |w| w == 2, all), None);
+        // Back to the starting window: it is followed now that focus left and returned.
+        assert_eq!(f.update(Some(1), none, all), Some(1));
+        // Not eligible (overlay, tiny, system UI).
+        assert_eq!(f.update(Some(3), none, |_| false), None);
+        assert_eq!(f.update(None, none, all), None);
+    }
+
+    #[test]
+    fn closed_window_returns_only_after_focus_left() {
+        let mut f = FocusFollower::default();
+        let none = |_| false;
+        let all = |_| true;
+        f.update(Some(1), none, all);
+        assert_eq!(f.update(Some(2), none, all), Some(2));
+        f.dismissed(2);
+        assert_eq!(f.update(Some(2), none, all), None);
+        assert_eq!(f.update(Some(1), none, all), Some(1));
+        assert_eq!(f.update(Some(2), none, all), Some(2));
+        // A failed start waits for the next focus change too.
+        f.failed();
+        assert_eq!(f.update(Some(2), none, all), None);
+        // Dismissing a window that is not focused changes nothing.
+        f.dismissed(7);
+        assert_eq!(f.update(Some(4), none, all), Some(4));
+    }
+
+    #[test]
+    fn eligibility_and_front_window() {
+        assert!(focus_eligible(0, 400.0, 300.0));
+        assert!(focus_eligible(8, 400.0, 200.0));
+        assert!(!focus_eligible(23, 800.0, 600.0));
+        assert!(!focus_eligible(101, 200.0, 300.0));
+        assert!(!focus_eligible(0, 20.0, 300.0));
+        assert!(is_system_ui("Siri AI") && is_system_ui("Dock") && !is_system_ui("SecurityAgent"));
+        let list = [(5, 20, 101, 100.0, 100.0), (6, 20, 0, 20.0, 20.0), (7, 30, 0, 300.0, 200.0), (8, 20, 0, 300.0, 200.0)];
+        assert_eq!(front_window(20, &list), Some(8));
+        assert_eq!(front_window(40, &list), None);
     }
 
     #[test]

@@ -32,6 +32,9 @@ pub struct Config {
     pub tray_icon_color: TrayIconColor,
     /// Open windows, dialogs and sheets that a streamed Mac app opens by itself.
     pub follow_new_windows: bool,
+    /// Open the window the Mac focuses when it is not shown yet: an app started from a
+    /// streamed window, a password prompt or alert that pops up, a Cmd+Tab switch.
+    pub follow_focus: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +59,7 @@ impl Default for Config {
             selected_host: None,
             tray_icon_color: TrayIconColor::Auto,
             follow_new_windows: true,
+            follow_focus: true,
         }
     }
 }

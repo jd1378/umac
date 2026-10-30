@@ -405,7 +405,7 @@ impl Injector {
         if t.desktop {
             return true;
         }
-        let in_front = || pasteboard::frontmost_pid().is_some_and(|p| p == t.pid || Some(p) == t.parent_pid);
+        let in_front = || ax::focused_app_pid().is_some_and(|p| p == t.pid || Some(p) == t.parent_pid);
         if in_front() {
             return true;
         }

@@ -88,6 +88,29 @@ pub fn paste_titles(pid: i32) -> Vec<String> {
 
 /// The menu item under a global point, or `None` when no menu item is there.
 /// The menu item under a global point and the pid of the app that owns it.
+/// Pid of the app that has keyboard focus, asked from the window server each time.
+/// `NSWorkspace.frontmostApplication` only updates on a running main run loop, which this
+/// agent does not have, so it goes stale.
+pub fn focused_app_pid() -> Option<i32> {
+    focused_window().map(|(pid, _)| pid)
+}
+
+/// The focused app and, when Accessibility knows it, its focused (or main) window.
+pub fn focused_window() -> Option<(i32, Option<WindowId>)> {
+    let system = Element(unsafe { AXUIElementCreateSystemWide() });
+    let app = attr(system.0, "AXFocusedApplication")?;
+    let mut pid = 0;
+    if unsafe { AXUIElementGetPid(app.as_CFTypeRef(), &mut pid) } != 0 || pid <= 0 {
+        return None;
+    }
+    let window = ["AXFocusedWindow", "AXMainWindow"].iter().find_map(|name| {
+        let w = attr(app.as_CFTypeRef(), name)?;
+        let mut id = 0u32;
+        (unsafe { _AXUIElementGetWindow(w.as_CFTypeRef(), &mut id) } == 0 && id != 0).then_some(id)
+    });
+    Some((pid, window))
+}
+
 pub fn menu_item_at(x: f64, y: f64) -> Option<(MenuItem, i32)> {
     let system = Element(unsafe { AXUIElementCreateSystemWide() });
     let mut hit: AXUIElementRef = ptr::null();

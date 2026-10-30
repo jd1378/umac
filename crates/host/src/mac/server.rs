@@ -220,6 +220,7 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
         dismissed: HashSet::new(),
         known: None,
         pending_new: HashMap::new(),
+        focus: newwin::FocusFollower::default(),
         frames_tx,
         replies: reply_tx,
     };
@@ -338,6 +339,8 @@ struct Session {
     known: Option<HashSet<WindowId>>,
     /// New windows waiting for Accessibility to describe them, with when they appeared.
     pending_new: HashMap<WindowId, Instant>,
+    /// Streams the Mac's focused window when it moves to one this session does not show.
+    focus: newwin::FocusFollower,
     frames_tx: mpsc::Sender<(WindowId, EncodedFrame)>,
     /// Messages from background work (input thread, launches) to this session's client.
     replies: Reply,
@@ -476,6 +479,7 @@ impl Session {
                 if self.streams.get(&window).is_some_and(|s| s.popup_of.is_some() || s.auto) {
                     self.dismissed.insert(window);
                 }
+                self.focus.dismissed(window);
                 self.close(window, send).await?;
             }
             ClientMsg::RequestKeyframe { window } => {
@@ -613,6 +617,64 @@ impl Session {
         write_msg(send, &HostMsg::StreamStarted { window: id, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info })
             .await?;
         Ok(true)
+    }
+
+    /// Streams the Mac's focused window when focus moves to one this session does not show:
+    /// an app opened from a streamed window, an alert or password prompt that pops up by
+    /// itself, a window brought forward with Cmd+Tab.
+    async fn follow_focus(
+        &mut self,
+        ordered: &[OnScreen],
+        list: &HashMap<WindowId, OnScreen>,
+        streamed_pids: &HashSet<i32>,
+        send: &mut Ctl,
+    ) -> anyhow::Result<()> {
+        if self.streams.values().any(|s| s.display.is_some()) {
+            return Ok(());
+        }
+        let windows: Vec<(WindowId, i32, i32, f64, f64)> = ordered.iter().map(|w| (w.id, w.pid, w.layer, w.width, w.height)).collect();
+        let focused = tokio::task::spawn_blocking(ax::focused_window)
+            .await?
+            .and_then(|(pid, id)| id.filter(|id| list.contains_key(id)).or_else(|| newwin::front_window(pid, &windows)));
+        let own = std::process::id() as i32;
+        let streams = &self.streams;
+        let candidate = self.focus.update(focused, |id| streams.contains_key(&id), |id| {
+            list.get(&id).is_some_and(|w| w.pid != own && newwin::focus_eligible(w.layer, w.width, w.height))
+        });
+        let Some(id) = candidate else { return Ok(()) };
+        let w = list[&id];
+        let owner = tokio::task::spawn_blocking(move || windows::owner_name(id)).await?.unwrap_or_default();
+        if newwin::is_system_ui(&owner) {
+            self.focus.failed();
+            return Ok(());
+        }
+        if self.streams.values().filter(|s| s.auto).count() >= newwin::MAX_AUTO {
+            tracing::info!(window = id, "not following the focused window: limit reached");
+            self.focus.failed();
+            return Ok(());
+        }
+        // A window of an app already shown keeps the usual rules (dialogs stay with it).
+        let kind = if streamed_pids.contains(&w.pid) {
+            let pid = w.pid;
+            tokio::task::spawn_blocking(move || ax::window_kind(pid, id)).await?.map_or(WindowKind::Normal, |ax| newwin::classify(&ax))
+        } else {
+            WindowKind::Normal
+        };
+        let parent = match kind {
+            WindowKind::Dialog => self.popup_parent(w.pid),
+            _ => None,
+        };
+        let kind = if parent.is_some() { kind } else { WindowKind::Normal };
+        let template = self
+            .streams
+            .values()
+            .find(|s| s.popup_of.is_none() && s.display.is_none())
+            .map(|s| s.stream.params())
+            .ok_or_else(|| anyhow!("no stream to copy settings from"))?;
+        let info = self.start_window(StreamParams { window: id, ..template }, kind, parent, true).await?;
+        tracing::info!(app = %info.app_name, pid = w.pid, window = id, ?kind, ?parent, "following the focused window");
+        write_msg(send, &HostMsg::StreamStarted { window: id, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info }).await?;
+        Ok(())
     }
 
     /// The streamed window the user works in (a popup resolves to its parent), for file panels
@@ -793,7 +855,8 @@ impl Session {
             return Ok(());
         }
         let now = Instant::now();
-        let list: HashMap<WindowId, OnScreen> = windows::on_screen().into_iter().map(|w| (w.id, w)).collect();
+        let ordered = windows::on_screen();
+        let list: HashMap<WindowId, OnScreen> = ordered.iter().map(|w| (w.id, *w)).collect();
         self.dismissed.retain(|id| list.contains_key(id));
 
         let snapshot: Vec<(WindowId, i32)> = list.values().map(|w| (w.id, w.layer)).collect();
@@ -814,6 +877,10 @@ impl Session {
                 if done {
                     self.pending_new.remove(&id);
                 }
+            }
+            if let Err(e) = self.follow_focus(&ordered, &list, &pids, send).await {
+                tracing::debug!("not following the focused window: {e:#}");
+                self.focus.failed();
             }
         }
 
