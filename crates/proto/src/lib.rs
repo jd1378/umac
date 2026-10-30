@@ -84,6 +84,9 @@ pub enum WindowKind {
     Popup,
     /// A whole display, streamed with the Mac cursor drawn in.
     Desktop,
+    /// Dialog, sheet or panel of `parent` (Save prompts, preferences, inspectors, file
+    /// pickers): its own window that stays above its parent. Sent unsolicited, like popups.
+    Dialog,
 }
 
 /// Stream ids at or above this are displays, not windows. `CGWindowID`s stay far below it.

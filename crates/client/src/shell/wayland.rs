@@ -363,7 +363,7 @@ impl State {
     fn open(&mut self, info: WindowInfo) -> Result<()> {
         anyhow::ensure!(!self.nodes.contains_key(&info.id), "window {} already shown", info.id);
         let shape = match info.kind {
-            WindowKind::Normal | WindowKind::Desktop => {
+            WindowKind::Normal | WindowKind::Desktop | WindowKind::Dialog => {
                 let surface = self.compositor.create_surface(&self.qh);
                 let window = self.xdg.create_window(surface, WindowDecorations::RequestServer, &self.qh);
                 window.set_title(core::title(&info));
