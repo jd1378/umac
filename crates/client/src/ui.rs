@@ -1,14 +1,15 @@
 //! Messages from the network and decode threads to whichever windowing shell is running.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use umac_proto::{CursorShape, WindowId, WindowInfo};
 
-use crate::decode::Nv12Frame;
+use crate::decode::Picture;
 
 pub enum UiEvent {
     Open(WindowInfo),
-    Frame { window: WindowId, frame: Nv12Frame },
+    /// A decoded picture; `decoded` is when the decoder finished it.
+    Frame { window: WindowId, frame: Picture, decoded: Instant },
     Changed(WindowInfo),
     Closed(WindowId),
     Shutdown(String),

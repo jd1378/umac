@@ -1,12 +1,12 @@
-//! wgpu presentation: one surface per window, NV12 uploaded as R8 + RG8 textures and
-//! converted to RGB in the fragment shader.
+//! wgpu presentation: one surface per window, NV12 as R8 + RG8 textures (uploaded from CPU
+//! memory, or the decoder's own surface imported zero-copy) converted to RGB in the shader.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result};
 
 use crate::{
-    decode::Nv12Frame,
+    decode::{self, Nv12Frame, Picture},
     viewport::{Fit, Viewport},
 };
 
@@ -54,6 +54,9 @@ fn fs_srgb(v: VsOut) -> @location(0) vec4<f32> {
 
 /// GPU objects shared by every window.
 pub struct Gpu {
+    /// Declared first so it drops first: it destroys Vulkan objects on `device`.
+    #[cfg(target_os = "linux")]
+    importer: Option<crate::zerocopy::Importer>,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -74,7 +77,23 @@ impl Gpu {
         }))
         .context("no GPU adapter")?;
         tracing::info!(adapter = ?adapter.get_info().name, backend = ?adapter.get_info().backend, "GPU");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+        #[cfg(target_os = "linux")]
+        let zero_copy = decode::zero_copy_allowed().then(|| crate::zerocopy::open_device(&adapter)).flatten();
+        #[cfg(not(target_os = "linux"))]
+        let zero_copy = None;
+        let zero_copy_device = zero_copy.is_some();
+        let (device, queue) = match zero_copy {
+            Some(dq) => dq,
+            None => pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?,
+        };
+        #[cfg(target_os = "linux")]
+        let importer = zero_copy_device
+            .then(|| crate::zerocopy::Importer::new(&device).inspect_err(|e| tracing::warn!("zero-copy importer: {e:#}")).ok())
+            .flatten();
+        #[cfg(target_os = "linux")]
+        let zero_copy_device = importer.is_some();
+        decode::set_zero_copy(zero_copy_device);
+        tracing::info!(path = if zero_copy_device { "zero-copy dmabuf" } else { "copy" }, "decoded frames");
         let tex_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -112,7 +131,18 @@ impl Gpu {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        Ok(Self { adapter, device, queue, layout, pipeline_layout, shader, sampler, pipelines: HashMap::new() })
+        Ok(Self {
+            adapter,
+            device,
+            queue,
+            layout,
+            pipeline_layout,
+            shader,
+            sampler,
+            pipelines: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            importer,
+        })
     }
 
     fn draw(&mut self, target: &wgpu::TextureView, format: wgpu::TextureFormat, frame: Option<(&FrameTextures, Viewport)>) {
@@ -171,11 +201,17 @@ impl Gpu {
 }
 
 struct FrameTextures {
-    y: wgpu::Texture,
-    uv: wgpu::Texture,
+    source: Source,
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
+}
+
+enum Source {
+    Upload { y: wgpu::Texture, uv: wgpu::Texture },
+    /// Sampled in place; kept alive until every submission that drew it has finished.
+    #[cfg(target_os = "linux")]
+    Imported(Arc<decode::dmabuf::DmabufFrame>),
 }
 
 /// Per-window presentation state.
@@ -233,11 +269,31 @@ impl WindowRenderer {
         Some(Viewport::new(self.fit, w, h, self.config.width, self.config.height))
     }
 
-    pub fn upload(&mut self, gpu: &Gpu, f: &Nv12Frame) {
-        if self.frame_size() != Some((f.width, f.height)) {
-            self.frame = Some(FrameTextures::new(gpu, f.width, f.height));
+    pub fn upload(&mut self, gpu: &mut Gpu, picture: Picture) {
+        match picture {
+            Picture::Cpu(f) => {
+                let reusable = matches!(&self.frame, Some(t) if matches!(t.source, Source::Upload { .. }) && (t.width, t.height) == (f.width, f.height));
+                if !reusable {
+                    self.frame = Some(FrameTextures::new(gpu, f.width, f.height));
+                }
+                self.frame.as_ref().unwrap().write(gpu, &f);
+            }
+            #[cfg(target_os = "linux")]
+            Picture::Dmabuf(f) => {
+                let Gpu { device, layout, sampler, importer, .. } = gpu;
+                let Some(importer) = importer.as_mut() else { return };
+                match importer.import(device, layout, sampler, &f) {
+                    Ok(bind_group) => {
+                        let (width, height) = (f.width, f.height);
+                        self.frame = Some(FrameTextures { source: Source::Imported(Arc::new(f)), bind_group, width, height });
+                    }
+                    Err(e) => {
+                        tracing::warn!("zero-copy import failed ({e:#}); copying frames instead");
+                        decode::set_zero_copy(false);
+                    }
+                }
+            }
         }
-        self.frame.as_ref().unwrap().write(gpu, f);
     }
 
     /// Draws the current frame (black until the first one arrives) and presents.
@@ -256,13 +312,18 @@ impl WindowRenderer {
         let view = texture.texture.create_view(&Default::default());
         let frame = self.frame.as_ref().zip(self.viewport());
         gpu.draw(&view, self.config.format, frame);
+        #[cfg(target_os = "linux")]
+        if let Some(FrameTextures { source: Source::Imported(f), .. }) = &self.frame {
+            let keep = f.clone();
+            gpu.queue.on_submitted_work_done(move || drop(keep));
+        }
         gpu.queue.present(texture);
     }
 }
 
 impl FrameTextures {
     fn write(&self, gpu: &Gpu, f: &Nv12Frame) {
-        let t = self;
+        let Source::Upload { y, uv } = &self.source else { return };
         let (cw, ch) = (f.width.div_ceil(2), f.height.div_ceil(2));
         let write = |tex: &wgpu::Texture, data: &[u8], stride: usize, w: u32, h: u32| {
             gpu.queue.write_texture(
@@ -272,8 +333,8 @@ impl FrameTextures {
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
         };
-        write(&t.y, &f.y, f.y_stride, f.width, f.height);
-        write(&t.uv, &f.uv, f.uv_stride, cw, ch);
+        write(y, &f.y, f.y_stride, f.width, f.height);
+        write(uv, &f.uv, f.uv_stride, cw, ch);
     }
 
     fn new(gpu: &Gpu, width: u32, height: u32) -> Self {
@@ -306,7 +367,7 @@ impl FrameTextures {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&gpu.sampler) },
             ],
         });
-        FrameTextures { y, uv, bind_group, width, height }
+        FrameTextures { source: Source::Upload { y, uv }, bind_group, width, height }
     }
 }
 
@@ -328,7 +389,18 @@ mod tests {
 
     /// Renders an NV12 frame offscreen and returns the center pixel.
     fn render_pixel(gpu: &mut Gpu, f: &Nv12Frame) -> [u8; 4] {
-        let (w, h) = (64u32, 64u32);
+        let textures = FrameTextures::new(gpu, f.width, f.height);
+        textures.write(gpu, f);
+        let data = render_rgba(gpu, &textures, 64, 64);
+        // Frames draw 1:1 from the top-left, so sample inside the frame.
+        let (x, y) = (f.width as usize / 2, f.height as usize / 2);
+        let o = (y * 64 + x) * 4;
+        [data[o], data[o + 1], data[o + 2], data[o + 3]]
+    }
+
+    /// Draws `textures` into a `w`x`h` RGBA target and reads it back, tightly packed.
+    fn render_rgba(gpu: &mut Gpu, textures: &FrameTextures, w: u32, h: u32) -> Vec<u8> {
+        let row = (w * 4).next_multiple_of(256);
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -340,13 +412,11 @@ mod tests {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let textures = FrameTextures::new(gpu, f.width, f.height);
-        textures.write(gpu, f);
         let view = target.create_view(&Default::default());
-        gpu.draw(&view, format, Some((&textures, Viewport::new(Fit::Exact, f.width, f.height, w, h))));
+        gpu.draw(&view, format, Some((textures, Viewport::new(Fit::Exact, textures.width, textures.height, w, h))));
         let buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: (256 * h) as u64,
+            size: (row * h) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -355,7 +425,7 @@ mod tests {
             target.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &buf,
-                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(h) },
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) },
             },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
@@ -363,10 +433,42 @@ mod tests {
         buf.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
         gpu.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         let data = buf.slice(..).get_mapped_range().unwrap();
-        // Frames draw 1:1 from the top-left, so sample inside the frame.
-        let (x, y) = (f.width / 2, f.height / 2);
-        let o = (y * 256 + x * 4) as usize;
-        [data[o], data[o + 1], data[o + 2], data[o + 3]]
+        data.chunks(row as usize).flat_map(|r| r[..(w * 4) as usize].to_vec()).collect()
+    }
+
+    /// The zero-copy path must show exactly what the copy path shows.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dmabuf_import_matches_copy() {
+        use umac_proto::Codec;
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(mut gpu) = Gpu::with_instance(&instance, None) else { return eprintln!("no GPU, skipping") };
+        if gpu.importer.is_none() {
+            return eprintln!("no dmabuf import support, skipping");
+        }
+        let path = std::env::temp_dir().join(format!("umac-zc-test-{}.ts", std::process::id()));
+        crate::sample::generate_hevc(&path, 320, 180, 1).unwrap();
+        let packets = crate::sample::read_packets(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let (Ok(mut copy), Ok(mut zc)) = (decode::create_with_export(Codec::Hevc, false), decode::create_with_export(Codec::Hevc, true))
+        else {
+            return eprintln!("no decoder, skipping");
+        };
+        if !zc.describe().contains("vaapi") {
+            return eprintln!("no VA-API, skipping");
+        }
+        for p in packets.iter().take(5) {
+            let Some(Picture::Cpu(cpu)) = copy.decode(&p.data).unwrap() else { panic!("copy path gave no CPU picture") };
+            let Some(Picture::Dmabuf(f)) = zc.decode(&p.data).unwrap() else { panic!("zero-copy path gave no dmabuf") };
+            let a = FrameTextures::new(&gpu, cpu.width, cpu.height);
+            a.write(&gpu, &cpu);
+            let Gpu { device, layout, sampler, importer, .. } = &mut gpu;
+            let bind_group = importer.as_mut().unwrap().import(device, layout, sampler, &f).unwrap();
+            let b = FrameTextures { source: Source::Imported(Arc::new(f)), bind_group, width: cpu.width, height: cpu.height };
+            let (ra, rb) = (render_rgba(&mut gpu, &a, 320, 180), render_rgba(&mut gpu, &b, 320, 180));
+            let worst = ra.iter().zip(&rb).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+            assert!(worst <= 1, "zero-copy differs from copy by up to {worst}");
+        }
     }
 
     #[test]

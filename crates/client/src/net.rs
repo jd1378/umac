@@ -424,7 +424,7 @@ fn spawn_decoder(
                 Ok(Some(frame)) => {
                     total += t.elapsed();
                     n += 1;
-                    if !ui.send(UiEvent::Frame { window, frame }) {
+                    if !ui.send(UiEvent::Frame { window, frame, decoded: Instant::now() }) {
                         break;
                     }
                 }

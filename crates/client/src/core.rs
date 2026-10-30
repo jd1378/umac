@@ -14,7 +14,7 @@ use crate::{
     clipboard::PasteFlow,
     config::Config,
     cursor::{Cursors, Shape},
-    decode::Nv12Frame,
+    decode::Picture,
     net::NetCmd,
     render::{Gpu, WindowRenderer},
     shortcuts::{Profile, Translator, is_terminal},
@@ -36,6 +36,9 @@ struct Remote {
     size: (u32, u32),
     resize_due: Option<Instant>,
     presented: u32,
+    /// Time from decode finished to present submitted, and the share spent on the UI thread.
+    present_lag: Duration,
+    ui_time: Duration,
     stats_since: Instant,
 }
 
@@ -167,7 +170,12 @@ impl Core {
         }
         self.remotes.insert(
             info.id,
-            Remote { info, renderer, cursor: (0.0, 0.0), size, resize_due: None, presented: 0, stats_since: Instant::now() },
+            Remote { info, renderer, cursor: (0.0, 0.0), size, resize_due: None,
+                presented: 0,
+                present_lag: Duration::ZERO,
+                ui_time: Duration::ZERO,
+                stats_since: Instant::now(),
+            },
         );
         Ok(())
     }
@@ -197,15 +205,26 @@ impl Core {
         self.opened_any && !self.remotes.values().any(|r| is_toplevel(r.info.kind))
     }
 
-    pub fn frame(&mut self, window: WindowId, frame: &Nv12Frame) {
+    pub fn frame(&mut self, window: WindowId, frame: Picture, decoded: Instant) {
         let (Some(r), Some(gpu)) = (self.remotes.get_mut(&window), self.gpu.as_mut()) else { return };
+        let start = Instant::now();
         r.renderer.upload(gpu, frame);
         r.renderer.render(gpu);
+        let end = Instant::now();
         r.presented += 1;
+        r.ui_time += end - start;
+        r.present_lag += end - decoded;
         let secs = r.stats_since.elapsed().as_secs_f64();
         if secs >= 5.0 {
-            tracing::info!(window, fps = format_args!("{:.1}", r.presented as f64 / secs), "present");
-            (r.presented, r.stats_since) = (0, Instant::now());
+            let ms = |d: Duration| format_args!("{:.2}", d.as_secs_f64() * 1e3 / r.presented as f64).to_string();
+            tracing::info!(
+                window,
+                fps = format_args!("{:.1}", r.presented as f64 / secs),
+                ui_ms = ms(r.ui_time),
+                lag_ms = ms(r.present_lag),
+                "present"
+            );
+            (r.presented, r.ui_time, r.present_lag, r.stats_since) = (0, Duration::ZERO, Duration::ZERO, Instant::now());
         }
     }
 

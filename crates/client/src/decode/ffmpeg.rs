@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow, bail};
 use ffmpeg_next::ffi as ff;
 use umac_proto::Codec;
 
-use super::{Decoder, MAX_DIMENSION, Nv12Frame};
+use super::{Decoder, MAX_DIMENSION, Nv12Frame, Picture};
 
 pub struct FfmpegDecoder {
     ctx: *mut ff::AVCodecContext,
@@ -15,6 +15,8 @@ pub struct FfmpegDecoder {
     sw_frame: *mut ff::AVFrame,
     desc: String,
     hw_checked: bool,
+    /// Overrides the process-wide zero-copy switch (tests compare both paths side by side).
+    pub(crate) export: Option<bool>,
 }
 
 // The raw pointers are owned exclusively by this struct and only touched through `&mut self`.
@@ -81,6 +83,9 @@ impl FfmpegDecoder {
             (*ctx).flags |= ff::AV_CODEC_FLAG_LOW_DELAY as i32;
             (*ctx).thread_count = 1;
             if hw {
+                // Zero-copy pictures keep their VA surface until the GPU has drawn them, so the
+                // fixed surface pool needs room beyond the reference frames.
+                (*ctx).extra_hw_frames = 8;
                 let mut dev = ptr::null_mut();
                 let ret = ff::av_hwdevice_ctx_create(
                     &mut dev,
@@ -108,7 +113,29 @@ impl FfmpegDecoder {
                 sw_frame: ff::av_frame_alloc(),
                 desc: String::new(),
                 hw_checked: !hw,
+                export: None,
             })
+        }
+    }
+
+    /// Hands out the current frame: as an exported VA surface when zero-copy is on, else
+    /// copied to CPU memory. A failed export falls back to copying from then on.
+    unsafe fn picture(&mut self) -> Result<Picture> {
+        unsafe {
+            #[cfg(target_os = "linux")]
+            if (*self.frame).format == ff::AVPixelFormat::AV_PIX_FMT_VAAPI as i32 && self.export.unwrap_or_else(super::zero_copy) {
+                match super::dmabuf::DmabufFrame::export(self.frame) {
+                    Ok(f) => {
+                        self.hw_checked = true;
+                        return Ok(Picture::Dmabuf(f));
+                    }
+                    Err(e) => {
+                        tracing::warn!("VA surface export failed ({e:#}); copying frames instead");
+                        super::set_zero_copy(false);
+                    }
+                }
+            }
+            Ok(Picture::Cpu(self.convert()?))
         }
     }
 
@@ -166,7 +193,7 @@ impl FfmpegDecoder {
 }
 
 impl Decoder for FfmpegDecoder {
-    fn decode(&mut self, data: &[u8]) -> Result<Option<Nv12Frame>> {
+    fn decode(&mut self, data: &[u8]) -> Result<Option<Picture>> {
         let len = i32::try_from(data.len()).map_err(|_| anyhow!("packet too large"))?;
         unsafe {
             // av_new_packet allocates the zeroed padding libavcodec's bitstream readers expect.
@@ -189,7 +216,7 @@ impl Decoder for FfmpegDecoder {
                 if ret < 0 {
                     return Err(av_err(ret));
                 }
-                let res = self.convert();
+                let res = self.picture();
                 ff::av_frame_unref(self.frame);
                 out = Some(res?);
             }

@@ -129,7 +129,7 @@ impl ApplicationHandler<UiEvent> for App {
                     }
                 }
             }
-            UiEvent::Frame { window, frame } => self.core.frame(window, &frame),
+            UiEvent::Frame { window, frame, decoded } => self.core.frame(window, frame, decoded),
             UiEvent::Changed(info) => {
                 let (id, kind, offset, parent) = (info.id, info.kind, core::popup_offset(&info), info.parent);
                 let Some(change) = self.core.changed(info) else { return };

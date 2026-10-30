@@ -35,9 +35,10 @@ async fn main() -> Result<()> {
     let dir = PathBuf::from(args.next().context("usage: fake_host <state-dir> [port]")?);
     let port: u16 = args.next().map(|p| p.parse()).transpose()?.unwrap_or(umac_proto::DEFAULT_PORT);
     let identity = Identity::load_or_create(&dir.join("identity"))?;
-    let clip = dir.join("clip.ts");
+    let (clip_w, clip_h) = clip_size();
+    let clip = dir.join(format!("clip-{clip_w}x{clip_h}.ts"));
     if !clip.exists() {
-        sample::generate_hevc(&clip, 1280, 720, 4)?;
+        sample::generate_hevc(&clip, clip_w, clip_h, 4)?;
     }
     let packets = Arc::new(sample::read_packets(&clip)?);
     let popup_clip = dir.join("popup.ts");
@@ -62,6 +63,17 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// UMAC_FAKE_SIZE=1920x1080 streams a larger clip, e.g. for decode benchmarks.
+fn clip_size() -> (u32, u32) {
+    std::env::var("UMAC_FAKE_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (w, h) = s.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .unwrap_or((1280, 720))
+}
+
 async fn serve(
     incoming: umac_transport::quinn::Incoming,
     packets: Arc<Vec<sample::SamplePacket>>,
@@ -82,6 +94,7 @@ async fn serve(
     write_msg(&mut send, &HelloReply::Accepted { host_name: "fake-host".into() }).await?;
     tracing::info!(client = hello.client_name, "client accepted");
 
+    let (clip_w, clip_h) = clip_size();
     let input_conn = conn.clone();
     tokio::spawn(async move {
         let Ok(mut uni) = input_conn.accept_uni().await else { return };
@@ -96,14 +109,14 @@ async fn serve(
         app_name: "FakeApp".into(),
         bundle_id: Some("dev.umac.fake".into()),
         title: "test pattern".into(),
-        width: 1280,
-        height: 720,
+        width: clip_w,
+        height: clip_h,
         scale: 1.0,
         parent: None,
         offset: (0, 0),
         kind: WindowKind::Normal,
     };
-    let popups = [(POPUP_IN, (100, 80)), (POPUP_OUT, (1280 - POPUP_SIZE.0 as i32 / 2, -60))].map(|(id, offset)| WindowInfo {
+    let popups = [(POPUP_IN, (100, 80)), (POPUP_OUT, (clip_w as i32 - POPUP_SIZE.0 as i32 / 2, -60))].map(|(id, offset)| WindowInfo {
         id,
         title: String::new(),
         width: POPUP_SIZE.0,
