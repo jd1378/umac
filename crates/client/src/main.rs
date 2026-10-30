@@ -40,6 +40,8 @@ enum LaunchArg {
     ActivityMonitor,
     /// A Finder window on /Applications.
     Finder,
+    /// System Settings.
+    Settings,
 }
 
 impl From<LaunchArg> for LaunchAction {
@@ -49,6 +51,7 @@ impl From<LaunchArg> for LaunchAction {
             LaunchArg::Terminal => LaunchAction::Terminal,
             LaunchArg::ActivityMonitor => LaunchAction::ActivityMonitor,
             LaunchArg::Finder => LaunchAction::FinderApplications,
+            LaunchArg::Settings => LaunchAction::SystemSettings,
         }
     }
 }

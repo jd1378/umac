@@ -40,7 +40,7 @@ and `displays` runs that one command in its own process instead (debugging, X11)
 with its last window.
 
 Left click on the tray opens Apps; the right-click menu has Apps, Open a terminal window,
-Show Desktop, Show task manager, Paired hosts and Exit, which closes every window and stops
+Show Desktop, Show task manager, Show settings (Mac System Settings), Paired hosts and Exit, which closes every window and stops
 the daemon. Failures show as desktop notifications. On macOS 27 the Apps launcher is an
 overlay that cannot be streamed, so Apps shows a Finder window on /Applications instead.
 

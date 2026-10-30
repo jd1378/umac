@@ -28,6 +28,7 @@ fn action(name: &str) -> anyhow::Result<LaunchAction> {
     Ok(match name {
         "terminal" => LaunchAction::Terminal,
         "activity" => LaunchAction::ActivityMonitor,
+        "settings" => LaunchAction::SystemSettings,
         "apps" => LaunchAction::Apps,
         "finder" => LaunchAction::FinderApplications,
         _ => anyhow::bail!("unknown action {name}"),

@@ -243,6 +243,8 @@ pub enum LaunchAction {
     ActivityMonitor,
     /// A Finder window on /Applications (fallback launcher).
     FinderApplications,
+    /// System Settings.
+    SystemSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

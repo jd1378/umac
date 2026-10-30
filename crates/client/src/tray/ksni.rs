@@ -60,6 +60,7 @@ impl ksni::Tray for UmacTray {
             item("Open a terminal window", Action::Terminal),
             item("Show Desktop", Action::Desktop),
             item("Show task manager", Action::TaskManager),
+            item("Show settings", Action::Settings),
             MenuItem::Separator,
         ];
         if !hosts.is_empty() {

@@ -17,6 +17,7 @@ pub enum Action {
     Terminal,
     Desktop,
     TaskManager,
+    Settings,
     /// Fingerprint of the host to use from now on.
     SelectHost(String),
     Exit,

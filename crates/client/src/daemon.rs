@@ -219,6 +219,7 @@ async fn tray_loop(store: Store, color: crate::config::TrayIconColor, manager: M
                             Action::Apps => manager.launch(None, LaunchAction::Apps).await,
                             Action::Terminal => manager.launch(None, LaunchAction::Terminal).await,
                             Action::TaskManager => manager.launch(None, LaunchAction::ActivityMonitor).await,
+                            Action::Settings => manager.launch(None, LaunchAction::SystemSettings).await,
                             Action::Desktop => manager.desktop(None, None, None).await,
                             Action::SelectHost(_) | Action::Exit => return,
                         };

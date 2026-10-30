@@ -36,6 +36,7 @@ pub fn plan(action: LaunchAction, home: &str) -> Plan {
         LaunchAction::ActivityMonitor => (vec!["-b", "com.apple.ActivityMonitor"], "com.apple.ActivityMonitor", Reuse::Any),
         LaunchAction::Apps => (vec!["-b", "com.apple.apps.launcher"], "com.apple.apps.launcher", Reuse::Any),
         LaunchAction::FinderApplications => (vec!["/Applications"], "com.apple.finder", Reuse::Titled("Applications")),
+        LaunchAction::SystemSettings => (vec!["-b", "com.apple.systempreferences"], "com.apple.systempreferences", Reuse::Any),
     };
     Plan { open_args: open_args.into_iter().map(str::to_owned).collect(), bundle_id, reuse }
 }
