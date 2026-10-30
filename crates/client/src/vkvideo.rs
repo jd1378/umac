@@ -3,9 +3,10 @@
 //! counts and references; here a job is decoded on the device's video decode queue and the
 //! picture is copied into two plain textures (R8 luma, RG8 CbCr) that the NV12 shader samples.
 //!
-//! Synchronization: the decode is waited for on the CPU (one frame, so this costs at most the
-//! decode time), the copy runs on wgpu's queue ahead of the draw, and the next decode waits for
-//! that copy through a semaphore. DPB images are shared concurrently by both queue families,
+//! Synchronization stays on the GPU: the decode signals a semaphore the copy on wgpu's queue
+//! waits for, the draw is submitted after the copy on that same queue, and the next decode
+//! waits for the copy through another semaphore. The CPU only waits on a fence before reusing
+//! a command buffer, by which time the previous frame is normally long done. DPB images are shared concurrently by both queue families,
 //! so no ownership transfers are needed.
 
 use std::{ffi::CStr, mem, ptr, sync::Arc};
@@ -299,6 +300,8 @@ pub struct Decoder {
     copy_fence: vk::Fence,
     /// Signaled by the last copy, waited by the next decode.
     copied: vk::Semaphore,
+    /// Signaled by each decode, waited for by the copy that follows it.
+    decoded: vk::Semaphore,
     copy_pending: bool,
     fresh: bool,
     planes_ready: bool,
@@ -367,6 +370,7 @@ impl Decoder {
                 copy_pool,
                 copy_fence: fence()?,
                 copied: raw.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?,
+                decoded: raw.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?,
                 copy_pending: false,
                 fresh: true,
                 planes_ready: false,
@@ -635,14 +639,14 @@ impl Decoder {
             let cmds = [cmd];
             let waits = [self.copied];
             let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
-            let mut submit = vk::SubmitInfo::default().command_buffers(&cmds);
+            let decoded = [self.decoded];
+            let mut submit = vk::SubmitInfo::default().command_buffers(&cmds).signal_semaphores(&decoded);
             if self.copy_pending {
                 submit = submit.wait_semaphores(&waits).wait_dst_stage_mask(&stages);
             }
             raw.queue_submit(ctx.decode_queue, &[submit], self.decode_fence)?;
             self.copy_pending = false;
             self.fresh = false;
-            raw.wait_for_fences(&[self.decode_fence], true, u64::MAX)?;
         }
         let (src, layer, layout) = match self.output {
             Some((img, _, _)) => (img, 0, vk::ImageLayout::VIDEO_DECODE_DST_KHR),
@@ -711,7 +715,11 @@ impl Decoder {
             raw.end_command_buffer(cmd)?;
             let cmds = [cmd];
             let signals = [self.copied];
-            let submit = vk::SubmitInfo::default().command_buffers(&cmds).signal_semaphores(&signals);
+            let waits = [self.decoded];
+            // The layout transitions at the start of this submission also touch the decoded
+            // image, so everything in it waits, not just the copies.
+            let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+            let submit = vk::SubmitInfo::default().command_buffers(&cmds).wait_semaphores(&waits).wait_dst_stage_mask(&stages).signal_semaphores(&signals);
             // wgpu's queue, from the render thread that also submits wgpu's work: the draw that
             // samples the planes is submitted after this and so runs after it.
             raw.queue_submit(ctx.gfx_queue, &[submit], self.copy_fence)?;
@@ -755,6 +763,7 @@ impl Drop for Decoder {
                 raw.free_memory(self.bitstream_memory, None);
             }
             raw.destroy_semaphore(self.copied, None);
+            raw.destroy_semaphore(self.decoded, None);
             raw.destroy_fence(self.decode_fence, None);
             raw.destroy_fence(self.copy_fence, None);
             raw.destroy_command_pool(self.decode_pool, None);
