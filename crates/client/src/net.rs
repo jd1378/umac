@@ -253,9 +253,15 @@ pub async fn run_open(
     let mut ctrl_send = session.ctrl_send;
     let mut tick = tokio::time::interval(TICK);
     let mut last_stats = Instant::now();
+    // SIGTERM (tray Exit) and Ctrl+C end the session cleanly, so the Mac stops streaming at
+    // once instead of waiting for the connection to time out.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     loop {
         tokio::select! {
+            _ = terminate.recv() => break,
+            _ = interrupt.recv() => break,
             dgram = conn.read_datagram() => {
                 let dgram = match dgram {
                     Ok(d) => d,

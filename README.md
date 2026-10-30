@@ -34,7 +34,9 @@ too); if it already runs, it just says so. `umac daemon` runs it in the foregrou
 opens Apps; the right-click menu has Apps, Open a terminal window, Show Desktop, Show task
 manager, Paired hosts and Exit. Each action is its own `umac` process (`umac launch apps|
 terminal|activity-monitor|finder`, `umac desktop`), so closing or crashing one never affects
-the tray; failures show as desktop notifications. On macOS 27 the Apps launcher is an
+the tray; failures show as desktop notifications. Exit also closes the windows the tray
+opened (streams started with `umac open` on the command line keep running; Ctrl+C or
+SIGTERM closes those cleanly). On macOS 27 the Apps launcher is an
 overlay that cannot be streamed, so Apps shows a Finder window on /Applications instead.
 
 Paired hosts lists every paired Mac as `name (address)`; the checked one is what the tray and

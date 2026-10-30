@@ -173,8 +173,31 @@ pub async fn run(store: Store, config_dir: Option<PathBuf>) -> Result<()> {
         }
     }
     tray.shutdown().await;
-    tracing::info!(running = children.len(), "tray closed; open windows keep running");
+    close_children(&mut children).await;
+    tracing::info!("tray closed");
     Ok(())
+}
+
+/// Asks every stream process started from the tray to close (SIGTERM: each one tells the Mac
+/// it is leaving), then kills whatever is still running after a grace period.
+async fn close_children(children: &mut Vec<Child>) {
+    const GRACE: Duration = Duration::from_secs(2);
+    for c in children.iter() {
+        if let Ok(pid) = i32::try_from(c.id()) {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+    }
+    let deadline = Instant::now() + GRACE;
+    while !children.is_empty() && Instant::now() < deadline {
+        children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for c in children.iter_mut() {
+        tracing::warn!(pid = c.id(), "stream did not exit in time; killing it");
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    children.clear();
 }
 
 /// Shows a desktop notification (org.freedesktop.Notifications). Best effort.
