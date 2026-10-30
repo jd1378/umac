@@ -4,7 +4,13 @@
 set -euo pipefail
 ref=${GITHUB_REF:-}
 if [[ $ref == refs/tags/v* ]]; then
-    echo "${ref#refs/tags/v}"
+    tag=${ref#refs/tags/v}
+    crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$(dirname "$0")/../Cargo.toml" | head -n1)
+    if [[ $tag != "$crate" ]]; then
+        echo "tag v$tag does not match the workspace version $crate in Cargo.toml" >&2
+        exit 1
+    fi
+    echo "$tag"
 else
     echo "dev-$(git rev-parse --short HEAD)"
 fi

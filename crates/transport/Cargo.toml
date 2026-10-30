@@ -18,7 +18,7 @@ socket2 = "=0.6.5"
 thiserror = "=2.0.21"
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 tracing = "=0.1.44"
-umac-proto = { version = "0.1.0", path = "../proto" }
+umac-proto = { version = "=0.2.0", path = "../proto" }
 
 [dev-dependencies]
 tokio = { version = "=1.54.1", features = ["rt", "macros", "rt-multi-thread"] }

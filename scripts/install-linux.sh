@@ -88,7 +88,7 @@ install_release() {
     install -Dm755 "$tmp/${asset%.tar.gz}/umac" "$bin/umac"
     printf 'installed %s (%s)\n' "$bin/umac" "$tag"
 
-    if ! ldconfig -p 2>/dev/null | grep -q 'libxkbcommon\.so\.0'; then
+    if ! { ldconfig -p 2>/dev/null || /sbin/ldconfig -p 2>/dev/null; } | grep -c 'libxkbcommon\.so\.0' >/dev/null; then
         printf '\numac needs libxkbcommon at runtime.\n'
         install_packages "libxkbcommon" "libxkbcommon0" "libxkbcommon"
     fi

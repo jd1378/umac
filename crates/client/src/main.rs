@@ -20,6 +20,7 @@ use umac_client::{
 #[derive(Parser)]
 #[command(
     name = "umac",
+    version,
     about = "Show individual Mac windows as native windows on this PC",
     after_help = "Without a command, starts the tray in the background if a Mac is paired."
 )]
