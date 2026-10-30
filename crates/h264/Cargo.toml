@@ -1,0 +1,8 @@
+[package]
+name = "umac-h264"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "=2.0.21"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/transport", "crates/host", "crates/client", "crates/pyrowave-decode"]
+members = ["crates/proto", "crates/transport", "crates/host", "crates/client", "crates/pyrowave-decode", "crates/h264"]
 
 [workspace.package]
 version = "0.1.0"

@@ -3316,6 +3316,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "umac-h264"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "umac-host"
 version = "0.1.0"
 dependencies = [
