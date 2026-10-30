@@ -39,6 +39,7 @@ pub fn run(spec: &str, seconds: u64, out: &Path, codec: Codec, bitrate_kbps: u32
     let stream = WindowStream::start(
         &window,
         StreamParams { window: id, codec, fps, bitrate_kbps },
+        0.0,
         Arc::new(move |_, frame| {
             let lat = clock::now_us().saturating_sub(frame.capture_us);
             let mut st = s.lock().unwrap();

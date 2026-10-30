@@ -68,8 +68,9 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    pub fn placement(&self, scale: f64) -> Placement {
-        Placement { x: self.x, y: self.y, width: self.width, height: self.height, scale }
+    /// Placement of the captured area: the window minus `inset` points at the top.
+    pub fn placement(&self, scale: f64, inset: f64) -> Placement {
+        Placement { x: self.x, y: self.y + inset, width: self.width, height: (self.height - inset).max(1.0), scale }
     }
 }
 

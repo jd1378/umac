@@ -219,6 +219,8 @@ struct ActiveStream {
     stream: WindowStream,
     info: WindowInfo,
     geometry: Geometry,
+    /// Title bar points cropped from the capture.
+    inset: f64,
 }
 
 struct Session {
@@ -295,7 +297,7 @@ impl Session {
             ClientMsg::Resize { window, width, height } => {
                 let Some(s) = self.streams.get(&window) else { return Ok(()) };
                 let (pid, scale) = (s.info.pid, s.info.scale.max(1.0) as f64);
-                let (w, h) = (width as f64 / scale, height as f64 / scale);
+                let (w, h) = (width as f64 / scale, height as f64 / scale + s.inset);
                 let res = tokio::task::spawn_blocking(move || AxWindow::find(pid, window)?.resize(w, h)).await?;
                 match res {
                     Ok(got) => tracing::debug!(window, requested = ?(w, h), ?got, "resized"),
@@ -319,11 +321,12 @@ impl Session {
         };
         let tx = self.frames_tx.clone();
         let on_encoded = Arc::new(move |w: WindowId, f: EncodedFrame| tx.try_send((w, f)).is_ok());
-        let (stream, sc_info) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let (stream, sc_info, inset) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let sc = find_window(window)?;
             let app = sc.owning_application().ok_or_else(|| anyhow!("window has no owning app"))?;
             let info = (app.process_id(), app.application_name(), app.bundle_identifier(), sc.title().unwrap_or_default());
-            Ok((WindowStream::start(&sc, params, on_encoded)?, info))
+            let inset = AxWindow::find(info.0, window).map(|w| w.titlebar_inset()).unwrap_or(0.0);
+            Ok((WindowStream::start(&sc, params, inset, on_encoded)?, info, inset))
         })
         .await??;
         let geometry = windows::geometry(window).ok_or_else(|| anyhow!("window {window} vanished"))?;
@@ -339,15 +342,15 @@ impl Session {
             parent: None,
             kind: umac_proto::WindowKind::Normal,
         };
-        self.set_target(&info, &geometry);
-        tracing::info!(window, app = %info.app_name, size = ?stream.size, ?params, "stream started");
-        self.streams.insert(window, ActiveStream { stream, info: info.clone(), geometry });
+        self.set_target(&info, &geometry, inset);
+        tracing::info!(window, app = %info.app_name, size = ?stream.size, inset, ?params, "stream started");
+        self.streams.insert(window, ActiveStream { stream, info: info.clone(), geometry, inset });
         Ok(info)
     }
 
-    fn set_target(&self, info: &WindowInfo, g: &Geometry) {
+    fn set_target(&self, info: &WindowInfo, g: &Geometry, inset: f64) {
         if let Ok(mut t) = self.shared.targets.write() {
-            t.insert(info.id, Target { pid: info.pid, placement: g.placement(info.scale as f64) });
+            t.insert(info.id, Target { pid: info.pid, placement: g.placement(info.scale as f64, inset) });
         }
     }
 
@@ -374,7 +377,7 @@ impl Session {
                 continue;
             }
             let scale = s.info.scale as f64;
-            let px = ((g.width * scale).round() as u32, (g.height * scale).round() as u32);
+            let px = ((g.width * scale).round() as u32, ((g.height - s.inset).max(1.0) * scale).round() as u32);
             let resized = px != (s.info.width, s.info.height);
             if resized {
                 if let Err(e) = s.stream.resize(px.0, px.1) {
@@ -388,8 +391,8 @@ impl Session {
                 s.info.title = g.title.clone();
             }
             s.geometry = g;
-            let (info, geometry) = (s.info.clone(), s.geometry.clone());
-            self.set_target(&info, &geometry);
+            let (info, geometry, inset) = (s.info.clone(), s.geometry.clone(), s.inset);
+            self.set_target(&info, &geometry, inset);
             if resized || retitled {
                 write_msg(send, &HostMsg::WindowChanged(info)).await?;
             }

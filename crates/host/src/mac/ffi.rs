@@ -164,4 +164,5 @@ unsafe extern "C" {
     pub fn _AXUIElementGetWindow(el: AXUIElementRef, id: *mut u32) -> AXError;
 }
 
+pub const kAXValueCGPointType: u32 = 1;
 pub const kAXValueCGSizeType: u32 = 2;

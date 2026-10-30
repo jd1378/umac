@@ -124,7 +124,7 @@ pub struct WindowStream {
 }
 
 impl WindowStream {
-    pub fn start(window: &SCWindow, params: StreamParams, on_encoded: OnEncoded) -> anyhow::Result<Self> {
+    pub fn start(window: &SCWindow, params: StreamParams, inset: f64, on_encoded: OnEncoded) -> anyhow::Result<Self> {
         let shared = Arc::new(Shared {
             params,
             encoder: Mutex::new(None),
@@ -136,7 +136,7 @@ impl WindowStream {
             on_encoded,
         });
         let s = shared.clone();
-        let (capture, size) = WindowCapture::start(window, params.fps, Box::new(move |buf, t| s.submit(buf, t)))?;
+        let (capture, size) = WindowCapture::start(window, params.fps, inset, Box::new(move |buf, t| s.submit(buf, t)))?;
         Ok(Self { capture, shared, size })
     }
 
