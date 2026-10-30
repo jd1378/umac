@@ -1,0 +1,181 @@
+//! Injects client input as global CGEvents. Runs on its own thread because event sources
+//! are not `Send`, and so slow AX calls never stall the network tasks.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock, mpsc},
+    time::Instant,
+};
+
+use core_graphics::{
+    event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField, ScrollEventUnit},
+    event_source::{CGEventSource, CGEventSourceStateID},
+    geometry::CGPoint,
+};
+use umac_proto::{InputEvent, WindowId};
+
+use super::ax::AxWindow;
+use crate::input_state::{ButtonKey, InputState, KeyAction, Placement};
+
+/// Where each streamed window currently sits on the Mac; kept fresh by the session poller.
+#[derive(Debug, Clone, Copy)]
+pub struct Target {
+    pub pid: i32,
+    pub placement: Placement,
+}
+
+pub type Targets = Arc<RwLock<HashMap<WindowId, Target>>>;
+
+pub enum Command {
+    Input(InputEvent),
+    Focus(WindowId),
+}
+
+pub fn spawn(targets: Targets) -> mpsc::Sender<Command> {
+    let (tx, rx) = mpsc::channel::<Command>();
+    std::thread::Builder::new()
+        .name("umac-input".into())
+        .spawn(move || {
+            let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+                tracing::error!("cannot create CGEventSource; input disabled");
+                return;
+            };
+            let mut inj = Injector { source, targets, state: InputState::default(), last_pos: HashMap::new() };
+            for cmd in rx {
+                match cmd {
+                    Command::Input(ev) => inj.handle(ev),
+                    Command::Focus(w) => inj.focus(w),
+                }
+            }
+            inj.release_all();
+        })
+        .expect("spawning input thread");
+    tx
+}
+
+struct Injector {
+    source: CGEventSource,
+    targets: Targets,
+    state: InputState,
+    last_pos: HashMap<WindowId, (f64, f64)>,
+}
+
+fn button_types(b: ButtonKey) -> (CGEventType, CGEventType, CGEventType, CGMouseButton) {
+    match b.cg_number() {
+        0 => (CGEventType::LeftMouseDown, CGEventType::LeftMouseUp, CGEventType::LeftMouseDragged, CGMouseButton::Left),
+        1 => (CGEventType::RightMouseDown, CGEventType::RightMouseUp, CGEventType::RightMouseDragged, CGMouseButton::Right),
+        _ => (CGEventType::OtherMouseDown, CGEventType::OtherMouseUp, CGEventType::OtherMouseDragged, CGMouseButton::Center),
+    }
+}
+
+impl Injector {
+    fn target(&self, w: WindowId) -> Option<Target> {
+        self.targets.read().ok()?.get(&w).copied()
+    }
+
+    fn flags(&self) -> CGEventFlags {
+        CGEventFlags::from_bits_retain(self.state.flags())
+    }
+
+    fn post_mouse(&self, kind: CGEventType, pos: (f64, f64), button: CGMouseButton, number: u32, clicks: Option<i64>) {
+        let Ok(ev) = CGEvent::new_mouse_event(self.source.clone(), kind, CGPoint::new(pos.0, pos.1), button) else { return };
+        ev.set_flags(self.flags());
+        if number > 2 {
+            ev.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number as i64);
+        }
+        if let Some(c) = clicks {
+            ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, c);
+        }
+        ev.post(CGEventTapLocation::HID);
+    }
+
+    fn handle(&mut self, ev: InputEvent) {
+        match ev {
+            InputEvent::MouseMove { window, x, y } => {
+                let Some(t) = self.target(window) else { return };
+                let pos = t.placement.to_global(x, y);
+                self.last_pos.insert(window, pos);
+                match self.state.dragging() {
+                    Some(b) => {
+                        let (_, _, drag, cgb) = button_types(b);
+                        self.post_mouse(drag, pos, cgb, b.cg_number(), None);
+                    }
+                    None => self.post_mouse(CGEventType::MouseMoved, pos, CGMouseButton::Left, 0, None),
+                }
+            }
+            InputEvent::MouseButton { window, x, y, button, pressed } => {
+                let Some(t) = self.target(window) else { return };
+                let pos = t.placement.to_global(x, y);
+                self.last_pos.insert(window, pos);
+                let clicks = self.state.button(button, pressed, pos, Instant::now());
+                let b = ButtonKey::from(button);
+                let (down, up, _, cgb) = button_types(b);
+                self.post_mouse(if pressed { down } else { up }, pos, cgb, b.cg_number(), Some(clicks));
+            }
+            InputEvent::Scroll { window, dx, dy, precise } => {
+                let Some(t) = self.target(window) else { return };
+                let pos = self.last_pos.get(&window).copied().unwrap_or_else(|| {
+                    let p = t.placement;
+                    (p.x + p.width / 2.0, p.y + p.height / 2.0)
+                });
+                // Same sign convention on both ends: positive dy is wheel up (away from the user).
+                let (sx, sy) = ((dx as f64 / t.placement.scale) as i32, (dy as f64 / t.placement.scale) as i32);
+                if sx == 0 && sy == 0 {
+                    return;
+                }
+                let Ok(ev) = CGEvent::new_scroll_event(self.source.clone(), ScrollEventUnit::PIXEL, 2, sy, sx, 0) else { return };
+                ev.set_location(CGPoint::new(pos.0, pos.1));
+                ev.set_flags(self.flags());
+                if precise {
+                    ev.set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1);
+                }
+                ev.post(CGEventTapLocation::HID);
+            }
+            InputEvent::Key { keycode, pressed, .. } => self.key(keycode, pressed),
+            InputEvent::ReleaseAll => self.release_all(),
+        }
+    }
+
+    fn key(&mut self, keycode: u16, pressed: bool) {
+        let (keycode, down, kind, flags) = match self.state.key(keycode, pressed) {
+            KeyAction::Ignore => return,
+            KeyAction::FlagsChanged { keycode, flags } => (keycode, pressed, Some(CGEventType::FlagsChanged), flags),
+            KeyAction::Key { keycode, pressed, flags } => (keycode, pressed, None, flags),
+        };
+        let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), keycode, down) else { return };
+        if let Some(k) = kind {
+            ev.set_type(k);
+        }
+        ev.set_flags(CGEventFlags::from_bits_retain(flags));
+        ev.post(CGEventTapLocation::HID);
+    }
+
+    fn release_all(&mut self) {
+        let (keys, buttons, mods) = self.state.take_held();
+        for k in keys {
+            if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), k, false) {
+                ev.set_flags(self.flags());
+                ev.post(CGEventTapLocation::HID);
+            }
+        }
+        let pos = self.last_pos.values().next().copied().unwrap_or((0.0, 0.0));
+        for b in buttons {
+            let (_, up, _, cgb) = button_types(b);
+            self.post_mouse(up, pos, cgb, b.cg_number(), None);
+        }
+        for m in mods {
+            if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), m, false) {
+                ev.set_type(CGEventType::FlagsChanged);
+                ev.set_flags(self.flags());
+                ev.post(CGEventTapLocation::HID);
+            }
+        }
+    }
+
+    fn focus(&mut self, w: WindowId) {
+        let Some(t) = self.target(w) else { return };
+        if let Err(e) = AxWindow::find(t.pid, w).and_then(|ax| ax.focus()) {
+            tracing::warn!(window = w, "focus failed: {e}");
+        }
+    }
+}
