@@ -14,12 +14,15 @@ upstream commit `7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b` (audited, see `pyrowa
   (about 150 Mbit/s at 1080p60, where small text was visually lossless in the M1 benchmark).
   Lowered on sustained loss, raised back slowly.
 - Packet boundary: the largest PyroWave packet that fits one QUIC datagram after the
-  22 byte `PyroHeader`. Encoder packets that still exceed it (a single oversized block) are
-  dropped and counted; the block decodes as blur.
+  22 byte `PyroHeader`. An encoder packet that still exceeds it (a single block larger than a
+  datagram, seen at about 1.2 bpp) is split over consecutive datagrams flagged
+  `pyro_flags::CONTINUED`; the receiver joins them before parsing. Losing any piece loses
+  that packet (blur), like losing an unsplit packet.
 
 ## Wire
 
-One datagram = `PyroHeader` (`crates/proto/src/video.rs`) + one encoder packet. No FEC and no
+One datagram = `PyroHeader` (`crates/proto/src/video.rs`) + one encoder packet, or one piece
+of it (`CONTINUED`). `packet_count` counts datagrams. No FEC and no
 keyframes: every packet decodes on its own. Frames are only sent when the window changed.
 
 ## Client

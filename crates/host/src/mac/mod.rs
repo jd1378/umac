@@ -6,6 +6,7 @@ pub mod ffi;
 pub mod input;
 pub mod launch;
 pub mod pasteboard;
+pub mod pyrowave;
 pub mod permissions;
 pub mod server;
 pub mod setup;

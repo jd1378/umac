@@ -14,6 +14,7 @@ mod launch;
 mod newwin;
 mod owners;
 mod popup;
+mod pyro;
 #[cfg(target_os = "macos")]
 mod mac;
 mod status;
@@ -69,6 +70,9 @@ enum Cmd {
         /// Encode H.264 instead of HEVC.
         #[arg(long)]
         h264: bool,
+        /// Encode PyroWave instead of HEVC (raw packets back to back in `out`).
+        #[arg(long, conflicts_with = "h264")]
+        pyrowave: bool,
     },
 }
 
@@ -113,8 +117,12 @@ fn platform_main(cmd: Cmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::CaptureTest { window, seconds, out, bitrate_kbps, fps, h264 } => {
-            let codec = if h264 { umac_proto::Codec::H264 } else { umac_proto::Codec::Hevc };
+        Cmd::CaptureTest { window, seconds, out, bitrate_kbps, fps, h264, pyrowave } => {
+            let codec = match (h264, pyrowave) {
+                (true, _) => umac_proto::Codec::H264,
+                (_, true) => umac_proto::Codec::PyroWave,
+                _ => umac_proto::Codec::Hevc,
+            };
             capture_test::run(&window, seconds, &out, codec, bitrate_kbps, fps)
         }
     }

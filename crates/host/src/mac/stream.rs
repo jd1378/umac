@@ -12,6 +12,7 @@ use screencapturekit::prelude::{SCDisplay, SCWindow};
 use umac_proto::{Codec, WindowId};
 
 use super::{
+    pyrowave::{Knobs, PyroEncoder},
     capture::{Rect, WindowCapture},
     ffi::{CVPixelBufferGetHeight, CVPixelBufferGetWidth, CVPixelBufferRef, CVPixelBufferRelease, CVPixelBufferRetain},
     videotoolbox::VtEncoder,
@@ -30,6 +31,10 @@ pub struct StreamParams {
     pub codec: Codec,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    /// PyroWave budget in bits per pixel times 1000.
+    pub pyro_bpp_milli: u32,
+    /// Largest datagram the connection carries, for PyroWave packet sizes.
+    pub max_datagram: u32,
 }
 
 /// Receives encoded frames; returns false if the frame had to be dropped, which forces the
@@ -46,6 +51,7 @@ impl Drop for Retained {
 
 struct Shared {
     params: StreamParams,
+    knobs: Arc<Knobs>,
     encoder: Mutex<Option<Box<dyn Encoder>>>,
     failed_size: Mutex<Option<(u32, u32)>>,
     force_keyframe: Arc<AtomicBool>,
@@ -57,8 +63,12 @@ struct Shared {
 
 impl Shared {
     fn new(params: StreamParams, on_encoded: OnEncoded) -> Arc<Self> {
+        let knobs = Knobs::default();
+        knobs.bpp_milli.store(params.pyro_bpp_milli, Ordering::Relaxed);
+        knobs.packet_boundary.store(packet_boundary(params.max_datagram), Ordering::Relaxed);
         Arc::new(Self {
             params,
+            knobs: Arc::new(knobs),
             encoder: Mutex::new(None),
             failed_size: Mutex::new(None),
             force_keyframe: Arc::new(AtomicBool::new(false)),
@@ -84,7 +94,7 @@ impl Shared {
                     force.store(true, Ordering::Relaxed);
                 }
             });
-            match create_encoder(self.params.codec, cfg, frame_sink) {
+            match create_encoder(self.params.codec, cfg, frame_sink, &self.knobs) {
                 Ok(e) => {
                     tracing::info!(window, ?size, codec = ?self.params.codec, "encoder ready");
                     *self.failed_size.lock().unwrap() = None;
@@ -123,11 +133,16 @@ impl Shared {
 }
 
 /// The one place that maps a negotiated codec to an implementation.
-fn create_encoder(codec: Codec, cfg: EncoderConfig, sink: crate::encode::FrameSink) -> anyhow::Result<Box<dyn Encoder>> {
+fn create_encoder(codec: Codec, cfg: EncoderConfig, sink: crate::encode::FrameSink, knobs: &Arc<Knobs>) -> anyhow::Result<Box<dyn Encoder>> {
     match codec {
         Codec::Hevc | Codec::H264 => Ok(Box::new(VtEncoder::new(codec, cfg, sink)?)),
-        Codec::PyroWave => anyhow::bail!("PyroWave is not implemented yet"),
+        Codec::PyroWave => Ok(Box::new(PyroEncoder::new(cfg, sink, knobs.clone())?)),
     }
+}
+
+/// Largest PyroWave packet that fits a datagram of `max_datagram` bytes with its header.
+pub fn packet_boundary(max_datagram: u32) -> u32 {
+    max_datagram.saturating_sub(umac_proto::video::PYRO_HEADER_LEN as u32)
 }
 
 pub struct WindowStream {
@@ -167,6 +182,11 @@ impl WindowStream {
 
     pub fn params(&self) -> StreamParams {
         self.shared.params
+    }
+
+    /// PyroWave knobs (budget, packet size, drop counter); unused by other codecs.
+    pub fn knobs(&self) -> &Arc<Knobs> {
+        &self.shared.knobs
     }
 
     pub fn scale(&self) -> f32 {

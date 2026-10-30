@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use umac_proto::Codec;
 
 pub const LABEL: &str = "dev.umac.host";
 
@@ -45,6 +46,11 @@ pub struct Settings {
     pub max_bitrate_kbps: u32,
     /// Log filter (tracing `EnvFilter` syntax) when `RUST_LOG` is not set, e.g. "umac_host=debug".
     pub log: String,
+    /// PyroWave budget in bits per pixel at 4:2:0 (1.2 is about 150 Mbit/s at 1080p60, where
+    /// small text was visually lossless in the M1 benchmark). Lowered on loss.
+    pub pyrowave_bpp: f64,
+    /// Codec preference, most preferred first; the first one the client also supports wins.
+    pub codecs: Vec<Codec>,
 }
 
 impl Default for Settings {
@@ -56,8 +62,20 @@ impl Default for Settings {
             default_bitrate_kbps: 25_000,
             max_bitrate_kbps: 100_000,
             log: "info".into(),
+            pyrowave_bpp: 1.2,
+            codecs: vec![Codec::PyroWave, Codec::Hevc, Codec::H264],
         }
     }
+}
+
+/// The first codec in `prefs` that this build and the client both support.
+pub fn choose_codec(prefs: &[Codec], supported: &[Codec], client: &[Codec]) -> Codec {
+    prefs
+        .iter()
+        .chain(supported)
+        .copied()
+        .find(|c| supported.contains(c) && client.contains(c))
+        .unwrap_or(Codec::H264)
 }
 
 impl Settings {
@@ -74,5 +92,22 @@ impl Settings {
         } else {
             requested_kbps.clamp(1_000, self.max_bitrate_kbps)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codec_choice_follows_host_preference_within_client_support() {
+        let supported = [Codec::PyroWave, Codec::Hevc, Codec::H264];
+        let prefs = Settings::default().codecs;
+        assert_eq!(choose_codec(&prefs, &supported, &[Codec::Hevc, Codec::PyroWave]), Codec::PyroWave);
+        assert_eq!(choose_codec(&prefs, &supported, &[Codec::Hevc, Codec::H264]), Codec::Hevc);
+        assert_eq!(choose_codec(&[Codec::Hevc], &supported, &[Codec::PyroWave, Codec::Hevc]), Codec::Hevc);
+        // A preference the build lacks is skipped; an empty list falls back to support order.
+        assert_eq!(choose_codec(&[], &supported, &[Codec::H264, Codec::PyroWave]), Codec::PyroWave);
+        assert_eq!(choose_codec(&prefs, &supported, &[]), Codec::H264);
     }
 }

@@ -20,3 +20,6 @@ umac-transport = { version = "0.1.0", path = "../transport" }
 core-foundation = "=0.10.1"
 core-graphics = { version = "=0.25.0", features = ["highsierra"] }
 screencapturekit = { version = "=11.1.1", features = ["macos_15_2"] }
+
+[build-dependencies]
+cc = "=1.10.0"

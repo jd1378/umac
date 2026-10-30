@@ -186,7 +186,7 @@ unsafe extern "C" fn output_callback(
         return;
     }
     match unsafe { extract(sample, shared.codec) } {
-        Ok((data, keyframe)) => (shared.sink)(EncodedFrame { data, keyframe, capture_us: frame_refcon as usize as u64, encoded_us: clock::now_us() }),
+        Ok((data, keyframe)) => (shared.sink)(EncodedFrame { data, keyframe, capture_us: frame_refcon as usize as u64, encoded_us: clock::now_us(), pyro: None }),
         Err(e) => tracing::warn!("bad encoder output: {e}"),
     }
 }

@@ -34,11 +34,11 @@ pub fn run(spec: &str, seconds: u64, out: &Path, codec: Codec, bitrate_kbps: u32
     let id = resolve_window(spec)?;
     let window = find_window(id)?;
     let file = Arc::new(Mutex::new(std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?));
-    let stats = Arc::new(Mutex::new((Vec::<u64>::new(), 0usize, 0usize)));
+    let stats = Arc::new(Mutex::new((Vec::<u64>::new(), 0usize, 0usize, 0usize)));
     let (f, s) = (file.clone(), stats.clone());
     let stream = WindowStream::start(
         &window,
-        StreamParams { window: id, codec, fps, bitrate_kbps },
+        StreamParams { window: id, codec, fps, bitrate_kbps, pyro_bpp_milli: (crate::config::Settings::load().pyrowave_bpp * 1000.0) as u32, max_datagram: 1400 },
         0.0,
         Arc::new(move |_, frame| {
             let lat = clock::now_us().saturating_sub(frame.capture_us);
@@ -46,6 +46,7 @@ pub fn run(spec: &str, seconds: u64, out: &Path, codec: Codec, bitrate_kbps: u32
             st.0.push(lat);
             st.1 += frame.data.len();
             st.2 += frame.keyframe as usize;
+            st.3 += frame.pyro.as_ref().map_or(0, |p| p.packets.len());
             f.lock().unwrap().write_all(&frame.data).is_ok()
         }),
     )?;
@@ -56,8 +57,9 @@ pub fn run(spec: &str, seconds: u64, out: &Path, codec: Codec, bitrate_kbps: u32
         stream.request_keyframe();
         stream.serve_idle_keyframe();
     }
+    let oversized = stream.knobs().oversized.load(std::sync::atomic::Ordering::Relaxed);
     drop(stream);
-    let (mut lat, bytes, keyframes) = stats.lock().unwrap().clone();
+    let (mut lat, bytes, keyframes, packets) = stats.lock().unwrap().clone();
     if lat.is_empty() {
         println!("no frames captured (is Screen Recording allowed? is the window visible?)");
         return Ok(());
@@ -72,6 +74,9 @@ pub fn run(spec: &str, seconds: u64, out: &Path, codec: Codec, bitrate_kbps: u32
         pct(0.95),
         pct(1.0)
     );
+    if codec == Codec::PyroWave {
+        println!("packets/frame {:.1}, oversized packets dropped {oversized}", packets as f64 / lat.len() as f64);
+    }
     println!("wrote {}", out.display());
     Ok(())
 }

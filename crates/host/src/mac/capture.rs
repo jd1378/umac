@@ -40,8 +40,14 @@ fn window_filter(window: &SCWindow) -> anyhow::Result<SCContentFilter> {
     SCContentFilter::create().with_window(window).build().map_err(|e| anyhow!("content filter: {e}"))
 }
 
+/// Pixel extent of `points` at `scale`, rounded down to even: 4:2:0 encoders (PyroWave in
+/// particular) need even sizes. The source rect is cut to match, so nothing is rescaled.
+pub fn pixels(points: f64, scale: f64) -> u32 {
+    ((points * scale).round() as u32 & !1).max(2)
+}
+
 fn window_pixels(width: f64, height: f64, scale: f32) -> (u32, u32) {
-    ((width * scale as f64).round() as u32, (height * scale as f64).round() as u32)
+    (pixels(width, scale as f64), pixels(height, scale as f64))
 }
 
 /// Backing scale and pixel size a capture of `window` with `inset` will have, without
@@ -108,11 +114,11 @@ fn stream_config(width: u32, height: u32, fps: u32) -> anyhow::Result<SCStreamCo
 }
 
 fn apply_region(config: &mut SCStreamConfiguration, rect: Rect, display: (f64, f64), scale: f64) -> (u32, u32) {
-    let size = ((rect.width * scale).round() as u32, (rect.height * scale).round() as u32);
+    let size = (pixels(rect.width, scale), pixels(rect.height, scale));
     config
-        .set_width(size.0.max(2))
-        .set_height(size.1.max(2))
-        .set_source_rect(CGRect::new(rect.x - display.0, rect.y - display.1, rect.width, rect.height));
+        .set_width(size.0)
+        .set_height(size.1)
+        .set_source_rect(CGRect::new(rect.x - display.0, rect.y - display.1, size.0 as f64 / scale, size.1 as f64 / scale));
     size
 }
 
@@ -156,7 +162,8 @@ impl WindowCapture {
         let frame = window.frame();
         let (w, h) = (frame.size.width, (frame.size.height - inset).max(1.0));
         let size = window_pixels(w, h, scale);
-        let config = stream_config(size.0, size.1, fps)?.with_source_rect(CGRect::new(0.0, inset, w, h));
+        let s = scale as f64;
+        let config = stream_config(size.0, size.1, fps)?.with_source_rect(CGRect::new(0.0, inset, size.0 as f64 / s, size.1 as f64 / s));
         let stream = open_stream(&filter, &config, on_frame)?;
         Ok((Self { stream, config, scale, inset, display_origin: None }, size))
     }

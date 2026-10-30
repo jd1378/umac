@@ -19,6 +19,7 @@ use tokio::{
 use umac_proto::{
     ClientMsg, Codec, ColorFormat, Cursor, Hello, HelloReply, HostMsg, InputEvent, MAX_CLIPBOARD_BYTES, PROTOCOL_VERSION,
     WindowId, WindowInfo, WindowKind, desktop_id,
+    video::{PYRO_HEADER_LEN, PyroHeader, pyro_flags},
 };
 use umac_transport::{
     Fingerprint, Identity,
@@ -33,13 +34,13 @@ use super::{
     input::{self, ClipboardLink, Command, Reply, Target, Targets},
     launch,
     pasteboard, permissions,
-    stream::{StreamParams, WindowStream},
+    stream::{self, StreamParams, WindowStream},
     windows::{self, Geometry, OnScreen},
     ax::{self, AxWindow},
 };
 use crate::{
     auth::AuthStore,
-    clipboard, clock, config,
+    clipboard, clock, config, pyro,
     config::Settings,
     encode::EncodedFrame,
     latency::StageStats,
@@ -50,7 +51,9 @@ use crate::{
     status::Status,
 };
 
-const SUPPORTED: [Codec; 2] = [Codec::Hevc, Codec::H264];
+const SUPPORTED: [Codec; 3] = [Codec::PyroWave, Codec::Hevc, Codec::H264];
+/// How often the PyroWave budget is re-evaluated from loss reports.
+const RATE_EVERY: Duration = Duration::from_millis(500);
 /// How often per-stream latency stats are reported.
 const STATS_EVERY: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(250);
@@ -217,7 +220,7 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
         conn.close(1u32.into(), b"rejected");
         return Ok(());
     }
-    let codec = hello.codecs.iter().copied().find(|c| SUPPORTED.contains(c)).unwrap_or(Codec::H264);
+    let codec = crate::config::choose_codec(&shared.settings.codecs, &SUPPORTED, &hello.codecs);
     write_msg(&mut send, &HelloReply::Accepted { host_name: shared.host_name.clone() }).await?;
     tracing::info!(client = %hello.client_name, remote = %conn.remote_address(), ?codec, "client connected");
 
@@ -247,6 +250,9 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
         replies: reply_tx,
         stats,
         want_stats: false,
+        rate: pyro::Rate::new(shared.settings.pyrowave_bpp),
+        loss: LossCounters::default(),
+        conn: conn.clone(),
     };
     let result = session.control_loop(&mut send, recv, reply_rx, cmd_rx).await;
 
@@ -306,8 +312,19 @@ async fn send_frames(
             return;
         };
         let seq = seqs.entry(window).or_insert(0);
-        let meta = FrameMeta { window, seq: *seq, keyframe: frame.keyframe, capture_us: frame.capture_us as u32 };
+        let frame_seq = *seq;
         *seq = seq.wrapping_add(1);
+        if let Some(pyro) = &frame.pyro {
+            if !send_pyro(&conn, window, frame_seq, &frame, pyro, max).await {
+                return;
+            }
+            let sent = clock::now_us();
+            if let Ok(mut s) = stats.lock() {
+                s.record(window, frame.encoded_us.saturating_sub(frame.capture_us), sent.saturating_sub(frame.encoded_us));
+            }
+            continue;
+        }
+        let meta = FrameMeta { window, seq: frame_seq, keyframe: frame.keyframe, capture_us: frame.capture_us as u32 };
         let shards = match shard_frame(meta, &frame.data, max, fec_percent) {
             Ok(s) => s,
             Err(e) => {
@@ -325,6 +342,39 @@ async fn send_frames(
             s.record(window, frame.encoded_us.saturating_sub(frame.capture_us), sent.saturating_sub(frame.encoded_us));
         }
     }
+}
+
+/// One datagram per PyroWave packet, no FEC: every packet decodes on its own, so a loss
+/// only blurs the blocks it carried. Returns false once the connection is gone.
+async fn send_pyro(conn: &quinn::Connection, window: WindowId, frame_seq: u32, frame: &EncodedFrame, p: &crate::encode::PyroFrame, max: usize) -> bool {
+    let Some(pieces) = pyro::pieces(&p.packets, max.saturating_sub(PYRO_HEADER_LEN)) else {
+        tracing::warn!(window, "PyroWave frame does not fit the datagram limits; dropped");
+        return true;
+    };
+    let packet_count = pieces.len() as u16;
+    for (i, (range, continued)) in pieces.into_iter().enumerate() {
+        let mut flags = if p.chroma_444 { pyro_flags::CHROMA_444 } else { 0 };
+        if continued {
+            flags |= pyro_flags::CONTINUED;
+        }
+        let header = PyroHeader {
+            flags,
+            window,
+            frame_seq,
+            capture_us: frame.capture_us as u32,
+            packet_index: i as u16,
+            packet_count,
+            width: p.width,
+            height: p.height,
+        };
+        let mut d = vec![0u8; PYRO_HEADER_LEN + range.len()];
+        header.write((&mut d[..PYRO_HEADER_LEN]).try_into().unwrap());
+        d[PYRO_HEADER_LEN..].copy_from_slice(&frame.data[range]);
+        if conn.send_datagram_wait(d.into()).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 async fn read_input(conn: quinn::Connection, shared: Arc<Shared>, client: ClientId, session: u64, reply: Reply) {
@@ -384,6 +434,22 @@ struct Session {
     /// Per stream encode and send times, reported while the client wants stats.
     stats: Arc<Mutex<StageStats>>,
     want_stats: bool,
+    /// PyroWave budget shared by this session's streams.
+    rate: pyro::Rate,
+    loss: LossCounters,
+    conn: quinn::Connection,
+}
+
+/// Loss evidence for PyroWave rate control since the last evaluation.
+#[derive(Default)]
+struct LossCounters {
+    /// Client reports (`VideoFeedback`): datagrams received and missing.
+    received: u64,
+    lost: u64,
+    /// QUIC path counters at the last evaluation (packets sent and declared lost).
+    quic_sent: u64,
+    quic_lost: u64,
+    last: Option<Instant>,
 }
 
 type Ctl = quinn::SendStream;
@@ -440,6 +506,7 @@ impl Session {
                     if let Err(e) = self.poll_windows(send).await {
                         break Err(e);
                     }
+                    self.adapt_rate();
                 }
                 Some(msg) = replies.recv() => {
                     if let Err(e) = write_msg(send, &msg).await {
@@ -495,10 +562,63 @@ impl Session {
         result
     }
 
+    /// Re-evaluates the PyroWave budget from client loss reports and QUIC's own loss
+    /// counters (whichever shows more loss), and refreshes the packet size from the path MTU.
+    fn adapt_rate(&mut self) {
+        if self.codec != Codec::PyroWave {
+            return;
+        }
+        let now = Instant::now();
+        if self.loss.last.is_some_and(|t| now.duration_since(t) < RATE_EVERY) {
+            return;
+        }
+        let path = self.conn.stats().path;
+        let (sent, lost) = (path.sent_packets - self.loss.quic_sent.min(path.sent_packets), path.lost_packets - self.loss.quic_lost.min(path.lost_packets));
+        let quic_ratio = if sent > 0 { lost as f64 / sent as f64 } else { 0.0 };
+        let client_total = self.loss.received + self.loss.lost;
+        let client_ratio = if client_total > 0 { self.loss.lost as f64 / client_total as f64 } else { 0.0 };
+        let (received, lost) = if client_ratio >= quic_ratio { (self.loss.received, self.loss.lost) } else { (sent - lost, lost) };
+        let before = self.rate.bpp();
+        if self.loss.last.is_some() {
+            self.rate.report(received, lost, now);
+        }
+        self.loss = LossCounters { quic_sent: path.sent_packets, quic_lost: path.lost_packets, last: Some(now), ..Default::default() };
+        if (self.rate.bpp() - before).abs() > 1e-6 {
+            tracing::info!(bpp = format_args!("{:.2}", self.rate.bpp()), quic_loss = format_args!("{quic_ratio:.3}"), client_loss = format_args!("{client_ratio:.3}"), "PyroWave budget changed");
+        }
+        let bpp_milli = (self.rate.bpp() * 1000.0) as u32;
+        let boundary = self.conn.max_datagram_size().map(|m| stream::packet_boundary(m as u32));
+        for (&window, s) in &self.streams {
+            let k = s.stream.knobs();
+            let mut times = k.encode_us.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+            if times.len() >= 300 {
+                times.sort_unstable();
+                let pct = |p: f64| times[((times.len() - 1) as f64 * p) as usize] as f64 / 1000.0;
+                let split = k.oversized.swap(0, Ordering::Relaxed);
+                tracing::info!(window, frames = times.len(), p50 = format_args!("{:.2}", pct(0.5)), p95 = format_args!("{:.2}", pct(0.95)), split, "PyroWave encode ms");
+            } else if let Ok(mut v) = k.encode_us.lock() {
+                v.extend(times);
+            }
+            k.bpp_milli.store(bpp_milli, Ordering::Relaxed);
+            if let Some(b) = boundary {
+                k.packet_boundary.store(b, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Initial PyroWave knobs for a new stream.
+    fn pyro_params(&self) -> (u32, u32) {
+        ((self.rate.bpp() * 1000.0) as u32, self.conn.max_datagram_size().unwrap_or(1200) as u32)
+    }
+
     async fn on_message(&mut self, msg: ClientMsg, send: &mut Ctl) -> anyhow::Result<()> {
         match msg {
             ClientMsg::Ping { nonce } => write_msg(send, &HostMsg::Pong { nonce }).await?,
             ClientMsg::WantStats { on } => self.want_stats = on,
+            ClientMsg::VideoFeedback { received, lost, .. } => {
+                self.loss.received += received as u64;
+                self.loss.lost += lost as u64;
+            }
             // Answered by the reader task as soon as it arrives.
             ClientMsg::TimeProbe { .. } => {}
             ClientMsg::Launch { nonce, action } => {
@@ -627,6 +747,8 @@ impl Session {
             codec: self.codec,
             fps: (max_fps as u32).clamp(1, 120),
             bitrate_kbps: self.shared.settings.clamp_bitrate(bitrate_kbps),
+            pyro_bpp_milli: self.pyro_params().0,
+            max_datagram: self.pyro_params().1,
         };
         self.start_window(params, WindowKind::Normal, None, false, send).await.map(|_| ())
     }
@@ -866,6 +988,8 @@ impl Session {
             codec: self.codec,
             fps: (max_fps as u32).clamp(1, 120),
             bitrate_kbps: self.shared.settings.clamp_bitrate(bitrate_kbps),
+            pyro_bpp_milli: self.pyro_params().0,
+            max_datagram: self.pyro_params().1,
         };
         let tx = self.frames_tx.clone();
         let on_encoded = Arc::new(move |w: WindowId, f: EncodedFrame| tx.try_send((w, f)).is_ok());
@@ -967,7 +1091,7 @@ impl Session {
                 continue;
             }
             let scale = s.info.scale as f64;
-            let px = ((g.width * scale).round() as u32, ((g.height - s.inset).max(1.0) * scale).round() as u32);
+            let px = (capture::pixels(g.width, scale), capture::pixels((g.height - s.inset).max(1.0), scale));
             let resized = px != (s.info.width, s.info.height);
             if resized {
                 if let Err(e) = s.stream.resize(px.0, px.1) {
