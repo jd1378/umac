@@ -1,0 +1,4 @@
+target/
+*.h265
+*.hevc
+.DS_Store
