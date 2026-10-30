@@ -54,4 +54,4 @@ say "Building umac-host (a few minutes the first time)"
 (cd "$src" && cargo build --locked --release -p umac-host)
 
 say "Running the setup wizard"
-"$src/target/release/umac-host" setup
+"${CARGO_TARGET_DIR:-$src/target}/release/umac-host" setup

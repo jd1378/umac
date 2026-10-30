@@ -78,7 +78,7 @@ printf 'building commit %s\n' "$(git -C "$src" rev-parse --short HEAD)"
 
 say "Building umac (a few minutes the first time)"
 (cd "$src" && cargo build --locked --release -p umac-client)
-install -Dm755 "$src/target/release/umac" "$bin/umac"
+install -Dm755 "${CARGO_TARGET_DIR:-$src/target}/release/umac" "$bin/umac"
 printf 'installed %s\n' "$bin/umac"
 case ":$PATH:" in *":$bin:"*) ;; *) printf 'note: add %s to your PATH\n' "$bin" ;; esac
 
