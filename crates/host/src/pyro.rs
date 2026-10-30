@@ -45,6 +45,23 @@ pub fn frame_bytes(width: u32, height: u32, bpp: f64) -> usize {
     (width as f64 * height as f64 * bpp / 8.0) as usize
 }
 
+/// Quality of the one-off frame sent when a window stops changing; static content then looks
+/// like the source (the M1 benchmark was effectively lossless from 2.4 bpp).
+pub const REFINE_BPP: f64 = 3.0;
+
+/// Bytes for one frame. Intra-only frames never refine on their own, so the budget is per
+/// pixel up to `target_bpp`, capped by the per-stream rate (`cap_bytes`) for large windows.
+/// Both shrink together under loss (`bpp` below `target_bpp`). A refine frame ignores the cap:
+/// it is sent once, after the window went idle.
+pub fn budget(width: u32, height: u32, bpp: f64, target_bpp: f64, cap_bytes: usize, refine: bool) -> usize {
+    let floor = frame_bytes(width, height, MIN_BPP).max(4096);
+    if refine {
+        return frame_bytes(width, height, REFINE_BPP.max(target_bpp)).max(floor);
+    }
+    let scale = if target_bpp > 0.0 { (bpp / target_bpp).clamp(0.0, 1.0) } else { 1.0 };
+    frame_bytes(width, height, bpp).min((cap_bytes as f64 * scale) as usize).max(floor)
+}
+
 #[derive(Debug, Clone)]
 pub struct Rate {
     target: f64,
@@ -133,5 +150,20 @@ mod tests {
         let mut r = Rate::new(1.2);
         r.report(990, 10, t);
         assert_eq!(r.bpp(), 1.2);
+    }
+
+    #[test]
+    fn budget_favors_small_windows_and_caps_large_ones() {
+        let cap = (200e6 / 8.0 / 60.0) as usize;
+        // Calculator sized: the full per-pixel budget.
+        assert_eq!(budget(230, 408, 3.0, 3.0, cap, false), frame_bytes(230, 408, 3.0));
+        // 1080p: held to the rate cap while it changes, about 1.6 bpp.
+        assert_eq!(budget(1920, 1080, 3.0, 3.0, cap, false), cap);
+        // Loss halves both.
+        assert_eq!(budget(1920, 1080, 1.5, 3.0, cap, false), cap / 2);
+        // Refinement ignores the cap.
+        assert_eq!(budget(1920, 1080, 1.5, 3.0, cap, true), frame_bytes(1920, 1080, REFINE_BPP));
+        // Tiny windows never drop below the floor.
+        assert_eq!(budget(40, 40, 0.5, 3.0, cap, false), 4096);
     }
 }

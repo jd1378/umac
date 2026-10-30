@@ -606,6 +606,10 @@ impl Session {
         }
     }
 
+    fn pyro_cap_bytes(&self, fps: u32) -> u32 {
+        (self.shared.settings.pyrowave_max_mbps.max(1.0) * 1e6 / 8.0 / fps.clamp(1, 120) as f64) as u32
+    }
+
     /// Initial PyroWave knobs for a new stream.
     fn pyro_params(&self) -> (u32, u32) {
         ((self.rate.bpp() * 1000.0) as u32, self.conn.max_datagram_size().unwrap_or(1200) as u32)
@@ -748,6 +752,7 @@ impl Session {
             fps: (max_fps as u32).clamp(1, 120),
             bitrate_kbps: self.shared.settings.clamp_bitrate(bitrate_kbps),
             pyro_bpp_milli: self.pyro_params().0,
+            pyro_cap_bytes: self.pyro_cap_bytes(max_fps as u32),
             max_datagram: self.pyro_params().1,
         };
         self.start_window(params, WindowKind::Normal, None, false, send).await.map(|_| ())
@@ -989,6 +994,7 @@ impl Session {
             fps: (max_fps as u32).clamp(1, 120),
             bitrate_kbps: self.shared.settings.clamp_bitrate(bitrate_kbps),
             pyro_bpp_milli: self.pyro_params().0,
+            pyro_cap_bytes: self.pyro_cap_bytes(max_fps as u32),
             max_datagram: self.pyro_params().1,
         };
         let tx = self.frames_tx.clone();
@@ -1066,6 +1072,7 @@ impl Session {
         for id in ids {
             let Some(s) = self.streams.get(&id) else { continue };
             s.stream.serve_idle_keyframe();
+            s.stream.serve_idle_refine();
             // Popups are tracked by the faster popup poll.
             if s.popup_of.is_some() {
                 continue;

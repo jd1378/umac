@@ -46,9 +46,12 @@ pub struct Settings {
     pub max_bitrate_kbps: u32,
     /// Log filter (tracing `EnvFilter` syntax) when `RUST_LOG` is not set, e.g. "umac_host=debug".
     pub log: String,
-    /// PyroWave budget in bits per pixel at 4:2:0 (1.2 is about 150 Mbit/s at 1080p60, where
-    /// small text was visually lossless in the M1 benchmark). Lowered on loss.
+    /// PyroWave quality ceiling in bits per pixel at 4:2:0 (the M1 benchmark was visually
+    /// lossless from 1.2 and effectively lossless at 2.4). Small windows always get it; large
+    /// ones are held to `pyrowave_max_mbps` while they change. Lowered on loss.
     pub pyrowave_bpp: f64,
+    /// Rate cap per changing PyroWave stream in Mbit/s (about 1.6 bpp at 1080p60 for 200).
+    pub pyrowave_max_mbps: f64,
     /// Codec preference, most preferred first; the first one the client also supports wins.
     pub codecs: Vec<Codec>,
 }
@@ -62,7 +65,8 @@ impl Default for Settings {
             default_bitrate_kbps: 25_000,
             max_bitrate_kbps: 100_000,
             log: "info".into(),
-            pyrowave_bpp: 1.2,
+            pyrowave_bpp: 3.0,
+            pyrowave_max_mbps: 200.0,
             codecs: vec![Codec::PyroWave, Codec::Hevc, Codec::H264],
         }
     }

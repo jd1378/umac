@@ -22,6 +22,9 @@ use crate::{
     encode::{EncodedFrame, Encoder, EncoderConfig},
 };
 
+/// A window idle this long gets its refine frame.
+const REFINE_AFTER_US: u64 = 120_000;
+
 /// Minimum spacing between forced keyframes; repeated requests inside it are coalesced.
 const KEYFRAME_SPACING_US: u64 = 100_000;
 
@@ -33,6 +36,8 @@ pub struct StreamParams {
     pub bitrate_kbps: u32,
     /// PyroWave budget in bits per pixel times 1000.
     pub pyro_bpp_milli: u32,
+    /// PyroWave rate cap in bytes per frame for a changing window.
+    pub pyro_cap_bytes: u32,
     /// Largest datagram the connection carries, for PyroWave packet sizes.
     pub max_datagram: u32,
 }
@@ -58,13 +63,22 @@ struct Shared {
     last_keyframe_us: AtomicU64,
     last_frame: Mutex<Option<Retained>>,
     last_frame_us: AtomicU64,
+    /// The last captured frame was already re-sent at refine quality.
+    refined: AtomicBool,
     on_encoded: OnEncoded,
 }
 
 impl Shared {
+    fn captured(&self, buffer: *mut c_void, now: u64) {
+        self.refined.store(false, Ordering::Relaxed);
+        self.submit(buffer, now);
+    }
+
     fn new(params: StreamParams, on_encoded: OnEncoded) -> Arc<Self> {
         let knobs = Knobs::default();
         knobs.bpp_milli.store(params.pyro_bpp_milli, Ordering::Relaxed);
+        knobs.target_milli.store(params.pyro_bpp_milli, Ordering::Relaxed);
+        knobs.cap_bytes.store(params.pyro_cap_bytes, Ordering::Relaxed);
         knobs.packet_boundary.store(packet_boundary(params.max_datagram), Ordering::Relaxed);
         Arc::new(Self {
             params,
@@ -75,6 +89,7 @@ impl Shared {
             last_keyframe_us: AtomicU64::new(0),
             last_frame: Mutex::new(None),
             last_frame_us: AtomicU64::new(0),
+            refined: AtomicBool::new(false),
             on_encoded,
         })
     }
@@ -155,7 +170,7 @@ impl WindowStream {
     pub fn start(window: &SCWindow, params: StreamParams, inset: f64, on_encoded: OnEncoded) -> anyhow::Result<Self> {
         let shared = Shared::new(params, on_encoded);
         let s = shared.clone();
-        let (capture, size) = WindowCapture::start(window, params.fps, inset, Box::new(move |buf, t| s.submit(buf, t)))?;
+        let (capture, size) = WindowCapture::start(window, params.fps, inset, Box::new(move |buf, t| s.captured(buf, t)))?;
         Ok(Self { capture, shared, size })
     }
 
@@ -163,7 +178,7 @@ impl WindowStream {
     pub fn start_region(display: &SCDisplay, rect: Rect, params: StreamParams, on_encoded: OnEncoded) -> anyhow::Result<Self> {
         let shared = Shared::new(params, on_encoded);
         let s = shared.clone();
-        let (capture, size) = WindowCapture::start_region(display, rect, params.fps, Box::new(move |buf, t| s.submit(buf, t)))?;
+        let (capture, size) = WindowCapture::start_region(display, rect, params.fps, Box::new(move |buf, t| s.captured(buf, t)))?;
         Ok(Self { capture, shared, size })
     }
 
@@ -171,7 +186,7 @@ impl WindowStream {
     pub fn start_display(display: &SCDisplay, params: StreamParams, on_encoded: OnEncoded) -> anyhow::Result<Self> {
         let shared = Shared::new(params, on_encoded);
         let s = shared.clone();
-        let (capture, size) = WindowCapture::start_display(display, params.fps, Box::new(move |buf, t| s.submit(buf, t)))?;
+        let (capture, size) = WindowCapture::start_display(display, params.fps, Box::new(move |buf, t| s.captured(buf, t)))?;
         Ok(Self { capture, shared, size })
     }
 
@@ -204,6 +219,24 @@ impl WindowStream {
 
     /// An idle window produces no frames, so a pending keyframe request would never be
     /// served. Re-encode the last captured frame in that case.
+    /// PyroWave frames are intra-only and never sharpen on their own, so once a window stops
+    /// changing its last frame is sent again, once, at refine quality.
+    pub fn serve_idle_refine(&self) {
+        let s = &self.shared;
+        if s.params.codec != Codec::PyroWave
+            || s.refined.load(Ordering::Relaxed)
+            || clock::now_us().saturating_sub(s.last_frame_us.load(Ordering::Relaxed)) < REFINE_AFTER_US
+        {
+            return;
+        }
+        let last = s.last_frame.lock().unwrap().as_ref().map(|r| Retained(unsafe { CVPixelBufferRetain(r.0) }));
+        if let Some(frame) = last {
+            s.refined.store(true, Ordering::Relaxed);
+            s.knobs.refine.store(true, Ordering::Relaxed);
+            s.submit(frame.0, clock::now_us());
+        }
+    }
+
     pub fn serve_idle_keyframe(&self) {
         let now = clock::now_us();
         let s = &self.shared;

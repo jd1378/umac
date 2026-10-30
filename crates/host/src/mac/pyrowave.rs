@@ -146,8 +146,14 @@ fn device() -> anyhow::Result<sys::pyrowave_device> {
 /// Live encoder knobs, shared with the session so rate control applies without a restart.
 #[derive(Debug, Default)]
 pub struct Knobs {
-    /// Bits per pixel times 1000.
+    /// Bits per pixel times 1000 (current, lowered on loss).
     pub bpp_milli: AtomicU32,
+    /// Configured bits per pixel times 1000.
+    pub target_milli: AtomicU32,
+    /// Rate cap in bytes per frame for a changing window.
+    pub cap_bytes: AtomicU32,
+    /// The next encode is the one-off high quality frame of an idle window.
+    pub refine: std::sync::atomic::AtomicBool,
     /// Largest packet that fits a datagram after the PyroWave header.
     pub packet_boundary: AtomicU32,
     /// Packets larger than the boundary (a single big block); sent split over datagrams.
@@ -205,8 +211,11 @@ impl Encoder for PyroEncoder {
             bail!("capture frame is not IOSurface backed");
         }
         let started = std::time::Instant::now();
-        let bpp = self.knobs.bpp_milli.load(Ordering::Relaxed) as f64 / 1000.0;
-        let budget = pyro::frame_bytes(self.cfg.width, self.cfg.height, bpp).max(4096);
+        let k = &self.knobs;
+        let bpp = k.bpp_milli.load(Ordering::Relaxed) as f64 / 1000.0;
+        let target = k.target_milli.load(Ordering::Relaxed) as f64 / 1000.0;
+        let refine = k.refine.swap(false, Ordering::Relaxed);
+        let budget = pyro::budget(self.cfg.width, self.cfg.height, bpp, target, k.cap_bytes.load(Ordering::Relaxed) as usize, refine);
         let boundary = (self.knobs.packet_boundary.load(Ordering::Relaxed) as usize).max(256);
         let input = sys::pyrowave_gpu_input { planes: [surface, std::ptr::null_mut(), std::ptr::null_mut()] };
         let rate = sys::pyrowave_rate_control { maximum_bitstream_size: budget };
