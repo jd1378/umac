@@ -35,12 +35,17 @@ async fn main() -> Result<()> {
     let dir = PathBuf::from(args.next().context("usage: fake_host <state-dir> [port]")?);
     let port: u16 = args.next().map(|p| p.parse()).transpose()?.unwrap_or(umac_proto::DEFAULT_PORT);
     let identity = Identity::load_or_create(&dir.join("identity"))?;
-    let (clip_w, clip_h) = clip_size();
-    let clip = dir.join(format!("clip-{clip_w}x{clip_h}.ts"));
-    if !clip.exists() {
-        sample::generate_hevc(&clip, clip_w, clip_h, 4)?;
-    }
-    let packets = Arc::new(sample::read_packets(&clip)?);
+    let packets = match mjpeg_files() {
+        Some(files) => Arc::new(files),
+        None => {
+            let (clip_w, clip_h) = clip_size();
+            let clip = dir.join(format!("clip-{clip_w}x{clip_h}.ts"));
+            if !clip.exists() {
+                sample::generate_hevc(&clip, clip_w, clip_h, 4)?;
+            }
+            Arc::new(sample::read_packets(&clip)?)
+        }
+    };
     let popup_clip = dir.join("popup.ts");
     if !popup_clip.exists() {
         sample::generate_hevc(&popup_clip, POPUP_SIZE.0, POPUP_SIZE.1, 4)?;
@@ -63,8 +68,17 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// UMAC_FAKE_MJPEG=a.jpg,b.jpg streams those 1920x1080 JPEGs in a loop as Motion-JPEG.
+fn mjpeg_files() -> Option<Vec<sample::SamplePacket>> {
+    let list = std::env::var("UMAC_FAKE_MJPEG").ok()?;
+    Some(list.split(',').map(|f| sample::SamplePacket { data: std::fs::read(f).expect("reading JPEG"), keyframe: true }).collect())
+}
+
 /// UMAC_FAKE_SIZE=1920x1080 streams a larger clip, e.g. for decode benchmarks.
 fn clip_size() -> (u32, u32) {
+    if std::env::var_os("UMAC_FAKE_MJPEG").is_some() {
+        return (1920, 1080);
+    }
     std::env::var("UMAC_FAKE_SIZE")
         .ok()
         .and_then(|s| {
@@ -141,9 +155,10 @@ async fn serve(
         match msg {
             ClientMsg::ListWindows => write_msg(&mut send, &HostMsg::Windows(vec![info.clone()])).await?,
             ClientMsg::Subscribe { window: WINDOW, .. } => {
+                let codec = if std::env::var_os("UMAC_FAKE_MJPEG").is_some() { Codec::Mjpeg } else { Codec::Hevc };
                 let msg = HostMsg::StreamStarted {
                     window: WINDOW,
-                    codec: Codec::Hevc,
+                    codec,
                     color: ColorFormat::Yuv420Bt709Limited,
                     info: info.clone(),
                 };

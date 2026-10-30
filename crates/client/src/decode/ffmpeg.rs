@@ -56,7 +56,7 @@ impl FfmpegDecoder {
         let (id, name) = match codec {
             Codec::Hevc => (ff::AVCodecID::AV_CODEC_ID_HEVC, "hevc"),
             Codec::H264 => (ff::AVCodecID::AV_CODEC_ID_H264, "h264"),
-            Codec::PyroWave => bail!("not an ffmpeg codec"),
+            Codec::PyroWave | Codec::Mjpeg => bail!("not an ffmpeg codec"),
         };
         match unsafe { Self::open(id, true) } {
             Ok(mut d) => {

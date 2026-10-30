@@ -5,6 +5,7 @@
 pub mod dmabuf;
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg;
+pub mod mjpeg;
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -90,6 +91,7 @@ pub fn codecs() -> Vec<Codec> {
             c.push(Codec::H264);
         }
     }
+    c.push(Codec::Mjpeg);
     c
 }
 
@@ -150,6 +152,7 @@ pub fn create(codec: Codec, color: ColorFormat) -> Result<Box<dyn Decoder>> {
         #[cfg(feature = "ffmpeg")]
         Codec::Hevc | Codec::H264 => Ok(Box::new(ffmpeg::FfmpegDecoder::new(codec)?)),
         Codec::PyroWave => bail!("PyroWave streams are decoded by the PyroWave path"),
+        Codec::Mjpeg => Ok(Box::new(mjpeg::MjpegDecoder)),
         #[allow(unreachable_patterns)]
         other => bail!("{other:?} is not supported by this build"),
     }

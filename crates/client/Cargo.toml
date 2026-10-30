@@ -39,6 +39,7 @@ umac-transport = { version = "0.1.0", path = "../transport" }
 url = "=2.5.8"
 wgpu = "=30.0.1"
 winit = "=0.30.13"
+zune-jpeg = "=0.5.15"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ash = "=0.38.0"

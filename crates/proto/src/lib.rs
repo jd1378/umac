@@ -31,6 +31,10 @@ pub enum Codec {
     H264,
     /// Reserved: intra-only wavelet codec, not implemented yet.
     PyroWave,
+    /// Motion-JPEG: one baseline JPEG per frame, every frame a keyframe. Patent free and
+    /// decodable anywhere; the last resort when nothing better is available. The JPEG holds
+    /// BT.709 YCbCr 4:2:0 in full range (what VideoToolbox writes), not JFIF's BT.601.
+    Mjpeg,
 }
 
 /// Fixed pixel contract for every codec: 8-bit, BT.709 primaries and matrix, limited range.
