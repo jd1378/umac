@@ -20,6 +20,7 @@ pub mod manager;
 pub mod net;
 pub mod pyro;
 pub mod render;
+#[cfg(feature = "ffmpeg")]
 pub mod sample;
 pub mod shortcuts;
 pub mod shell;
@@ -27,4 +28,8 @@ pub mod tray;
 pub mod ui;
 pub mod viewport;
 #[cfg(target_os = "linux")]
+pub mod vkdevice;
+#[cfg(target_os = "linux")]
+pub mod vkvideo;
+#[cfg(all(target_os = "linux", feature = "ffmpeg"))]
 pub mod zerocopy;

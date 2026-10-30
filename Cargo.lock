@@ -3306,6 +3306,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "umac-h264",
  "umac-proto",
  "umac-pyrowave-decode",
  "umac-transport",

@@ -1,7 +1,9 @@
 //! wgpu presentation: one surface per window, NV12 as R8 + RG8 textures (uploaded from CPU
 //! memory, or the decoder's own surface imported zero-copy) converted to RGB in the shader.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+#[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -54,8 +56,11 @@ fn fs_srgb(v: VsOut) -> @location(0) vec4<f32> {
 /// GPU objects shared by every window.
 pub struct Gpu {
     /// Declared first so it drops first: it destroys Vulkan objects on `device`.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
     importer: Option<crate::zerocopy::Importer>,
+    /// Vulkan Video H.264 decoding on this device, if it has a decode queue.
+    #[cfg(target_os = "linux")]
+    video: Option<std::sync::Arc<crate::vkvideo::Context>>,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -65,7 +70,7 @@ pub struct Gpu {
     sampler: wgpu::Sampler,
     pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     /// Consecutive zero-copy import or acquire failures.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
     zc_failures: u32,
 }
 
@@ -93,19 +98,30 @@ impl Gpu {
         .context("no GPU adapter")?;
         tracing::info!(adapter = ?adapter.get_info().name, backend = ?adapter.get_info().backend, "GPU");
         #[cfg(target_os = "linux")]
-        let zero_copy = decode::zero_copy_allowed().then(|| crate::zerocopy::open_device(&adapter)).flatten();
+        let opened = crate::vkdevice::open(&adapter, decode::zero_copy_allowed());
+        #[cfg(target_os = "linux")]
+        let (zero_copy_device, video_family) = opened.as_ref().map_or((false, None), |o| (o.dmabuf, o.video_family));
         #[cfg(not(target_os = "linux"))]
-        let zero_copy = None;
-        let zero_copy_device = zero_copy.is_some();
-        let (device, queue) = match zero_copy {
+        let zero_copy_device = false;
+        #[cfg(target_os = "linux")]
+        let opened = opened.map(|o| (o.device, o.queue));
+        #[cfg(not(target_os = "linux"))]
+        let opened = None;
+        let (device, queue) = match opened {
             Some(dq) => dq,
             None => pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?,
         };
         #[cfg(target_os = "linux")]
+        let video = video_family.and_then(|f| {
+            crate::vkvideo::Context::new(&device, f).inspect_err(|e| tracing::warn!("Vulkan Video: {e:#}")).ok()
+        });
+        #[cfg(target_os = "linux")]
+        tracing::info!(h264 = video.is_some(), "Vulkan Video decoding");
+        #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
         let importer = zero_copy_device
             .then(|| crate::zerocopy::Importer::new(&device).inspect_err(|e| tracing::warn!("zero-copy importer: {e:#}")).ok())
             .flatten();
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
         let zero_copy_device = importer.is_some();
         decode::set_zero_copy(zero_copy_device);
         tracing::info!(path = if zero_copy_device { "zero-copy dmabuf" } else { "copy" }, "decoded frames");
@@ -155,25 +171,27 @@ impl Gpu {
             shader,
             sampler,
             pipelines: HashMap::new(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
             importer,
             #[cfg(target_os = "linux")]
+            video,
+            #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
             zc_failures: 0,
         })
     }
 
     /// Drops the zero-copy state of a closed window.
     pub fn forget(&mut self, owner: u64) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
         if let Some(i) = self.importer.as_mut() {
             i.forget(owner);
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", feature = "ffmpeg")))]
         let _ = owner;
     }
 
     /// Counts a zero-copy failure; too many in a row switch every decoder to copying.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
     fn zero_copy_failed(&mut self, what: &str, e: &anyhow::Error) {
         self.zc_failures += 1;
         tracing::warn!(failures = self.zc_failures, "zero-copy {what} failed ({e:#}); copying this frame");
@@ -186,7 +204,7 @@ impl Gpu {
     /// Draws `frame` into `target`. An imported frame is acquired from the decoder before the
     /// submission and released back after it; if the acquire fails nothing samples it.
     fn draw(&mut self, target: &wgpu::TextureView, format: wgpu::TextureFormat, frame: Option<(&FrameTextures, Viewport)>) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
         let imported = match frame {
             Some((FrameTextures { source: Source::Imported { frame: f, images }, .. }, _)) => {
                 match self.importer.as_mut().map(|i| i.acquire(*images)) {
@@ -224,7 +242,7 @@ impl Gpu {
             }
         }
         self.queue.submit([enc.finish()]);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
         if let (Some((f, images)), Some(importer)) = (imported, self.importer.as_mut())
             && let Err(e) = importer.release(images, f)
         {
@@ -271,14 +289,18 @@ enum Source {
     Upload { y: wgpu::Texture, uv: wgpu::Texture },
     /// The window's PyroWave decoder output planes (owned by `WindowRenderer::pyro`).
     Pyro,
-    /// Sampled in place; each draw hands the frame to the importer until the GPU is done.
+    /// The window's Vulkan Video decoder output planes (owned by `WindowRenderer::h264`).
     #[cfg(target_os = "linux")]
+    H264,
+    /// Sampled in place; each draw hands the frame to the importer until the GPU is done.
+    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
     Imported { frame: Arc<decode::dmabuf::DmabufFrame>, images: [ash::vk::Image; 2] },
 }
 
 /// Per-window presentation state.
 pub struct WindowRenderer {
     /// Window id, so the importer can tell this window's decoder surfaces apart.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ffmpeg")), allow(dead_code))]
     owner: u64,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
@@ -286,6 +308,9 @@ pub struct WindowRenderer {
     fit: Fit,
     /// PyroWave decoder for this window and the bind group sampling its output planes.
     pyro: Option<(umac_pyrowave_decode::GpuDecoder, wgpu::BindGroup)>,
+    /// Vulkan Video H.264 decoder for this window.
+    #[cfg(target_os = "linux")]
+    h264: Option<crate::vkvideo::Decoder>,
 }
 
 impl WindowRenderer {
@@ -309,7 +334,16 @@ impl WindowRenderer {
             color_space: Default::default(),
         };
         surface.configure(&gpu.device, &config);
-        Self { owner, surface, config, frame: None, fit: Fit::Exact, pyro: None }
+        Self {
+            owner,
+            surface,
+            config,
+            frame: None,
+            fit: Fit::Exact,
+            pyro: None,
+            #[cfg(target_os = "linux")]
+            h264: None,
+        }
     }
 
     pub fn set_fit(&mut self, fit: Fit) {
@@ -335,8 +369,38 @@ impl WindowRenderer {
         Some(Viewport::new(self.fit, w, h, self.config.width, self.config.height))
     }
 
-    pub fn upload(&mut self, gpu: &mut Gpu, picture: Picture) {
+    /// Takes a decoded (or to-be-decoded) picture. False if decoding failed and the stream
+    /// needs a keyframe to recover.
+    pub fn upload(&mut self, gpu: &mut Gpu, picture: Picture) -> bool {
         match picture {
+            #[cfg(target_os = "linux")]
+            Picture::H264(job) => {
+                let Some(ctx) = gpu.video.clone() else {
+                    tracing::warn!("H.264 frame but no Vulkan Video decoder");
+                    return false;
+                };
+                if self.h264.as_ref().is_none_or(|d| !d.fits(&job)) {
+                    self.h264 = None;
+                    if !job.idr {
+                        return false;
+                    }
+                    match crate::vkvideo::Decoder::new(&ctx, &gpu.device, |y, c| gpu.bind_planes(y, c), &job) {
+                        Ok(d) => self.h264 = Some(d),
+                        Err(e) => {
+                            tracing::warn!("Vulkan Video decoder: {e:#}");
+                            return false;
+                        }
+                    }
+                }
+                let decoder = self.h264.as_mut().expect("just created");
+                if let Err(e) = decoder.decode(&job) {
+                    tracing::warn!("Vulkan Video decode: {e:#}");
+                    self.h264 = None;
+                    return false;
+                }
+                let (width, height) = decoder.size();
+                self.frame = Some(FrameTextures { source: Source::H264, bind_group: decoder.bind_group().clone(), width, height });
+            }
             Picture::Pyro(p) => {
                 if self.pyro.as_ref().is_none_or(|(d, _)| *d.layout() != p.layout) {
                     match umac_pyrowave_decode::GpuDecoder::new(&gpu.device, &gpu.queue, p.layout.clone()) {
@@ -347,7 +411,7 @@ impl WindowRenderer {
                         }
                         Err(e) => {
                             tracing::warn!("PyroWave decoder: {e}");
-                            return;
+                            return true;
                         }
                     }
                 }
@@ -364,7 +428,7 @@ impl WindowRenderer {
                 }
                 self.frame.as_ref().unwrap().write(gpu, &f);
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
             Picture::Dmabuf(f) => {
                 let Gpu { device, layout, sampler, importer, .. } = gpu;
                 let res = match importer.as_mut() {
@@ -381,13 +445,14 @@ impl WindowRenderer {
                     Err(e) => {
                         gpu.zero_copy_failed("import", &e);
                         match f.download() {
-                            Ok(cpu) => self.upload(gpu, Picture::Cpu(cpu)),
+                            Ok(cpu) => return self.upload(gpu, Picture::Cpu(cpu)),
                             Err(e) => tracing::warn!("copying the frame failed too: {e:#}"),
                         }
                     }
                 }
             }
         }
+        true
     }
 
     /// Draws the current frame (black until the first one arrives) and presents.
@@ -512,7 +577,7 @@ mod tests {
     }
 
     /// The zero-copy path must show exactly what the copy path shows.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
     #[test]
     fn dmabuf_import_matches_copy() {
         use umac_proto::Codec;
@@ -553,6 +618,44 @@ mod tests {
         }
         assert_eq!(gpu.zc_failures, 0);
         gpu.forget(1);
+    }
+
+    /// Vulkan Video must show what ffmpeg decodes from the same VideoToolbox stream. Needs a
+    /// driver with H.264 Vulkan Video (on Fedora: RPM Fusion's mesa-vulkan-drivers-freeworld).
+    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+    #[test]
+    fn vulkan_h264_matches_ffmpeg() {
+        use umac_proto::Codec;
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(mut gpu) = Gpu::with_instance(&instance, None) else { return eprintln!("no GPU, skipping") };
+        let Some(ctx) = gpu.video.clone() else { return eprintln!("no Vulkan Video H.264, skipping") };
+        let data = include_bytes!("../../h264/testdata/videotoolbox_1080p.h264");
+        let aus = umac_h264::access_units(data);
+        let mut parser = umac_h264::Parser::new();
+        let Ok(mut reference) = decode::create_with_export(Codec::H264, false) else { return eprintln!("no ffmpeg H.264, skipping") };
+        let mut dec: Option<crate::vkvideo::Decoder> = None;
+        let mut times = Vec::new();
+        for (i, au) in aus.iter().enumerate() {
+            let job = parser.push(au).unwrap();
+            let Some(Picture::Cpu(cpu)) = reference.decode(au).unwrap() else { panic!("ffmpeg gave no picture for {i}") };
+            if dec.is_none() {
+                dec = Some(crate::vkvideo::Decoder::new(&ctx, &gpu.device, |y, c| gpu.bind_planes(y, c), &job).unwrap());
+            }
+            let d = dec.as_mut().unwrap();
+            let t = std::time::Instant::now();
+            d.decode(&job).unwrap();
+            times.push(t.elapsed());
+            let (w, h) = d.size();
+            let a = FrameTextures::new(&gpu, cpu.width, cpu.height);
+            a.write(&gpu, &cpu);
+            let b = FrameTextures { source: Source::H264, bind_group: d.bind_group().clone(), width: w, height: h };
+            let ra = render_rgba(&mut gpu, &a, 480, 270);
+            let rb = render_rgba(&mut gpu, &b, 480, 270);
+            let worst = ra.iter().zip(&rb).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+            assert!(worst <= 2, "frame {i}: Vulkan Video differs from ffmpeg by up to {worst}");
+        }
+        times.sort();
+        eprintln!("Vulkan Video decode+copy p50 {:?} p95 {:?}", times[times.len() / 2], times[times.len() * 95 / 100]);
     }
 
     #[test]

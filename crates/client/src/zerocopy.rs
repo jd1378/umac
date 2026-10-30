@@ -26,7 +26,7 @@ use wgpu::hal::{api::Vulkan, vulkan as hal_vk};
 use crate::decode::dmabuf::{DmabufFrame, Plane};
 
 /// Device extensions needed on top of wgpu's own.
-const EXTENSIONS: [&CStr; 4] = [
+pub const EXTENSIONS: [&CStr; 4] = [
     ash::khr::external_memory_fd::NAME,
     ash::ext::external_memory_dma_buf::NAME,
     ash::ext::image_drm_format_modifier::NAME,
@@ -38,32 +38,15 @@ const MAX_CACHED_BYTES: u64 = 512 << 20;
 /// Raw submissions in flight: an acquire and a release per draw.
 const RING: usize = 8;
 
-/// Opens a wgpu device with the dmabuf import extensions, or `None` if the adapter lacks them.
-pub fn open_device(adapter: &wgpu::Adapter) -> Option<(wgpu::Device, wgpu::Queue)> {
-    let hal = unsafe { adapter.as_hal::<Vulkan>() }?;
-    if let Some(missing) = EXTENSIONS.iter().find(|e| !hal.physical_device_capabilities().supports_extension(e)) {
-        tracing::info!(?missing, "zero-copy decode unavailable");
-        return None;
+/// Whether the adapter can import dmabufs (open the device with [`EXTENSIONS`]).
+pub fn supported(adapter: &hal_vk::Adapter) -> bool {
+    match EXTENSIONS.iter().find(|e| !adapter.physical_device_capabilities().supports_extension(e)) {
+        Some(missing) => {
+            tracing::info!(?missing, "zero-copy decode unavailable");
+            false
+        }
+        None => true,
     }
-    let (features, limits, hints) = (wgpu::Features::empty(), wgpu::Limits::default(), wgpu::MemoryHints::default());
-    let open = unsafe {
-        hal.open_with_callback(
-            features,
-            &limits,
-            &hints,
-            Some(Box::new(|args: hal_vk::CreateDeviceCallbackArgs| {
-                for e in EXTENSIONS {
-                    if !args.extensions.contains(&e) {
-                        args.extensions.push(e);
-                    }
-                }
-            })),
-        )
-    };
-    drop(hal);
-    let open = open.inspect_err(|e| tracing::warn!("opening zero-copy device: {e}")).ok()?;
-    let desc = wgpu::DeviceDescriptor { required_features: features, required_limits: limits, memory_hints: hints, ..Default::default() };
-    unsafe { adapter.create_device_from_hal(open, &desc) }.inspect_err(|e| tracing::warn!("zero-copy device: {e}")).ok()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

@@ -297,7 +297,9 @@ impl Core {
         let (frame, timing) = slot.take()?;
         let decoded = timing.decoded;
         let start = Instant::now();
-        r.renderer.upload(gpu, frame);
+        if !r.renderer.upload(gpu, frame) {
+            let _ = self.net.send(NetCmd::DecodeError(window));
+        }
         r.renderer.render(gpu);
         let end = Instant::now();
         r.presented += 1;

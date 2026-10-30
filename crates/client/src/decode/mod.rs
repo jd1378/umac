@@ -1,8 +1,9 @@
 //! Codec-agnostic decoding. A decoder turns one encoded frame into one picture, with no
 //! reordering or buffering, so latency stays at a single frame.
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "ffmpeg"))]
 pub mod dmabuf;
+#[cfg(feature = "ffmpeg")]
 mod ffmpeg;
 
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -28,7 +29,10 @@ pub enum Picture {
     Cpu(Nv12Frame),
     /// A validated PyroWave frame, decoded on the renderer's GPU when drawn.
     Pyro(crate::pyro::PyroPicture),
+    /// A validated H.264 access unit, decoded with Vulkan Video on the renderer's GPU.
     #[cfg(target_os = "linux")]
+    H264(Box<umac_h264::DecodeJob>),
+    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
     Dmabuf(dmabuf::DmabufFrame),
 }
 
@@ -38,6 +42,8 @@ impl Picture {
             Picture::Cpu(f) => (f.width, f.height),
             Picture::Pyro(p) => (p.layout.width, p.layout.height),
             #[cfg(target_os = "linux")]
+            Picture::H264(j) => j.sps.display_size(),
+            #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
             Picture::Dmabuf(f) => (f.width, f.height),
         }
     }
@@ -69,13 +75,40 @@ pub fn zero_copy_allowed() -> bool {
 }
 
 /// Codecs to offer the host, most preferred first. PyroWave needs no ffmpeg and decodes in
-/// well under a millisecond, so it leads whenever a GPU can run its compute decoder;
-/// `UMAC_PYROWAVE=0` turns it off for comparisons.
+/// well under a millisecond, so it leads whenever a GPU can run its compute decoder
+/// (`UMAC_PYROWAVE=0` turns it off for comparisons). H.264 through Vulkan Video comes next,
+/// then what ffmpeg can decode, if built in.
 pub fn codecs() -> Vec<Codec> {
     let pyro = std::env::var("UMAC_PYROWAVE").map_or(true, |v| v != "0") && pyrowave_gpu();
     let mut c = if pyro { vec![Codec::PyroWave] } else { Vec::new() };
-    c.extend([Codec::Hevc, Codec::H264]);
+    if vulkan_h264() {
+        c.push(Codec::H264);
+    }
+    if cfg!(feature = "ffmpeg") {
+        c.push(Codec::Hevc);
+        if !c.contains(&Codec::H264) {
+            c.push(Codec::H264);
+        }
+    }
     c
+}
+
+/// Whether the GPU decodes H.264 with Vulkan Video (checked once). Fedora's stock Mesa leaves
+/// H.264 out; RPM Fusion's `mesa-vulkan-drivers-freeworld` has it.
+pub fn vulkan_h264() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OK.get_or_init(|| {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return false };
+            let ok = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }.is_some_and(|a| crate::vkvideo::decode_family(&a).is_some());
+            tracing::info!(ok, adapter = ?adapter.get_info().name, "Vulkan Video H.264 decoder");
+            ok
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
 }
 
 /// Whether a GPU adapter can run the PyroWave decoder (checked once).
@@ -100,7 +133,7 @@ pub trait Decoder: Send {
 
 /// An HEVC/H.264 decoder that always (or never) exports VA surfaces, regardless of the
 /// process-wide switch.
-#[cfg(test)]
+#[cfg(all(test, feature = "ffmpeg"))]
 pub(crate) fn create_with_export(codec: Codec, export: bool) -> Result<Box<dyn Decoder>> {
     let mut d = ffmpeg::FfmpegDecoder::new(codec)?;
     d.export = Some(export);
@@ -112,12 +145,41 @@ pub fn create(codec: Codec, color: ColorFormat) -> Result<Box<dyn Decoder>> {
         bail!("{codec:?} streams are 4:2:0 only");
     }
     match codec {
+        #[cfg(target_os = "linux")]
+        Codec::H264 if vulkan_h264() => Ok(Box::new(H264Front::default())),
+        #[cfg(feature = "ffmpeg")]
         Codec::Hevc | Codec::H264 => Ok(Box::new(ffmpeg::FfmpegDecoder::new(codec)?)),
-        Codec::PyroWave => bail!("PyroWave decoding is not available in this build"),
+        Codec::PyroWave => bail!("PyroWave streams are decoded by the PyroWave path"),
+        #[allow(unreachable_patterns)]
+        other => bail!("{other:?} is not supported by this build"),
     }
 }
 
-#[cfg(test)]
+/// The CPU half of Vulkan Video H.264 decoding: validates each access unit and tracks
+/// references, so the renderer only executes the job. Errors make the caller ask for a keyframe.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct H264Front {
+    parser: umac_h264::Parser,
+}
+
+#[cfg(target_os = "linux")]
+impl Decoder for H264Front {
+    fn decode(&mut self, data: &[u8]) -> Result<Option<Picture>> {
+        let job = self.parser.push(data)?;
+        let (w, h) = job.sps.display_size();
+        if w > MAX_DIMENSION || h > MAX_DIMENSION {
+            bail!("{w}x{h} exceeds {MAX_DIMENSION}");
+        }
+        Ok(Some(Picture::H264(Box::new(job))))
+    }
+
+    fn describe(&self) -> &str {
+        "h264 vulkan video"
+    }
+}
+
+#[cfg(all(test, feature = "ffmpeg"))]
 mod tests {
     use super::*;
     use crate::sample;

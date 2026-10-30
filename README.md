@@ -60,6 +60,13 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/jd1378/umac/main/scripts
 
 Run it again to update.
 
+Codecs, in order of preference: PyroWave (GPU compute, no extra libraries), H.264 through
+Vulkan Video (needs a driver that exposes it; on Fedora RPM Fusion's
+`mesa-vulkan-drivers-freeworld`), then HEVC and H.264 through ffmpeg/VA-API. The ffmpeg path
+is the `ffmpeg` cargo feature (on by default); `cargo build -p umac-client
+--no-default-features` builds a client without ffmpeg. `UMAC_VULKAN_VIDEO=0` turns the Vulkan
+Video path off.
+
 ## 3. Pair
 
 ```sh

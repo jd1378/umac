@@ -1,31 +1,4 @@
-use umac_h264::{Error, Parser, bits};
-
-/// Splits a raw H.264 stream into access units (a new one starts at parameter sets after a
-/// slice, or at a slice beginning at macroblock 0).
-fn access_units(data: &[u8]) -> Vec<Vec<u8>> {
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    let mut cur = Vec::new();
-    let mut has_slice = false;
-    for nal in bits::nal_units(data) {
-        let t = nal[0] & 0x1f;
-        let starts_new = match t {
-            1 | 5 => has_slice && bits::BitReader::new(&bits::unescape(&nal[1..])).ue().unwrap() == 0,
-            6..=9 => has_slice,
-            _ => false,
-        };
-        if starts_new {
-            out.push(std::mem::take(&mut cur));
-            has_slice = false;
-        }
-        has_slice |= matches!(t, 1 | 5);
-        cur.extend_from_slice(&[0, 0, 0, 1]);
-        cur.extend_from_slice(nal);
-    }
-    if has_slice {
-        out.push(cur);
-    }
-    out
-}
+use umac_h264::{Error, Parser, access_units};
 
 fn check_stream(data: &[u8], frames: usize, idrs: usize, slices: usize, size: (u32, u32)) {
     let aus = access_units(data);
