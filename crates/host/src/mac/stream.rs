@@ -8,11 +8,11 @@ use std::{
     },
 };
 
-use screencapturekit::prelude::SCWindow;
+use screencapturekit::prelude::{SCDisplay, SCWindow};
 use umac_proto::{Codec, WindowId};
 
 use super::{
-    capture::WindowCapture,
+    capture::{Rect, WindowCapture},
     ffi::{CVPixelBufferGetHeight, CVPixelBufferGetWidth, CVPixelBufferRef, CVPixelBufferRelease, CVPixelBufferRetain},
     videotoolbox::VtEncoder,
 };
@@ -56,6 +56,19 @@ struct Shared {
 }
 
 impl Shared {
+    fn new(params: StreamParams, on_encoded: OnEncoded) -> Arc<Self> {
+        Arc::new(Self {
+            params,
+            encoder: Mutex::new(None),
+            failed_size: Mutex::new(None),
+            force_keyframe: Arc::new(AtomicBool::new(false)),
+            last_keyframe_us: AtomicU64::new(0),
+            last_frame: Mutex::new(None),
+            last_frame_us: AtomicU64::new(0),
+            on_encoded,
+        })
+    }
+
     fn submit(&self, buffer: *mut c_void, now: u64) {
         let size = unsafe { (CVPixelBufferGetWidth(buffer) as u32, CVPixelBufferGetHeight(buffer) as u32) };
         let mut enc = self.encoder.lock().unwrap();
@@ -125,19 +138,27 @@ pub struct WindowStream {
 
 impl WindowStream {
     pub fn start(window: &SCWindow, params: StreamParams, inset: f64, on_encoded: OnEncoded) -> anyhow::Result<Self> {
-        let shared = Arc::new(Shared {
-            params,
-            encoder: Mutex::new(None),
-            failed_size: Mutex::new(None),
-            force_keyframe: Arc::new(AtomicBool::new(false)),
-            last_keyframe_us: AtomicU64::new(0),
-            last_frame: Mutex::new(None),
-            last_frame_us: AtomicU64::new(0),
-            on_encoded,
-        });
+        let shared = Shared::new(params, on_encoded);
         let s = shared.clone();
         let (capture, size) = WindowCapture::start(window, params.fps, inset, Box::new(move |buf, t| s.submit(buf, t)))?;
         Ok(Self { capture, shared, size })
+    }
+
+    /// Streams a popup by capturing its on-screen region (see `WindowCapture::start_region`).
+    pub fn start_region(display: &SCDisplay, rect: Rect, params: StreamParams, on_encoded: OnEncoded) -> anyhow::Result<Self> {
+        let shared = Shared::new(params, on_encoded);
+        let s = shared.clone();
+        let (capture, size) = WindowCapture::start_region(display, rect, params.fps, Box::new(move |buf, t| s.submit(buf, t)))?;
+        Ok(Self { capture, shared, size })
+    }
+
+    pub fn set_region(&mut self, rect: Rect) -> anyhow::Result<()> {
+        self.size = self.capture.set_region(rect)?;
+        Ok(())
+    }
+
+    pub fn params(&self) -> StreamParams {
+        self.shared.params
     }
 
     pub fn scale(&self) -> f32 {

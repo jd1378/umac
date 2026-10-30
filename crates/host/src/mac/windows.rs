@@ -7,7 +7,9 @@ use core_foundation::{
     string::CFString,
 };
 use core_graphics::window::{
-    copy_window_info, kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowListOptionIncludingWindow, kCGWindowName,
+    copy_window_info, kCGNullWindowID, kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowLayer,
+    kCGWindowListExcludeDesktopElements, kCGWindowListOptionIncludingWindow, kCGWindowListOptionOnScreenOnly,
+    kCGWindowName, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use screencapturekit::prelude::*;
 use umac_proto::{WindowId, WindowInfo, WindowKind};
@@ -73,6 +75,45 @@ impl Geometry {
     pub fn placement(&self, scale: f64, inset: f64) -> Placement {
         Placement { x: self.x, y: self.y + inset, width: self.width, height: (self.height - inset).max(1.0), scale }
     }
+}
+
+/// One on-screen window as CGWindowList reports it. Cheap to query (no ScreenCaptureKit).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OnScreen {
+    pub id: WindowId,
+    pub pid: i32,
+    pub layer: i32,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// All on-screen windows, front to back.
+pub fn on_screen() -> Vec<OnScreen> {
+    let Some(list) = copy_window_info(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID)
+    else {
+        return Vec::new();
+    };
+    let key = |k| unsafe { CFString::wrap_under_get_rule(k) };
+    list.iter()
+        .filter_map(|raw| {
+            let info: CFDictionary<CFString, CFType> = unsafe { CFDictionary::wrap_under_get_rule(*raw as _) };
+            let num = |k| info.find(key(k)).and_then(|v| v.downcast::<CFNumber>()).and_then(|n| n.to_i64());
+            let bounds = info.find(key(unsafe { kCGWindowBounds }))?.downcast::<CFDictionary>()?;
+            let bounds: CFDictionary<CFString, CFType> =
+                unsafe { CFDictionary::wrap_under_get_rule(bounds.as_concrete_TypeRef()) };
+            Some(OnScreen {
+                id: num(unsafe { kCGWindowNumber })? as WindowId,
+                pid: num(unsafe { kCGWindowOwnerPID })? as i32,
+                layer: num(unsafe { kCGWindowLayer })? as i32,
+                x: number(&bounds, "X")?,
+                y: number(&bounds, "Y")?,
+                width: number(&bounds, "Width")?,
+                height: number(&bounds, "Height")?,
+            })
+        })
+        .collect()
 }
 
 fn number(d: &CFDictionary<CFString, CFType>, k: &str) -> Option<f64> {

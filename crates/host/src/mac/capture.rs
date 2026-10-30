@@ -1,5 +1,5 @@
-//! Per-window ScreenCaptureKit streams. Captures the window's own backing store, so it keeps
-//! working while the window is covered or partly off screen.
+//! Per-window ScreenCaptureKit streams. Normal windows are captured from their own backing
+//! store, so capture keeps working while the window is covered or partly off screen.
 
 use std::ffi::c_void;
 
@@ -17,12 +17,23 @@ use crate::clock;
 /// and its capture time. The buffer is only valid during the call unless retained.
 pub type FrameCallback = Box<dyn Fn(*mut c_void, u64) + Send + Sync>;
 
+/// Global rectangle in points.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 pub struct WindowCapture {
     stream: SCStream,
     config: SCStreamConfiguration,
     pub scale: f32,
     /// Points cropped off the top of the window (its title bar).
     inset: f64,
+    /// For region captures: the display origin, so global rects map to display coordinates.
+    display_origin: Option<(f64, f64)>,
 }
 
 pub fn find_window(id: WindowId) -> anyhow::Result<SCWindow> {
@@ -32,6 +43,30 @@ pub fn find_window(id: WindowId) -> anyhow::Result<SCWindow> {
         .into_iter()
         .find(|w| w.window_id() == id)
         .ok_or_else(|| anyhow!("window {id} not found"))
+}
+
+/// Displays rarely change, and listing shareable content costs 30 to 50 ms, which would
+/// delay every popup; so displays are cached briefly.
+const DISPLAY_CACHE: std::time::Duration = std::time::Duration::from_secs(10);
+static DISPLAYS: std::sync::Mutex<Option<(Vec<SCDisplay>, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+/// The display containing the global point, or the first display.
+pub fn display_at(x: f64, y: f64) -> anyhow::Result<SCDisplay> {
+    let mut cache = DISPLAYS.lock().unwrap();
+    if cache.as_ref().is_none_or(|(_, t)| t.elapsed() > DISPLAY_CACHE) {
+        let content = SCShareableContent::get().map_err(|e| anyhow!("listing shareable content: {e}"))?;
+        *cache = Some((content.displays(), std::time::Instant::now()));
+    }
+    let displays = &cache.as_ref().unwrap().0;
+    displays
+        .iter()
+        .find(|d| {
+            let f = d.frame();
+            x >= f.origin.x && y >= f.origin.y && x < f.origin.x + f.size.width && y < f.origin.y + f.size.height
+        })
+        .or(displays.first())
+        .cloned()
+        .ok_or_else(|| anyhow!("no display"))
 }
 
 fn stream_config(width: u32, height: u32, fps: u32) -> anyhow::Result<SCStreamConfiguration> {
@@ -48,6 +83,39 @@ fn stream_config(width: u32, height: u32, fps: u32) -> anyhow::Result<SCStreamCo
     Ok(cfg)
 }
 
+fn apply_region(config: &mut SCStreamConfiguration, rect: Rect, display: (f64, f64), scale: f64) -> (u32, u32) {
+    let size = ((rect.width * scale).round() as u32, (rect.height * scale).round() as u32);
+    config
+        .set_width(size.0.max(2))
+        .set_height(size.1.max(2))
+        .set_source_rect(CGRect::new(rect.x - display.0, rect.y - display.1, rect.width, rect.height));
+    size
+}
+
+fn open_stream(filter: &SCContentFilter, config: &SCStreamConfiguration, on_frame: FrameCallback) -> anyhow::Result<SCStream> {
+    let mut stream = SCStream::new(filter, config).map_err(|e| anyhow!("creating stream: {e}"))?;
+    stream
+        .add_output_handler(
+            move |sample: CMSampleBuffer, kind: SCStreamOutputType| {
+                if kind != SCStreamOutputType::Screen {
+                    return;
+                }
+                // Idle frames carry no pixels: the window did not change.
+                if sample.frame_status() != Some(screencapturekit::cm::SCFrameStatus::Complete) {
+                    return;
+                }
+                let buffer = sample.image_buffer_ptr_borrowed();
+                if !buffer.is_null() {
+                    on_frame(buffer, clock::now_us());
+                }
+            },
+            SCStreamOutputType::Screen,
+        )
+        .map_err(|e| anyhow!("adding output handler: {e}"))?;
+    stream.start_capture().map_err(|e| anyhow!("starting capture: {e}")).context("is Screen Recording allowed?")?;
+    Ok(stream)
+}
+
 impl WindowCapture {
     /// Starts capturing `window` at its native pixel size, minus `inset` points at the top.
     /// Returns the capture and the pixel size it was configured for.
@@ -58,27 +126,30 @@ impl WindowCapture {
         let (w, h) = (frame.size.width, (frame.size.height - inset).max(1.0));
         let size = ((w * scale as f64).round() as u32, (h * scale as f64).round() as u32);
         let config = stream_config(size.0, size.1, fps)?.with_source_rect(CGRect::new(0.0, inset, w, h));
-        let mut stream = SCStream::new(&filter, &config).map_err(|e| anyhow!("creating stream: {e}"))?;
-        stream
-            .add_output_handler(
-                move |sample: CMSampleBuffer, kind: SCStreamOutputType| {
-                    if kind != SCStreamOutputType::Screen {
-                        return;
-                    }
-                    // Idle frames carry no pixels: the window did not change.
-                    if sample.frame_status() != Some(screencapturekit::cm::SCFrameStatus::Complete) {
-                        return;
-                    }
-                    let buffer = sample.image_buffer_ptr_borrowed();
-                    if !buffer.is_null() {
-                        on_frame(buffer, clock::now_us());
-                    }
-                },
-                SCStreamOutputType::Screen,
-            )
-            .map_err(|e| anyhow!("adding output handler: {e}"))?;
-        stream.start_capture().map_err(|e| anyhow!("starting capture: {e}")).context("is Screen Recording allowed?")?;
-        Ok((Self { stream, config, scale, inset }, size))
+        let stream = open_stream(&filter, &config, on_frame)?;
+        Ok((Self { stream, config, scale, inset, display_origin: None }, size))
+    }
+
+    /// Captures the screen inside `rect` on `display`, as the window server composites it.
+    /// Used for menus and other popups: a window filter on them returns the parent window's
+    /// pixels instead of the menu. Popups sit on top, so the region shows the popup, with the
+    /// real backdrop behind its rounded corners.
+    pub fn start_region(display: &SCDisplay, rect: Rect, fps: u32, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
+        let filter = SCContentFilter::create().with_display(display).build().map_err(|e| anyhow!("content filter: {e}"))?;
+        let scale = filter.point_pixel_scale().max(1.0);
+        let d = display.frame().origin;
+        let mut config = stream_config(2, 2, fps)?;
+        let size = apply_region(&mut config, rect, (d.x, d.y), scale as f64);
+        let stream = open_stream(&filter, &config, on_frame)?;
+        Ok((Self { stream, config, scale, inset: 0.0, display_origin: Some((d.x, d.y)) }, size))
+    }
+
+    /// Moves or resizes a region capture; returns the new pixel size.
+    pub fn set_region(&mut self, rect: Rect) -> anyhow::Result<(u32, u32)> {
+        let origin = self.display_origin.ok_or_else(|| anyhow!("not a region capture"))?;
+        let size = apply_region(&mut self.config, rect, origin, self.scale as f64);
+        self.stream.update_configuration(&self.config).map_err(|e| anyhow!("updating stream: {e}"))?;
+        Ok(size)
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> anyhow::Result<()> {

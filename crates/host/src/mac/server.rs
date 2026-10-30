@@ -1,16 +1,21 @@
 //! The agent: QUIC server, per-client sessions, window streams and input routing.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{Ipv6Addr, SocketAddr},
-    sync::{Arc, mpsc as std_mpsc},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc,
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow, bail};
 use tokio::{sync::mpsc, time::timeout};
 use umac_proto::{
     ClientMsg, Codec, ColorFormat, Hello, HelloReply, HostMsg, InputEvent, PROTOCOL_VERSION, WindowId, WindowInfo,
+    WindowKind,
 };
 use umac_transport::{
     Fingerprint, Identity,
@@ -20,17 +25,27 @@ use umac_transport::{
 };
 
 use super::{
-    capture::find_window,
+    capture::{Rect, display_at, find_window},
     input::{self, Command, Target, Targets},
     permissions,
     stream::{StreamParams, WindowStream},
-    windows::{self, Geometry},
+    windows::{self, Geometry, OnScreen},
     ax::AxWindow,
 };
-use crate::{auth::AuthStore, config, config::Settings, encode::EncodedFrame, status::Status};
+use crate::{
+    auth::AuthStore,
+    config,
+    config::Settings,
+    encode::EncodedFrame,
+    input_state::Placement,
+    popup::{self, Candidate},
+    status::Status,
+};
 
 const SUPPORTED: [Codec; 2] = [Codec::Hevc, Codec::H264];
 const POLL: Duration = Duration::from_millis(250);
+/// Popups (menus, tooltips) must show up fast, so they get their own cheap, quick poll.
+const POPUP_POLL: Duration = Duration::from_millis(40);
 /// Encoded frames waiting for the network. Small on purpose: a backlog means stale video.
 const FRAME_QUEUE: usize = 6;
 
@@ -39,6 +54,8 @@ struct Shared {
     auth: AuthStore,
     targets: Targets,
     input: std_mpsc::Sender<Command>,
+    /// Window that last received input or focus; new popups attach to it.
+    active: Arc<Mutex<Option<WindowId>>>,
     host_name: String,
 }
 
@@ -81,6 +98,7 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
     let shared = Arc::new(Shared {
         input: input::spawn(targets.clone()),
         targets,
+        active: Arc::default(),
         auth: AuthStore::new(&config::support_dir()),
         host_name: host_name(),
         settings,
@@ -132,9 +150,10 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
 
     let (frames_tx, frames_rx) = mpsc::channel::<(WindowId, EncodedFrame)>(FRAME_QUEUE);
     let sender = tokio::spawn(send_frames(conn.clone(), frames_rx, shared.settings.fec_percent));
-    let input_task = tokio::spawn(read_input(conn.clone(), shared.input.clone()));
+    let input_task = tokio::spawn(read_input(conn.clone(), shared.input.clone(), shared.active.clone()));
 
-    let mut session = Session { shared: shared.clone(), codec, streams: HashMap::new(), frames_tx };
+    let mut session =
+        Session { shared: shared.clone(), codec, streams: HashMap::new(), dismissed: HashSet::new(), frames_tx };
     let result = session.control_loop(&mut send, recv).await;
 
     let windows: Vec<WindowId> = session.streams.keys().copied().collect();
@@ -202,11 +221,14 @@ async fn send_frames(conn: quinn::Connection, mut rx: mpsc::Receiver<(WindowId, 
     }
 }
 
-async fn read_input(conn: quinn::Connection, input: std_mpsc::Sender<Command>) {
+async fn read_input(conn: quinn::Connection, input: std_mpsc::Sender<Command>, active: Arc<Mutex<Option<WindowId>>>) {
     while let Ok(mut recv) = conn.accept_uni().await {
-        let input = input.clone();
+        let (input, active) = (input.clone(), active.clone());
         tokio::spawn(async move {
             while let Ok(Some(ev)) = read_msg::<_, InputEvent>(&mut recv).await {
+                if let InputEvent::MouseButton { window, pressed: true, .. } | InputEvent::Key { window, pressed: true, .. } = ev {
+                    *active.lock().unwrap() = Some(window);
+                }
                 if input.send(Command::Input(ev)).is_err() {
                     return;
                 }
@@ -221,12 +243,16 @@ struct ActiveStream {
     geometry: Geometry,
     /// Title bar points cropped from the capture.
     inset: f64,
+    /// Set for popups: the streamed window they belong to.
+    popup_of: Option<WindowId>,
 }
 
 struct Session {
     shared: Arc<Shared>,
     codec: Codec,
     streams: HashMap<WindowId, ActiveStream>,
+    /// Popups the client closed while they are still open on the Mac; not restarted.
+    dismissed: HashSet<WindowId>,
     frames_tx: mpsc::Sender<(WindowId, EncodedFrame)>,
 }
 
@@ -235,6 +261,8 @@ type Ctl = quinn::SendStream;
 impl Session {
     async fn control_loop(&mut self, send: &mut Ctl, mut recv: quinn::RecvStream) -> anyhow::Result<()> {
         let mut poll = tokio::time::interval(POLL);
+        let mut popup_poll = tokio::time::interval(POPUP_POLL);
+        popup_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let (msg_tx, mut msg_rx) = mpsc::channel::<anyhow::Result<Option<ClientMsg>>>(16);
         // Reading in a separate task keeps `read_msg` cancellation-safe.
         let reader = tokio::spawn(async move {
@@ -262,6 +290,11 @@ impl Session {
                         break Err(e);
                     }
                 }
+                _ = popup_poll.tick() => {
+                    if let Err(e) = self.poll_popups(send).await {
+                        break Err(e);
+                    }
+                }
             }
         };
         reader.abort();
@@ -285,17 +318,31 @@ impl Session {
                 };
                 write_msg(send, &reply).await?;
             }
-            ClientMsg::Unsubscribe { window } => self.remove(window),
+            ClientMsg::Unsubscribe { window } => {
+                // Closing a popup on the client does not dismiss it on the Mac: a synthetic
+                // Escape could land in another window if the menu already closed itself. The
+                // click that dismissed it on the client reaches the Mac and closes it there.
+                if self.streams.get(&window).is_some_and(|s| s.popup_of.is_some()) {
+                    self.dismissed.insert(window);
+                }
+                self.close(window, send).await?;
+            }
             ClientMsg::RequestKeyframe { window } => {
                 if let Some(s) = self.streams.get(&window) {
                     s.stream.request_keyframe();
                 }
             }
             ClientMsg::Focus { window } => {
-                let _ = self.shared.input.send(Command::Focus(window));
+                *self.shared.active.lock().unwrap() = Some(window);
+                if self.streams.get(&window).is_some_and(|s| s.popup_of.is_none()) {
+                    let _ = self.shared.input.send(Command::Focus(window));
+                }
             }
             ClientMsg::Resize { window, width, height } => {
                 let Some(s) = self.streams.get(&window) else { return Ok(()) };
+                if s.popup_of.is_some() {
+                    return Ok(());
+                }
                 let (pid, scale) = (s.info.pid, s.info.scale.max(1.0) as f64);
                 let (w, h) = (width as f64 / scale, height as f64 / scale + s.inset);
                 let res = tokio::task::spawn_blocking(move || AxWindow::find(pid, window)?.resize(w, h)).await?;
@@ -345,7 +392,7 @@ impl Session {
         };
         self.set_target(&info, &geometry, inset);
         tracing::info!(window, app = %info.app_name, size = ?stream.size, inset, ?params, "stream started");
-        self.streams.insert(window, ActiveStream { stream, info: info.clone(), geometry, inset });
+        self.streams.insert(window, ActiveStream { stream, info: info.clone(), geometry, inset, popup_of: None });
         Ok(info)
     }
 
@@ -364,16 +411,34 @@ impl Session {
         }
     }
 
+    /// Stops a stream and its popups, telling the client about every window that went away.
+    async fn close(&mut self, window: WindowId, send: &mut Ctl) -> anyhow::Result<()> {
+        let mut gone: Vec<WindowId> =
+            self.streams.iter().filter(|(_, s)| s.popup_of == Some(window)).map(|(&id, _)| id).collect();
+        gone.push(window);
+        for id in gone {
+            if self.streams.contains_key(&id) {
+                self.remove(id);
+                write_msg(send, &HostMsg::WindowClosed { window: id }).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn poll_windows(&mut self, send: &mut Ctl) -> anyhow::Result<()> {
         let ids: Vec<WindowId> = self.streams.keys().copied().collect();
         for id in ids {
+            let Some(s) = self.streams.get(&id) else { continue };
+            s.stream.serve_idle_keyframe();
+            // Popups are tracked by the faster popup poll.
+            if s.popup_of.is_some() {
+                continue;
+            }
             let Some(g) = windows::geometry(id) else {
-                self.remove(id);
-                write_msg(send, &HostMsg::WindowClosed { window: id }).await?;
+                self.close(id, send).await?;
                 continue;
             };
             let s = self.streams.get_mut(&id).unwrap();
-            s.stream.serve_idle_keyframe();
             if g == s.geometry {
                 continue;
             }
@@ -399,5 +464,126 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Finds popups opened by streamed apps, follows their geometry and closes them when
+    /// they disappear.
+    async fn poll_popups(&mut self, send: &mut Ctl) -> anyhow::Result<()> {
+        let pids: HashSet<i32> = self.streams.values().filter(|s| s.popup_of.is_none()).map(|s| s.info.pid).collect();
+        if pids.is_empty() && self.dismissed.is_empty() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let list: HashMap<WindowId, OnScreen> = windows::on_screen().into_iter().map(|w| (w.id, w)).collect();
+        self.dismissed.retain(|id| list.contains_key(id));
+
+        let popups: Vec<WindowId> = self.streams.iter().filter(|(_, s)| s.popup_of.is_some()).map(|(&id, _)| id).collect();
+        for id in popups {
+            match list.get(&id) {
+                Some(w) => self.update_popup(*w, send).await?,
+                None => self.close(id, send).await?,
+            }
+        }
+        for w in list.values() {
+            if !pids.contains(&w.pid) || self.streams.contains_key(&w.id) || self.dismissed.contains(&w.id) {
+                continue;
+            }
+            if !popup::is_popup(w.layer, w.width, w.height) {
+                continue;
+            }
+            if let Err(e) = self.start_popup(*w, now, send).await {
+                tracing::debug!(window = w.id, layer = w.layer, "popup not started yet: {e:#}");
+            }
+        }
+        Ok(())
+    }
+
+    fn popup_parent(&self, pid: i32) -> Option<WindowId> {
+        let candidates: Vec<Candidate> =
+            self.streams.values().map(|s| Candidate { id: s.info.id, pid: s.info.pid, popup_of: s.popup_of }).collect();
+        popup::choose_parent(pid, *self.shared.active.lock().unwrap(), &candidates)
+    }
+
+    /// Parent capture origin in global points and its surface scale.
+    fn parent_origin(&self, parent: WindowId) -> Option<((f64, f64), f64)> {
+        let p = self.streams.get(&parent)?;
+        Some(((p.geometry.x, p.geometry.y + p.inset), p.info.scale as f64))
+    }
+
+    async fn start_popup(&mut self, w: OnScreen, seen: Instant, send: &mut Ctl) -> anyhow::Result<()> {
+        let parent = self.popup_parent(w.pid).ok_or_else(|| anyhow!("no parent window"))?;
+        let (origin, scale) = self.parent_origin(parent).ok_or_else(|| anyhow!("parent gone"))?;
+        let p = &self.streams[&parent];
+        let params = StreamParams { window: w.id, ..p.stream.params() };
+        let mut info = WindowInfo {
+            id: w.id,
+            pid: w.pid,
+            app_name: p.info.app_name.clone(),
+            bundle_id: p.info.bundle_id.clone(),
+            title: String::new(),
+            width: 0,
+            height: 0,
+            scale: p.info.scale,
+            parent: Some(parent),
+            offset: popup::offset((w.x, w.y), origin, scale),
+            kind: WindowKind::Popup,
+        };
+        let tx = self.frames_tx.clone();
+        let first = AtomicBool::new(false);
+        let on_encoded = Arc::new(move |id: WindowId, f: EncodedFrame| {
+            if !first.swap(true, Ordering::Relaxed) {
+                tracing::info!(window = id, ms = seen.elapsed().as_millis() as u64, "popup first frame");
+            }
+            tx.try_send((id, f)).is_ok()
+        });
+        let (id, rect) = (w.id, Rect { x: w.x, y: w.y, width: w.width, height: w.height });
+        let (stream, find_ms) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let t = Instant::now();
+            let display = display_at(rect.x, rect.y)?;
+            let find_ms = t.elapsed().as_millis() as u64;
+            Ok((WindowStream::start_region(&display, rect, params, on_encoded)?, find_ms))
+        })
+        .await??;
+        (info.width, info.height) = stream.size;
+        tracing::info!(
+            window = id, parent, layer = w.layer, offset = ?info.offset, size = ?stream.size,
+            find_ms, start_ms = seen.elapsed().as_millis() as u64, "popup started"
+        );
+        let geometry = Geometry { x: w.x, y: w.y, width: w.width, height: w.height, title: String::new(), on_screen: true };
+        self.set_popup_target(&info, &geometry);
+        self.streams.insert(id, ActiveStream { stream, info: info.clone(), geometry, inset: 0.0, popup_of: Some(parent) });
+        write_msg(send, &HostMsg::StreamStarted { window: id, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info })
+            .await?;
+        Ok(())
+    }
+
+    fn set_popup_target(&self, info: &WindowInfo, g: &Geometry) {
+        if let Ok(mut t) = self.shared.targets.write() {
+            let placement = Placement { x: g.x, y: g.y, width: g.width, height: g.height, scale: info.scale as f64 };
+            t.insert(info.id, Target { pid: info.pid, placement });
+        }
+    }
+
+    /// Follows popup moves and resizes, and parent moves that shift the offset.
+    async fn update_popup(&mut self, w: OnScreen, send: &mut Ctl) -> anyhow::Result<()> {
+        let Some(parent) = self.streams.get(&w.id).and_then(|s| s.popup_of) else { return Ok(()) };
+        let Some((origin, scale)) = self.parent_origin(parent) else { return Ok(()) };
+        let s = self.streams.get_mut(&w.id).unwrap();
+        let offset = popup::offset((w.x, w.y), origin, scale);
+        let moved = (w.x, w.y, w.width, w.height) != (s.geometry.x, s.geometry.y, s.geometry.width, s.geometry.height);
+        if !moved && offset == s.info.offset {
+            return Ok(());
+        }
+        if moved {
+            if let Err(e) = s.stream.set_region(Rect { x: w.x, y: w.y, width: w.width, height: w.height }) {
+                tracing::warn!(window = w.id, "moving popup capture: {e:#}");
+            }
+            (s.info.width, s.info.height) = s.stream.size;
+        }
+        (s.geometry.x, s.geometry.y, s.geometry.width, s.geometry.height) = (w.x, w.y, w.width, w.height);
+        s.info.offset = offset;
+        let (info, geometry) = (s.info.clone(), s.geometry.clone());
+        self.set_popup_target(&info, &geometry);
+        Ok(write_msg(send, &HostMsg::WindowChanged(info)).await?)
     }
 }

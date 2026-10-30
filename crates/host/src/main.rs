@@ -7,6 +7,7 @@ mod clock;
 mod config;
 mod encode;
 mod input_state;
+mod popup;
 #[cfg(target_os = "macos")]
 mod mac;
 mod status;
@@ -41,7 +42,11 @@ enum Cmd {
     /// Forget a paired client by fingerprint prefix.
     Unpair { fingerprint: String },
     /// List capturable windows.
-    ListWindows,
+    ListWindows {
+        /// Every on-screen window with its layer (debugging popup detection).
+        #[arg(long)]
+        all: bool,
+    },
     /// Capture and encode one window to an Annex-B file, reporting encode latency.
     CaptureTest {
         /// Window id or a substring of its app name or title.
@@ -88,7 +93,13 @@ fn platform_main(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Status => setup::status(),
         Cmd::Uninstall { purge } => setup::uninstall(purge),
         Cmd::Unpair { .. } => unreachable!(),
-        Cmd::ListWindows => {
+        Cmd::ListWindows { all: true } => {
+            for w in windows::on_screen() {
+                println!("{:>6} pid {:>6} layer {:>5}  {:>7.1},{:>7.1} {:>6.1}x{:<6.1}", w.id, w.pid, w.layer, w.x, w.y, w.width, w.height);
+            }
+            Ok(())
+        }
+        Cmd::ListWindows { all: false } => {
             for w in windows::list()? {
                 println!("{:>6}  {}x{}  {:<24} {}", w.id, w.width, w.height, w.app_name, w.title);
             }
