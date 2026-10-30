@@ -132,3 +132,28 @@ To measure with steady frames, move the Mac pointer over a desktop stream, e.g.
 Every dependency is pinned to an exact version (`=x.y.z`) and `Cargo.lock` is committed, so
 nothing updates by accident. Build with `--locked`. To update a crate, change its pin
 deliberately, run `cargo update -p <crate>`, and review the lockfile diff.
+
+## Development
+
+`scripts/deploy-host.sh` builds the host on the Mac and installs it through `umac-host setup`.
+It takes the Mac and its accounts from the environment:
+
+    UMAC_MAC=mac.local UMAC_BUILD_USER=builder UMAC_GUI_USER=me scripts/deploy-host.sh
+
+`UMAC_SSH_KEY` optionally selects a private key. `scripts/gen-tray-masks.sh` regenerates the
+tray icon masks from `crates/client/assets/tray.svg` (needs Inkscape and ImageMagick).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this work, as defined in the Apache-2.0 license, shall be dual
+licensed as above, without any additional terms or conditions.
+
+Apple, Mac, macOS, ScreenCaptureKit and VideoToolbox are trademarks of Apple Inc. umac is an
+independent project, not affiliated with or endorsed by Apple. The tray icon is original
+artwork (a window with the Command key symbol) under the same license as the code.
