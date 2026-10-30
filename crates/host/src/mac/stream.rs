@@ -156,7 +156,7 @@ impl Shared {
 /// The one place that maps a negotiated codec to an implementation.
 fn create_encoder(codec: Codec, cfg: EncoderConfig, sink: crate::encode::FrameSink, knobs: &Arc<Knobs>) -> anyhow::Result<Box<dyn Encoder>> {
     match codec {
-        Codec::Hevc | Codec::H264 => Ok(Box::new(VtEncoder::new(codec, cfg, sink)?)),
+        Codec::Hevc | Codec::H264 | Codec::Mjpeg => Ok(Box::new(VtEncoder::new(codec, cfg, sink)?)),
         Codec::PyroWave => Ok(Box::new(PyroEncoder::new(cfg, sink, knobs.clone())?)),
     }
 }

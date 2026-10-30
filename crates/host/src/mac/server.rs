@@ -51,7 +51,7 @@ use crate::{
     status::Status,
 };
 
-const SUPPORTED: [Codec; 3] = [Codec::PyroWave, Codec::Hevc, Codec::H264];
+const SUPPORTED: [Codec; 4] = [Codec::PyroWave, Codec::Hevc, Codec::H264, Codec::Mjpeg];
 /// How often the PyroWave budget is re-evaluated from loss reports.
 const RATE_EVERY: Duration = Duration::from_millis(500);
 /// How often per-stream latency stats are reported.
@@ -88,6 +88,7 @@ enum SessionCmd {
 }
 
 pub async fn run(settings: Settings) -> anyhow::Result<()> {
+    super::videotoolbox::set_mjpeg_quality(settings.mjpeg_quality);
     let identity = Identity::load_or_create(&config::identity_dir()).context("loading host identity")?;
     let mut status = Status {
         pid: std::process::id(),

@@ -54,6 +54,10 @@ pub struct Settings {
     pub pyrowave_max_mbps: f64,
     /// Send only the PyroWave blocks touching changed regions (off: every block, for A/B).
     pub pyrowave_changed_only: bool,
+    /// Motion-JPEG quality, 0 to 1 (VideoToolbox rounds it to a few steps: 0.65 and 0.75
+    /// encode the same, as do 0.85 and 0.92). 0.75 keeps small text clean at 1080p in about
+    /// 170 to 290 KB per frame; 0.5 shows ringing around text.
+    pub mjpeg_quality: f64,
     /// Codec preference, most preferred first; the first one the client also supports wins.
     pub codecs: Vec<Codec>,
 }
@@ -70,7 +74,8 @@ impl Default for Settings {
             pyrowave_bpp: 3.0,
             pyrowave_max_mbps: 200.0,
             pyrowave_changed_only: true,
-            codecs: vec![Codec::PyroWave, Codec::Hevc, Codec::H264],
+            mjpeg_quality: 0.75,
+            codecs: vec![Codec::PyroWave, Codec::H264, Codec::Hevc, Codec::Mjpeg],
         }
     }
 }
@@ -116,5 +121,13 @@ mod tests {
         // A preference the build lacks is skipped; an empty list falls back to support order.
         assert_eq!(choose_codec(&[], &supported, &[Codec::H264, Codec::PyroWave]), Codec::PyroWave);
         assert_eq!(choose_codec(&prefs, &supported, &[]), Codec::H264);
+    }
+
+    #[test]
+    fn mjpeg_is_the_last_resort() {
+        let supported = [Codec::PyroWave, Codec::Hevc, Codec::H264, Codec::Mjpeg];
+        let prefs = Settings::default().codecs;
+        assert_eq!(choose_codec(&prefs, &supported, &[Codec::Mjpeg, Codec::H264]), Codec::H264);
+        assert_eq!(choose_codec(&prefs, &supported, &[Codec::Mjpeg]), Codec::Mjpeg);
     }
 }

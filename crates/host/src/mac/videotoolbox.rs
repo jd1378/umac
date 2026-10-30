@@ -1,6 +1,11 @@
-//! Hardware HEVC/H.264 encoding through VideoToolbox, tuned for latency over efficiency.
+//! Hardware HEVC/H.264 and Motion-JPEG encoding through VideoToolbox, tuned for latency over
+//! efficiency.
 
-use std::{ffi::c_void, ptr};
+use std::{
+    ffi::c_void,
+    ptr,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use anyhow::{Context, bail};
 use core_foundation::{
@@ -23,6 +28,13 @@ use crate::{
 struct Shared {
     codec: Codec,
     sink: FrameSink,
+}
+
+/// Motion-JPEG quality times 1000, from the host settings.
+static MJPEG_QUALITY_MILLI: AtomicU32 = AtomicU32::new(750);
+
+pub fn set_mjpeg_quality(quality: f64) {
+    MJPEG_QUALITY_MILLI.store((quality.clamp(0.05, 1.0) * 1000.0) as u32, Ordering::Relaxed);
 }
 
 pub struct VtEncoder {
@@ -50,13 +62,16 @@ impl VtEncoder {
         let codec_type = match codec {
             Codec::Hevc => kCMVideoCodecType_HEVC,
             Codec::H264 => kCMVideoCodecType_H264,
+            Codec::Mjpeg => kCMVideoCodecType_JPEG,
             Codec::PyroWave => bail!("PyroWave is not a VideoToolbox codec"),
         };
         let shared = Box::into_raw(Box::new(Shared { codec, sink }));
         // Low-latency rate control is not available for every codec/OS combination, so fall
         // back to plain real-time mode rather than failing the stream.
         let mut last_err = 0;
-        for low_latency in [true, false] {
+        // JPEG has no rate control to make low latency.
+        let modes: &[bool] = if codec == Codec::Mjpeg { &[false] } else { &[true, false] };
+        for &low_latency in modes {
             let mut spec = vec![(
                 unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder },
                 CFBoolean::true_value().as_CFType(),
@@ -84,7 +99,7 @@ impl VtEncoder {
                 )
             };
             if status == 0 && !session.is_null() {
-                if !low_latency {
+                if !low_latency && codec != Codec::Mjpeg {
                     tracing::warn!(?codec, "low-latency rate control unavailable, using plain real-time mode");
                 }
                 let enc = Self { session, shared, config, low_latency_rc: low_latency };
@@ -108,6 +123,9 @@ impl VtEncoder {
     fn configure(&self) -> anyhow::Result<()> {
         let c = self.config;
         let codec = unsafe { (*self.shared).codec };
+        if codec == Codec::Mjpeg {
+            return self.configure_jpeg();
+        }
         unsafe {
             self.set(kVTCompressionPropertyKey_RealTime, &CFBoolean::true_value().as_CFType())?;
             self.set(kVTCompressionPropertyKey_AllowFrameReordering, &CFBoolean::false_value().as_CFType())?;
@@ -127,6 +145,20 @@ impl VtEncoder {
             if let Err(e) = self.set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, &CFBoolean::true_value().as_CFType()) {
                 tracing::debug!("speed priority not supported: {e}");
             }
+            VTCompressionSessionPrepareToEncodeFrames(self.session);
+        }
+        Ok(())
+    }
+}
+
+impl VtEncoder {
+    /// Intra-only, quality driven; the capture's BT.709 tags carry over, and VideoToolbox
+    /// writes the samples in full range.
+    fn configure_jpeg(&self) -> anyhow::Result<()> {
+        let quality = MJPEG_QUALITY_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
+        unsafe {
+            self.set(kVTCompressionPropertyKey_RealTime, &CFBoolean::true_value().as_CFType())?;
+            self.set(kVTCompressionPropertyKey_Quality, &CFNumber::from(quality).as_CFType())?;
             VTCompressionSessionPrepareToEncodeFrames(self.session);
         }
         Ok(())
@@ -185,7 +217,8 @@ unsafe extern "C" fn output_callback(
         tracing::warn!(status, flags, "encoder dropped a frame");
         return;
     }
-    match unsafe { extract(sample, shared.codec) } {
+    let out = if shared.codec == Codec::Mjpeg { unsafe { extract_jpeg(sample) } } else { unsafe { extract(sample, shared.codec) } };
+    match out {
         Ok((data, keyframe)) => (shared.sink)(EncodedFrame { data, keyframe, capture_us: frame_refcon as usize as u64, encoded_us: clock::now_us(), pyro: None }),
         Err(e) => tracing::warn!("bad encoder output: {e}"),
     }
@@ -199,6 +232,26 @@ unsafe fn is_keyframe(sample: CMSampleBufferRef) -> bool {
         }
         let first = CFArrayGetValueAtIndex(attachments, 0) as CFDictionaryRef;
         CFDictionaryContainsKey(first, kCMSampleAttachmentKey_NotSync as *const c_void) == 0
+    }
+}
+
+/// A JPEG sample is the whole file; every frame stands on its own.
+unsafe fn extract_jpeg(sample: CMSampleBufferRef) -> anyhow::Result<(Vec<u8>, bool)> {
+    unsafe {
+        let block = CMSampleBufferGetDataBuffer(sample);
+        if block.is_null() {
+            bail!("no data buffer");
+        }
+        let len = CMBlockBufferGetDataLength(block);
+        let mut data = vec![0u8; len];
+        let st = CMBlockBufferCopyDataBytes(block, 0, len, data.as_mut_ptr().cast());
+        if st != 0 {
+            bail!("CMBlockBufferCopyDataBytes: {st}");
+        }
+        if !data.starts_with(&[0xFF, 0xD8]) {
+            bail!("encoder output is not a JPEG");
+        }
+        Ok((data, true))
     }
 }
 
@@ -314,5 +367,36 @@ mod tests {
                 f.write_all(&fr.data).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn mjpeg_encodes_one_baseline_jpeg_per_frame() {
+        let out: Arc<Mutex<Vec<(EncodedFrame, u64)>>> = Arc::default();
+        let o = out.clone();
+        let cfg = EncoderConfig { width: 1920, height: 1080, fps: 60, bitrate_kbps: 25_000 };
+        let mut enc = VtEncoder::new(Codec::Mjpeg, cfg, Box::new(move |f| {
+            let lat = clock::now_us() - f.capture_us;
+            o.lock().unwrap().push((f, lat));
+        }))
+        .unwrap();
+        for t in 0..30 {
+            let f = frame(1920, 1080, t);
+            enc.encode(f, clock::now_us(), false).unwrap();
+            unsafe { CVPixelBufferRelease(f) };
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        drop(enc);
+        let frames = std::mem::take(&mut *out.lock().unwrap());
+        assert_eq!(frames.len(), 30);
+        for (f, _) in &frames {
+            assert!(f.keyframe);
+            assert_eq!(&f.data[..2], &[0xFF, 0xD8]);
+            // Baseline frame header (SOF0) with 4:2:0 sampling: luma 2x2, chroma 1x1.
+            let sof = f.data.windows(2).position(|w| w == [0xFF, 0xC0]).expect("baseline SOF0");
+            assert_eq!([f.data[sof + 11], f.data[sof + 14], f.data[sof + 17]], [0x22, 0x11, 0x11]);
+        }
+        let mut lat: Vec<u64> = frames.iter().map(|f| f.1).collect();
+        lat.sort_unstable();
+        eprintln!("mjpeg {} B avg, latency us p50 {} p95 {}", frames.iter().map(|f| f.0.data.len()).sum::<usize>() / 30, lat[15], lat[28]);
     }
 }

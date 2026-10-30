@@ -34,6 +34,7 @@ impl CMTime {
 
 pub const kCMVideoCodecType_HEVC: u32 = u32::from_be_bytes(*b"hvc1");
 pub const kCMVideoCodecType_H264: u32 = u32::from_be_bytes(*b"avc1");
+pub const kCMVideoCodecType_JPEG: u32 = u32::from_be_bytes(*b"jpeg");
 #[cfg(test)]
 pub const kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: u32 = u32::from_be_bytes(*b"420v");
 pub const kVTEncodeInfo_FrameDropped: u32 = 1 << 1;
@@ -77,6 +78,7 @@ unsafe extern "C" {
     pub static kVTCompressionPropertyKey_DataRateLimits: CFStringRef;
     pub static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
     pub static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
+    pub static kVTCompressionPropertyKey_Quality: CFStringRef;
     pub static kVTCompressionPropertyKey_ColorPrimaries: CFStringRef;
     pub static kVTCompressionPropertyKey_TransferFunction: CFStringRef;
     pub static kVTCompressionPropertyKey_YCbCrMatrix: CFStringRef;
