@@ -2,6 +2,10 @@
 //! Intra-only frames have no reference chain, so loss only blurs blocks; the budget still
 //! drops quickly on loss (a congested link loses more) and creeps back.
 
+// The encoder side helpers here serve the PyroWave encoder; the session parts (rate
+// control, packet splitting) are used by every build.
+#![cfg_attr(not(feature = "pyrowave"), allow(dead_code))]
+
 use std::{
     ops::Range,
     time::{Duration, Instant},

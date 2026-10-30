@@ -5,7 +5,9 @@ fn main() {
         return;
     }
     swift_library_path();
-    pyrowave();
+    if std::env::var_os("CARGO_FEATURE_PYROWAVE").is_some() {
+        pyrowave();
+    }
 }
 
 // The screencapturekit crate only adds the Xcode.app Swift library path. With Command Line

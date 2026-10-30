@@ -1,0 +1,123 @@
+name: Release
+
+# A pushed tag vX.Y.Z builds, attests and publishes the release. A manual run only builds,
+# so the artifacts can be inspected without publishing anything.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Release binaries without debug info (the profile keeps it for local profiling).
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_STRIP: debuginfo
+
+jobs:
+  host:
+    name: umac-host, macOS arm64
+    runs-on: macos-15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Version
+        id: version
+        run: echo "version=$(scripts/release-version.sh)" >> "$GITHUB_OUTPUT"
+      - run: cargo build --locked --release -p umac-host
+      - name: Package
+        run: |
+          name="umac-host-${{ steps.version.outputs.version }}-macos-arm64"
+          mkdir -p "dist/$name"
+          cp target/release/umac-host LICENSE-MIT LICENSE-APACHE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: umac-host-macos-arm64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  client:
+    name: umac, Linux ${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    # Built on Ubuntu 22.04 so the binary runs on distributions with glibc 2.35 or newer.
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config clang
+      - name: Rust (toolchain from rust-toolchain.toml)
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Version
+        id: version
+        run: echo "version=$(scripts/release-version.sh)" >> "$GITHUB_OUTPUT"
+      - run: cargo build --locked --release -p umac-client
+      - name: Package
+        run: |
+          name="umac-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$name"
+          cp target/release/umac LICENSE-MIT LICENSE-APACHE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: umac-linux-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [host, client]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/SHA256SUMS
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true

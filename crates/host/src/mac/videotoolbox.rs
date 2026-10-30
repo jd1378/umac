@@ -8,19 +8,25 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+#[cfg(any(feature = "h264", feature = "hevc"))]
 use core_foundation::{
-    array::{CFArray, CFArrayGetCount, CFArrayGetValueAtIndex},
+    array::{CFArrayGetCount, CFArrayGetValueAtIndex},
+    dictionary::{CFDictionaryContainsKey, CFDictionaryRef},
+};
+use core_foundation::{
+    array::CFArray,
     base::{CFType, TCFType},
     boolean::CFBoolean,
-    dictionary::{CFDictionary, CFDictionaryContainsKey, CFDictionaryRef},
+    dictionary::CFDictionary,
     number::CFNumber,
     string::{CFString, CFStringRef},
 };
 use umac_proto::Codec;
 
 use super::ffi::*;
+#[cfg(any(feature = "h264", feature = "hevc"))]
+use crate::annexb::avcc_to_annexb;
 use crate::{
-    annexb::avcc_to_annexb,
     clock,
     encode::{EncodedFrame, Encoder, EncoderConfig, FrameSink},
 };
@@ -33,6 +39,7 @@ struct Shared {
 /// Motion-JPEG quality times 1000, from the host settings.
 static MJPEG_QUALITY_MILLI: AtomicU32 = AtomicU32::new(750);
 
+#[cfg(feature = "mjpeg")]
 pub fn set_mjpeg_quality(quality: f64) {
     MJPEG_QUALITY_MILLI.store((quality.clamp(0.05, 1.0) * 1000.0) as u32, Ordering::Relaxed);
 }
@@ -42,6 +49,7 @@ pub struct VtEncoder {
     shared: *mut Shared,
     config: EncoderConfig,
     #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(feature = "hevc"), allow(dead_code))]
     pub low_latency_rc: bool,
 }
 
@@ -217,13 +225,21 @@ unsafe extern "C" fn output_callback(
         tracing::warn!(status, flags, "encoder dropped a frame");
         return;
     }
-    let out = if shared.codec == Codec::Mjpeg { unsafe { extract_jpeg(sample) } } else { unsafe { extract(sample, shared.codec) } };
+    let out = match shared.codec {
+        #[cfg(feature = "mjpeg")]
+        Codec::Mjpeg => unsafe { extract_jpeg(sample) },
+        #[cfg(any(feature = "h264", feature = "hevc"))]
+        c @ (Codec::H264 | Codec::Hevc) => unsafe { extract(sample, c) },
+        #[allow(unreachable_patterns)]
+        other => Err(anyhow::anyhow!("{other:?} output is not supported by this build")),
+    };
     match out {
         Ok((data, keyframe)) => (shared.sink)(EncodedFrame { data, keyframe, capture_us: frame_refcon as usize as u64, encoded_us: clock::now_us(), pyro: None }),
         Err(e) => tracing::warn!("bad encoder output: {e}"),
     }
 }
 
+#[cfg(any(feature = "h264", feature = "hevc"))]
 unsafe fn is_keyframe(sample: CMSampleBufferRef) -> bool {
     unsafe {
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, 0);
@@ -236,6 +252,7 @@ unsafe fn is_keyframe(sample: CMSampleBufferRef) -> bool {
 }
 
 /// A JPEG sample is the whole file; every frame stands on its own.
+#[cfg(feature = "mjpeg")]
 unsafe fn extract_jpeg(sample: CMSampleBufferRef) -> anyhow::Result<(Vec<u8>, bool)> {
     unsafe {
         let block = CMSampleBufferGetDataBuffer(sample);
@@ -255,6 +272,7 @@ unsafe fn extract_jpeg(sample: CMSampleBufferRef) -> anyhow::Result<(Vec<u8>, bo
     }
 }
 
+#[cfg(any(feature = "h264", feature = "hevc"))]
 unsafe fn extract(sample: CMSampleBufferRef, codec: Codec) -> anyhow::Result<(Vec<u8>, bool)> {
     unsafe {
         let keyframe = is_keyframe(sample);
@@ -294,15 +312,25 @@ unsafe fn extract(sample: CMSampleBufferRef, codec: Codec) -> anyhow::Result<(Ve
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "hevc", feature = "mjpeg")))]
 mod tests {
+    #[cfg(feature = "hevc")]
+    use std::io::Write;
     use std::{
-        io::Write,
         sync::{Arc, Mutex},
         time::Duration,
     };
 
     use super::*;
+
+    /// CI runners are VMs without the hardware encoders: `UMAC_SKIP_HW_TESTS=1` skips these.
+    fn skip_hw() -> bool {
+        let skip = std::env::var_os("UMAC_SKIP_HW_TESTS").is_some();
+        if skip {
+            eprintln!("hardware encoder test skipped (UMAC_SKIP_HW_TESTS)");
+        }
+        skip
+    }
 
     /// IOSurface-backed NV12 frame with a moving gradient, like a capture would deliver.
     fn frame(w: usize, h: usize, t: usize) -> CVPixelBufferRef {
@@ -328,7 +356,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "hevc")]
     fn hevc_encodes_annexb_with_low_latency() {
+        if skip_hw() {
+            return;
+        }
         let out: Arc<Mutex<Vec<(EncodedFrame, u64)>>> = Arc::default();
         let o = out.clone();
         let cfg = EncoderConfig { width: 1920, height: 1080, fps: 60, bitrate_kbps: 25_000 };
@@ -370,7 +402,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mjpeg")]
     fn mjpeg_encodes_one_baseline_jpeg_per_frame() {
+        if skip_hw() {
+            return;
+        }
         let out: Arc<Mutex<Vec<(EncodedFrame, u64)>>> = Arc::default();
         let o = out.clone();
         let cfg = EncoderConfig { width: 1920, height: 1080, fps: 60, bitrate_kbps: 25_000 };

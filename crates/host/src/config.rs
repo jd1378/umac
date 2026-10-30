@@ -80,14 +80,9 @@ impl Default for Settings {
     }
 }
 
-/// The first codec in `prefs` that this build and the client both support.
-pub fn choose_codec(prefs: &[Codec], supported: &[Codec], client: &[Codec]) -> Codec {
-    prefs
-        .iter()
-        .chain(supported)
-        .copied()
-        .find(|c| supported.contains(c) && client.contains(c))
-        .unwrap_or(Codec::H264)
+/// The first codec in `prefs` that this build and the client both support, if any.
+pub fn choose_codec(prefs: &[Codec], supported: &[Codec], client: &[Codec]) -> Option<Codec> {
+    prefs.iter().chain(supported).copied().find(|c| supported.contains(c) && client.contains(c))
 }
 
 impl Settings {
@@ -115,19 +110,20 @@ mod tests {
     fn codec_choice_follows_host_preference_within_client_support() {
         let supported = [Codec::PyroWave, Codec::Hevc, Codec::H264];
         let prefs = Settings::default().codecs;
-        assert_eq!(choose_codec(&prefs, &supported, &[Codec::Hevc, Codec::PyroWave]), Codec::PyroWave);
-        assert_eq!(choose_codec(&prefs, &supported, &[Codec::Hevc, Codec::H264]), Codec::H264);
-        assert_eq!(choose_codec(&[Codec::Hevc], &supported, &[Codec::PyroWave, Codec::Hevc]), Codec::Hevc);
+        assert_eq!(choose_codec(&prefs, &supported, &[Codec::Hevc, Codec::PyroWave]), Some(Codec::PyroWave));
+        assert_eq!(choose_codec(&prefs, &supported, &[Codec::Hevc, Codec::H264]), Some(Codec::H264));
+        assert_eq!(choose_codec(&[Codec::Hevc], &supported, &[Codec::PyroWave, Codec::Hevc]), Some(Codec::Hevc));
         // A preference the build lacks is skipped; an empty list falls back to support order.
-        assert_eq!(choose_codec(&[], &supported, &[Codec::H264, Codec::PyroWave]), Codec::PyroWave);
-        assert_eq!(choose_codec(&prefs, &supported, &[]), Codec::H264);
+        assert_eq!(choose_codec(&[], &supported, &[Codec::H264, Codec::PyroWave]), Some(Codec::PyroWave));
+        assert_eq!(choose_codec(&prefs, &supported, &[]), None);
+        assert_eq!(choose_codec(&prefs, &[Codec::PyroWave], &[Codec::Hevc]), None);
     }
 
     #[test]
     fn mjpeg_is_the_last_resort() {
         let supported = [Codec::PyroWave, Codec::Hevc, Codec::H264, Codec::Mjpeg];
         let prefs = Settings::default().codecs;
-        assert_eq!(choose_codec(&prefs, &supported, &[Codec::Mjpeg, Codec::H264]), Codec::H264);
-        assert_eq!(choose_codec(&prefs, &supported, &[Codec::Mjpeg]), Codec::Mjpeg);
+        assert_eq!(choose_codec(&prefs, &supported, &[Codec::Mjpeg, Codec::H264]), Some(Codec::H264));
+        assert_eq!(choose_codec(&prefs, &supported, &[Codec::Mjpeg]), Some(Codec::Mjpeg));
     }
 }

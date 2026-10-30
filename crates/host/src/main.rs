@@ -1,10 +1,12 @@
 //! `umac-host`: streams individual macOS windows to paired clients.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
+#[cfg(any(feature = "h264", feature = "hevc"))]
 mod annexb;
 mod auth;
 mod clipboard;
 mod clock;
+mod codecs;
 mod config;
 mod cursor;
 mod encode;
@@ -123,6 +125,7 @@ fn platform_main(cmd: Cmd) -> anyhow::Result<()> {
                 (_, true) => umac_proto::Codec::PyroWave,
                 _ => umac_proto::Codec::Hevc,
             };
+            anyhow::ensure!(codecs::COMPILED.contains(&codec), "this build has no {codec:?} encoder (cargo feature `{}`)", codecs::feature(codec));
             capture_test::run(&window, seconds, &out, codec, bitrate_kbps, fps)
         }
     }

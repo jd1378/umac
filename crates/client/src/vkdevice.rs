@@ -19,19 +19,23 @@ static PRIORITY: [f32; 1] = [1.0];
 /// device).
 pub fn open(adapter: &wgpu::Adapter, want_dmabuf: bool) -> Option<Opened> {
     let hal = unsafe { adapter.as_hal::<Vulkan>() }?;
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(feature = "hevc")]
     let dmabuf = want_dmabuf && crate::zerocopy::supported(&hal);
-    #[cfg(not(feature = "ffmpeg"))]
+    #[cfg(not(feature = "hevc"))]
     let dmabuf = want_dmabuf && false;
+    #[cfg(feature = "h264")]
     let video_family = crate::vkvideo::decode_family(&hal);
+    #[cfg(not(feature = "h264"))]
+    let video_family: Option<u32> = None;
     if !dmabuf && video_family.is_none() {
         return None;
     }
     let mut extensions: Vec<&'static CStr> = Vec::new();
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(feature = "hevc")]
     if dmabuf {
         extensions.extend(crate::zerocopy::EXTENSIONS);
     }
+    #[cfg(feature = "h264")]
     if video_family.is_some() {
         extensions.extend(crate::vkvideo::EXTENSIONS);
     }

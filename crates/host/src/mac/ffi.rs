@@ -1,6 +1,8 @@
 //! Minimal C declarations for the VideoToolbox, CoreMedia, CoreVideo, CoreGraphics and
 //! Accessibility calls we use. Plain C APIs, stable across macOS releases.
 #![allow(non_upper_case_globals, non_snake_case, clippy::upper_case_acronyms)]
+// Declarations for every encoder; builds without some codec features leave theirs unused.
+#![allow(dead_code)]
 
 use std::ffi::c_void;
 

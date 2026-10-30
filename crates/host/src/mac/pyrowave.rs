@@ -11,8 +11,8 @@
 use std::{
     ffi::{CStr, c_char, c_int, c_void},
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::Ordering,
     },
 };
 
@@ -22,7 +22,7 @@ use umac_pyrowave_decode::{
     select::{self, Selector},
 };
 
-use super::ffi::CVPixelBufferRef;
+use super::{ffi::CVPixelBufferRef, knobs::Knobs};
 use crate::{
     clock,
     encode::{EncodedFrame, Encoder, EncoderConfig, FrameSink, PyroFrame},
@@ -145,33 +145,6 @@ fn device() -> anyhow::Result<sys::pyrowave_device> {
         check(r, "creating the PyroWave device").map(|_| Device(dev)).map_err(|e| format!("{e:#}"))
     });
     d.as_ref().map(|d| d.0).map_err(|e| anyhow!("{e}"))
-}
-
-/// Live encoder knobs, shared with the session so rate control applies without a restart.
-#[derive(Debug, Default)]
-pub struct Knobs {
-    /// Bits per pixel times 1000 (current, lowered on loss).
-    pub bpp_milli: AtomicU32,
-    /// Configured bits per pixel times 1000.
-    pub target_milli: AtomicU32,
-    /// Rate cap in bytes per frame for a changing window.
-    pub cap_bytes: AtomicU32,
-    /// The next encode is the one-off high quality frame of an idle window.
-    pub refine: std::sync::atomic::AtomicBool,
-    /// Largest packet that fits a datagram after the PyroWave header.
-    pub packet_boundary: AtomicU32,
-    /// Packets larger than the boundary (a single big block); sent split over datagrams.
-    pub oversized: AtomicU64,
-    /// Encode call durations in microseconds (submit to packets ready), drained by the session.
-    pub encode_us: Mutex<Vec<u32>>,
-    /// Send only blocks touching changed regions.
-    pub changed_only: std::sync::atomic::AtomicBool,
-    /// Changed regions of the frame being submitted, as ScreenCaptureKit reported them.
-    pub dirty: Mutex<Option<Vec<[f64; 4]>>>,
-    /// Blocks sent and blocks in the frames, and bytes sent, since the session last drained them.
-    pub kept_blocks: AtomicU64,
-    pub total_blocks: AtomicU64,
-    pub sent_bytes: AtomicU64,
 }
 
 pub struct PyroEncoder {

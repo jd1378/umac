@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}, default features
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config clang
+      - name: Rust (toolchain from rust-toolchain.toml)
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  linux-all-features:
+    # Ubuntu 22.04's ffmpeg (4.4) is too old for ffmpeg-next 9, so the HEVC path builds
+    # against RPM Fusion's ffmpeg on Fedora.
+    name: Linux ${{ matrix.arch }}, all features (Fedora)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container: fedora:44
+    steps:
+      - name: System packages
+        run: |
+          dnf install -y "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-44.noarch.rpm"
+          dnf install -y --allowerasing ffmpeg ffmpeg-devel libxkbcommon-devel wayland-devel clang pkgconf-pkg-config gcc git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust (toolchain from rust-toolchain.toml)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace --all-features
+
+  macos:
+    name: macOS host, ${{ matrix.features.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - name: default features
+            flags: ""
+          - name: all features
+            flags: --all-features
+    runs-on: macos-15
+    env:
+      # Runners are VMs without the hardware video encoders.
+      UMAC_SKIP_HW_TESTS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo clippy --locked -p umac-host --all-targets ${{ matrix.features.flags }} -- -D warnings
+      - run: cargo test --locked -p umac-host ${{ matrix.features.flags }}

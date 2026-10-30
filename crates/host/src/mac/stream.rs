@@ -12,10 +12,9 @@ use screencapturekit::prelude::{SCDisplay, SCWindow};
 use umac_proto::{Codec, WindowId};
 
 use super::{
-    pyrowave::{Knobs, PyroEncoder},
     capture::{Rect, WindowCapture},
     ffi::{CVPixelBufferGetHeight, CVPixelBufferGetWidth, CVPixelBufferRef, CVPixelBufferRelease, CVPixelBufferRetain},
-    videotoolbox::VtEncoder,
+    knobs::Knobs,
 };
 use crate::{
     clock,
@@ -156,8 +155,19 @@ impl Shared {
 /// The one place that maps a negotiated codec to an implementation.
 fn create_encoder(codec: Codec, cfg: EncoderConfig, sink: crate::encode::FrameSink, knobs: &Arc<Knobs>) -> anyhow::Result<Box<dyn Encoder>> {
     match codec {
-        Codec::Hevc | Codec::H264 | Codec::Mjpeg => Ok(Box::new(VtEncoder::new(codec, cfg, sink)?)),
-        Codec::PyroWave => Ok(Box::new(PyroEncoder::new(cfg, sink, knobs.clone())?)),
+        #[cfg(feature = "pyrowave")]
+        Codec::PyroWave => Ok(Box::new(super::pyrowave::PyroEncoder::new(cfg, sink, knobs.clone())?)),
+        #[cfg(feature = "h264")]
+        Codec::H264 => Ok(Box::new(super::videotoolbox::VtEncoder::new(codec, cfg, sink)?)),
+        #[cfg(feature = "hevc")]
+        Codec::Hevc => Ok(Box::new(super::videotoolbox::VtEncoder::new(codec, cfg, sink)?)),
+        #[cfg(feature = "mjpeg")]
+        Codec::Mjpeg => Ok(Box::new(super::videotoolbox::VtEncoder::new(codec, cfg, sink)?)),
+        #[allow(unreachable_patterns)]
+        other => {
+            let _ = (cfg, sink, knobs);
+            anyhow::bail!("this build has no {other:?} encoder (cargo feature `{}`)", crate::codecs::feature(other))
+        }
     }
 }
 

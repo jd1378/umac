@@ -51,7 +51,6 @@ use crate::{
     status::Status,
 };
 
-const SUPPORTED: [Codec; 4] = [Codec::PyroWave, Codec::Hevc, Codec::H264, Codec::Mjpeg];
 /// How often the PyroWave budget is re-evaluated from loss reports.
 const RATE_EVERY: Duration = Duration::from_millis(500);
 /// How often per-stream latency stats are reported.
@@ -88,6 +87,7 @@ enum SessionCmd {
 }
 
 pub async fn run(settings: Settings) -> anyhow::Result<()> {
+    #[cfg(feature = "mjpeg")]
     super::videotoolbox::set_mjpeg_quality(settings.mjpeg_quality);
     let identity = Identity::load_or_create(&config::identity_dir()).context("loading host identity")?;
     let mut status = Status {
@@ -221,7 +221,15 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
         conn.close(1u32.into(), b"rejected");
         return Ok(());
     }
-    let codec = crate::config::choose_codec(&shared.settings.codecs, &SUPPORTED, &hello.codecs);
+    let Some(codec) = crate::config::choose_codec(&shared.settings.codecs, crate::codecs::COMPILED, &hello.codecs) else {
+        let reason = crate::codecs::no_common(&hello.codecs);
+        tracing::warn!(client = %hello.client_name, "rejected: {reason}");
+        write_msg(&mut send, &HelloReply::Rejected { reason }).await?;
+        let _ = send.finish();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        conn.close(1u32.into(), b"no common codec");
+        return Ok(());
+    };
     write_msg(&mut send, &HelloReply::Accepted { host_name: shared.host_name.clone() }).await?;
     tracing::info!(client = %hello.client_name, remote = %conn.remote_address(), ?codec, "client connected");
 

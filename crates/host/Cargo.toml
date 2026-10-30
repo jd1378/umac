@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["pyrowave"]
+# Each codec is optional; PyroWave alone is the default. At least one is required.
+# PyroWave: the vendored Metal encoder (third_party/pyrowave-metal), built by build.rs.
+pyrowave = []
+# VideoToolbox encoders.
+h264 = []
+hevc = []
+mjpeg = []
+
 [dependencies]
 anyhow = "=1.0.104"
 clap = { version = "=4.6.7", features = ["derive"] }

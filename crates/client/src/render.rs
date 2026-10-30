@@ -2,7 +2,7 @@
 //! memory, or the decoder's own surface imported zero-copy) converted to RGB in the shader.
 
 use std::collections::HashMap;
-#[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+#[cfg(all(target_os = "linux", feature = "hevc"))]
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -56,10 +56,10 @@ fn fs_srgb(v: VsOut) -> @location(0) vec4<f32> {
 /// GPU objects shared by every window.
 pub struct Gpu {
     /// Declared first so it drops first: it destroys Vulkan objects on `device`.
-    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+    #[cfg(all(target_os = "linux", feature = "hevc"))]
     importer: Option<crate::zerocopy::Importer>,
     /// Vulkan Video H.264 decoding on this device, if it has a decode queue.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "h264"))]
     video: Option<std::sync::Arc<crate::vkvideo::Context>>,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -70,7 +70,7 @@ pub struct Gpu {
     sampler: wgpu::Sampler,
     pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     /// Consecutive zero-copy import or acquire failures.
-    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+    #[cfg(all(target_os = "linux", feature = "hevc"))]
     zc_failures: u32,
 }
 
@@ -97,31 +97,31 @@ impl Gpu {
         }))
         .context("no GPU adapter")?;
         tracing::info!(adapter = ?adapter.get_info().name, backend = ?adapter.get_info().backend, "GPU");
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", any(feature = "h264", feature = "hevc")))]
         let opened = crate::vkdevice::open(&adapter, decode::zero_copy_allowed());
-        #[cfg(target_os = "linux")]
-        let (zero_copy_device, video_family) = opened.as_ref().map_or((false, None), |o| (o.dmabuf, o.video_family));
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(target_os = "linux", any(feature = "h264", feature = "hevc")))]
+        let (zero_copy_device, _video_family) = opened.as_ref().map_or((false, None), |o| (o.dmabuf, o.video_family));
+        #[cfg(not(all(target_os = "linux", any(feature = "h264", feature = "hevc"))))]
         let zero_copy_device = false;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", any(feature = "h264", feature = "hevc")))]
         let opened = opened.map(|o| (o.device, o.queue));
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", any(feature = "h264", feature = "hevc"))))]
         let opened = None;
         let (device, queue) = match opened {
             Some(dq) => dq,
             None => pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?,
         };
-        #[cfg(target_os = "linux")]
-        let video = video_family.and_then(|f| {
+        #[cfg(all(target_os = "linux", feature = "h264"))]
+        let video = _video_family.and_then(|f| {
             crate::vkvideo::Context::new(&device, f).inspect_err(|e| tracing::warn!("Vulkan Video: {e:#}")).ok()
         });
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "h264"))]
         tracing::info!(h264 = video.is_some(), "Vulkan Video decoding");
-        #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+        #[cfg(all(target_os = "linux", feature = "hevc"))]
         let importer = zero_copy_device
             .then(|| crate::zerocopy::Importer::new(&device).inspect_err(|e| tracing::warn!("zero-copy importer: {e:#}")).ok())
             .flatten();
-        #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+        #[cfg(all(target_os = "linux", feature = "hevc"))]
         let zero_copy_device = importer.is_some();
         decode::set_zero_copy(zero_copy_device);
         tracing::info!(path = if zero_copy_device { "zero-copy dmabuf" } else { "copy" }, "decoded frames");
@@ -171,27 +171,27 @@ impl Gpu {
             shader,
             sampler,
             pipelines: HashMap::new(),
-            #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+            #[cfg(all(target_os = "linux", feature = "hevc"))]
             importer,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "h264"))]
             video,
-            #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+            #[cfg(all(target_os = "linux", feature = "hevc"))]
             zc_failures: 0,
         })
     }
 
     /// Drops the zero-copy state of a closed window.
     pub fn forget(&mut self, owner: u64) {
-        #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+        #[cfg(all(target_os = "linux", feature = "hevc"))]
         if let Some(i) = self.importer.as_mut() {
             i.forget(owner);
         }
-        #[cfg(not(all(target_os = "linux", feature = "ffmpeg")))]
+        #[cfg(not(all(target_os = "linux", feature = "hevc")))]
         let _ = owner;
     }
 
     /// Counts a zero-copy failure; too many in a row switch every decoder to copying.
-    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+    #[cfg(all(target_os = "linux", feature = "hevc"))]
     fn zero_copy_failed(&mut self, what: &str, e: &anyhow::Error) {
         self.zc_failures += 1;
         tracing::warn!(failures = self.zc_failures, "zero-copy {what} failed ({e:#}); copying this frame");
@@ -204,7 +204,7 @@ impl Gpu {
     /// Draws `frame` into `target`. An imported frame is acquired from the decoder before the
     /// submission and released back after it; if the acquire fails nothing samples it.
     fn draw(&mut self, target: &wgpu::TextureView, format: wgpu::TextureFormat, frame: Option<(&FrameTextures, Viewport)>) {
-        #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+        #[cfg(all(target_os = "linux", feature = "hevc"))]
         let imported = match frame {
             Some((FrameTextures { source: Source::Imported { frame: f, images }, .. }, _)) => {
                 match self.importer.as_mut().map(|i| i.acquire(*images)) {
@@ -242,7 +242,7 @@ impl Gpu {
             }
         }
         self.queue.submit([enc.finish()]);
-        #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+        #[cfg(all(target_os = "linux", feature = "hevc"))]
         if let (Some((f, images)), Some(importer)) = (imported, self.importer.as_mut())
             && let Err(e) = importer.release(images, f)
         {
@@ -288,28 +288,30 @@ struct FrameTextures {
 enum Source {
     Upload { y: wgpu::Texture, uv: wgpu::Texture },
     /// The window's PyroWave decoder output planes (owned by `WindowRenderer::pyro`).
+    #[cfg(feature = "pyrowave")]
     Pyro,
     /// The window's Vulkan Video decoder output planes (owned by `WindowRenderer::h264`).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "h264"))]
     H264,
     /// Sampled in place; each draw hands the frame to the importer until the GPU is done.
-    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+    #[cfg(all(target_os = "linux", feature = "hevc"))]
     Imported { frame: Arc<decode::dmabuf::DmabufFrame>, images: [ash::vk::Image; 2] },
 }
 
 /// Per-window presentation state.
 pub struct WindowRenderer {
     /// Window id, so the importer can tell this window's decoder surfaces apart.
-    #[cfg_attr(not(all(target_os = "linux", feature = "ffmpeg")), allow(dead_code))]
+    #[cfg_attr(not(all(target_os = "linux", feature = "hevc")), allow(dead_code))]
     owner: u64,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     frame: Option<FrameTextures>,
     fit: Fit,
     /// PyroWave decoder for this window and the bind group sampling its output planes.
+    #[cfg(feature = "pyrowave")]
     pyro: Option<(umac_pyrowave_decode::GpuDecoder, wgpu::BindGroup)>,
     /// Vulkan Video H.264 decoder for this window.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "h264"))]
     h264: Option<crate::vkvideo::Decoder>,
 }
 
@@ -340,8 +342,9 @@ impl WindowRenderer {
             config,
             frame: None,
             fit: Fit::Exact,
+            #[cfg(feature = "pyrowave")]
             pyro: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "h264"))]
             h264: None,
         }
     }
@@ -373,7 +376,7 @@ impl WindowRenderer {
     /// needs a keyframe to recover.
     pub fn upload(&mut self, gpu: &mut Gpu, picture: Picture) -> bool {
         match picture {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "h264"))]
             Picture::H264(job) => {
                 let Some(ctx) = gpu.video.clone() else {
                     tracing::warn!("H.264 frame but no Vulkan Video decoder");
@@ -401,6 +404,10 @@ impl WindowRenderer {
                 let (width, height) = decoder.size();
                 self.frame = Some(FrameTextures { source: Source::H264, bind_group: decoder.bind_group().clone(), width, height });
             }
+            // Never negotiated without the feature; frames would only come from a broken host.
+            #[cfg(not(feature = "pyrowave"))]
+            Picture::Pyro(_) => return false,
+            #[cfg(feature = "pyrowave")]
             Picture::Pyro(p) => {
                 if self.pyro.as_ref().is_none_or(|(d, _)| *d.layout() != p.layout) {
                     match umac_pyrowave_decode::GpuDecoder::new(&gpu.device, &gpu.queue, p.layout.clone()) {
@@ -428,7 +435,7 @@ impl WindowRenderer {
                 }
                 self.frame.as_ref().unwrap().write(gpu, &f);
             }
-            #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+            #[cfg(all(target_os = "linux", feature = "hevc"))]
             Picture::Dmabuf(f) => {
                 let Gpu { device, layout, sampler, importer, .. } = gpu;
                 let res = match importer.as_mut() {
@@ -477,6 +484,8 @@ impl WindowRenderer {
 
 impl FrameTextures {
     fn write(&self, gpu: &Gpu, f: &Nv12Frame) {
+        // The only kind of source in a Motion-JPEG-only build.
+        #[allow(irrefutable_let_patterns)]
         let Source::Upload { y, uv } = &self.source else { return };
         let (cw, ch) = (f.width.div_ceil(2), f.height.div_ceil(2));
         let write = |tex: &wgpu::Texture, data: &[u8], stride: usize, w: u32, h: u32| {
@@ -577,7 +586,7 @@ mod tests {
     }
 
     /// The zero-copy path must show exactly what the copy path shows.
-    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+    #[cfg(all(target_os = "linux", feature = "hevc"))]
     #[test]
     fn dmabuf_import_matches_copy() {
         use umac_proto::Codec;
@@ -622,7 +631,7 @@ mod tests {
 
     /// Vulkan Video must show what ffmpeg decodes from the same VideoToolbox stream. Needs a
     /// driver with H.264 Vulkan Video (on Fedora: RPM Fusion's mesa-vulkan-drivers-freeworld).
-    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+    #[cfg(all(target_os = "linux", feature = "hevc", feature = "h264"))]
     #[test]
     fn vulkan_h264_matches_ffmpeg() {
         use umac_proto::Codec;

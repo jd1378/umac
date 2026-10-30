@@ -7,6 +7,7 @@
 #   UMAC_BUILD_USER  account on the Mac with a Rust toolchain (builds there)
 #   UMAC_GUI_USER    account logged in on the Mac's screen (runs the agent)
 #   UMAC_SSH_KEY     optional private key; otherwise your ssh config and agent decide
+#   UMAC_FEATURES    optional extra codec features, e.g. h264,hevc,mjpeg (default: PyroWave only)
 set -euo pipefail
 : "${UMAC_MAC:?set UMAC_MAC to the Mac hostname or address}"
 : "${UMAC_BUILD_USER:?set UMAC_BUILD_USER to the Mac account that builds}"
@@ -23,7 +24,8 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 rsync -az --delete --exclude target --exclude .git -e "ssh ${ssh_opts[*]}" "$root/" "$build_user@$host:unified_mac/"
-ssh "${ssh_opts[@]}" "$build_user@$host" 'cd unified_mac && ~/.cargo/bin/cargo build --locked --release -q -p umac-host && ~/.cargo/bin/cargo test --locked -q -p umac-host 2>&1 | grep -E "test result|FAILED"; ~/.cargo/bin/cargo clippy -q -p umac-host --all-targets 2>&1 | grep -E "^(warning|error)" -A4 || true'
+features=${UMAC_FEATURES:+--features $UMAC_FEATURES}
+ssh "${ssh_opts[@]}" "$build_user@$host" "cd unified_mac && ~/.cargo/bin/cargo build --locked --release -q -p umac-host $features && ~/.cargo/bin/cargo test --locked -q -p umac-host $features 2>&1 | grep -E 'test result|FAILED'; ~/.cargo/bin/cargo clippy -q -p umac-host --all-targets $features 2>&1 | grep -E '^(warning|error)' -A4 || true"
 scp -q "${ssh_opts[@]}" "$build_user@$host:unified_mac/target/release/umac-host" "$tmp/umac-host"
 ssh "${ssh_opts[@]}" "$gui_user@$host" 'mkdir -p ~/.umac-staging && chmod 700 ~/.umac-staging'
 scp -q "${ssh_opts[@]}" "$tmp/umac-host" "$gui_user@$host:.umac-staging/umac-host"

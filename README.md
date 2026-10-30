@@ -1,23 +1,22 @@
 # umac
 
 Use apps from a headless Mac on your Linux desktop. Each Mac window opens as its own native
-window on Linux, with hardware video encoding on the Mac (VideoToolbox HEVC) and hardware
-decoding on the PC (VA-API, zero-copy into Vulkan), over an encrypted, certificate-pinned
-QUIC link on your LAN.
+window on Linux. Video is PyroWave, a low latency wavelet codec encoded on the Mac's GPU and
+decoded on the PC's GPU, over an encrypted, certificate-pinned QUIC link on your LAN.
 
 - Separate windows, not a remote desktop: menus, dropdowns, dialogs and sheets appear where
   they belong; new windows and the window the Mac focuses open automatically.
 - Whole-desktop mode when you want it (`umac desktop`).
 - Clipboard sync, Mac cursor shapes, key repeat, Linux-style shortcuts.
 - A tray icon for the common actions; one background process owns every window.
-- About 19 ms (p50) from the Mac compositing a frame to your screen, at 1080p over Wi-Fi.
+- About 15 ms (p50) from the Mac compositing a frame to your screen, at 1080p over Wi-Fi.
 
 ## Requirements
 
 - **Mac:** Apple Silicon, macOS 15 or newer (developed on macOS 27). A display or an HDMI
   dummy plug if it runs headless.
-- **PC:** Linux with a Wayland desktop (developed on Fedora with KDE Plasma) and a GPU with
-  VA-API HEVC decoding.
+- **PC:** Linux (x86_64 or aarch64) with a Wayland desktop (developed on Fedora with KDE
+  Plasma) and a Vulkan GPU.
 - Both on the same network; UDP port 47810 must reach the Mac.
 
 ## 1. Install on the Mac
@@ -30,10 +29,13 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/jd1378/umac/main/scripts
 
 [scripts/install-mac.sh](scripts/install-mac.sh) (read it first if you like):
 
-1. checks for Apple's Command Line Tools and offers to install Rust (rustup) if missing,
-2. downloads this repository and builds `umac-host`,
-3. runs `umac-host setup`, which installs the agent as a LaunchAgent and signs it locally so
+1. downloads the latest release, checks it against the release's `SHA256SUMS` and, if the
+   GitHub CLI (`gh`) is installed, its build provenance attestation,
+2. runs `umac-host setup`, which installs the agent as a LaunchAgent and signs it locally so
    macOS keeps its permissions across updates.
+
+`UMAC_VERSION=v0.2.0` installs a specific release. `UMAC_FROM_SOURCE=1` builds from source
+instead (Command Line Tools and Rust, offered if missing).
 
 The wizard asks you to allow **Screen & System Audio Recording** and **Accessibility** for
 `umac-host` in System Settings > Privacy & Security (do this over Screen Sharing), and checks
@@ -49,23 +51,30 @@ Run the same command again to update. `umac-host pair` prints a new pairing link
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/jd1378/umac/main/scripts/install-linux.sh)"
 ```
 
-[scripts/install-linux.sh](scripts/install-linux.sh) asks before anything that needs sudo:
+[scripts/install-linux.sh](scripts/install-linux.sh) downloads the latest release for your
+machine (x86_64 or aarch64), verifies it like the Mac script, installs `~/.local/bin/umac`, and
+offers to raise `net.core.rmem_max` so keyframe bursts are not dropped. The only runtime
+library it needs is libxkbcommon. It asks before anything that needs sudo. Run it again to
+update; `UMAC_VERSION` picks a release.
 
-1. installs build dependencies (ffmpeg with headers, libva, libxkbcommon, clang) with dnf,
-   apt or pacman; on Fedora, ffmpeg and hardware HEVC decoding come from
-   [RPM Fusion](https://rpmfusion.org) (`ffmpeg-devel`, `mesa-va-drivers-freeworld`),
-2. offers to install Rust (rustup) if missing,
-3. builds `umac` from this repository into `~/.local/bin/umac`,
-4. offers to raise `net.core.rmem_max` so keyframe bursts are not dropped.
+Building from source instead: `UMAC_FROM_SOURCE=1` (installs build packages and Rust, asking
+first), or by hand with `cargo build --locked --release -p umac-client`.
 
-Run it again to update.
+### Codecs
 
-Codecs, in order of preference: PyroWave (GPU compute, no extra libraries), H.264 through
-Vulkan Video (needs a driver that exposes it; on Fedora RPM Fusion's
-`mesa-vulkan-drivers-freeworld`), then HEVC and H.264 through ffmpeg/VA-API. The ffmpeg path
-is the `ffmpeg` cargo feature (on by default); `cargo build -p umac-client
---no-default-features` builds a client without ffmpeg. `UMAC_VULKAN_VIDEO=0` turns the Vulkan
-Video path off.
+Every codec is a cargo feature; release builds contain only PyroWave. Both ends offer what they
+were built with and use the first codec they share, in this order:
+
+| Feature | Codec | Mac | PC | Notes |
+|---|---|---|---|---|
+| `pyrowave` (default) | PyroWave | Metal compute (vendored encoder) | wgpu compute | Lowest latency, sharpest; about 25 to 200 Mbit/s |
+| `h264` | H.264 | VideoToolbox | Vulkan Video | Fallback for low bandwidth; the driver must expose H.264 decode (Fedora: RPM Fusion's `mesa-vulkan-drivers-freeworld`) |
+| `hevc` | HEVC (and H.264) | VideoToolbox | ffmpeg with VA-API | Needs ffmpeg development files to build (Fedora: RPM Fusion) |
+| `mjpeg` | Motion-JPEG | VideoToolbox | zune-jpeg on the CPU | Last resort |
+
+Add codecs with `--features h264,mjpeg` (or `UMAC_FEATURES=h264,mjpeg UMAC_FROM_SOURCE=1` in the
+install scripts). If the two ends share no codec, the Mac refuses the connection and names the
+features that would fix it. `UMAC_CODECS=h264` limits what a client offers, for testing.
 
 ## 3. Pair
 
@@ -151,7 +160,23 @@ Crates: `proto` (wire types), `transport` (QUIC, pinning, FEC video datagrams), 
 
 `UMAC_SSH_KEY` optionally selects a private key. `scripts/gen-tray-masks.sh` regenerates the
 tray icon masks from `crates/client/assets/tray.svg` (needs Inkscape and ImageMagick).
-PyroWave is reserved as a codec but not integrated; see [docs/pyrowave.md](docs/pyrowave.md).
+PyroWave integration notes: [docs/pyrowave-integration.md](docs/pyrowave-integration.md).
+
+`scripts/check-features.sh client` (on Linux) and `scripts/check-features.sh host` (on macOS)
+build, lint and test every codec feature combination. The Rust version is pinned in
+`rust-toolchain.toml`.
+
+### CI and releases
+
+`.github/workflows/ci.yml` lints and tests every push: the client on Linux x86_64 and aarch64
+(default features on Ubuntu 22.04, all features in a Fedora container for RPM Fusion's ffmpeg)
+and the host on macOS (default and all features).
+
+Pushing a tag `vX.Y.Z` runs `.github/workflows/release.yml`: it builds `umac-host` for macOS
+arm64 and `umac` for Linux x86_64 and aarch64 (default features, Ubuntu 22.04 so any glibc 2.35+
+distribution runs it), attests each archive's build provenance, and publishes them with
+`SHA256SUMS` as a GitHub release. Running the workflow by hand only builds. Verify a download
+yourself with `gh attestation verify <archive> --repo jd1378/umac`.
 
 ## License
 

@@ -1,10 +1,11 @@
 //! Codec-agnostic decoding. A decoder turns one encoded frame into one picture, with no
 //! reordering or buffering, so latency stays at a single frame.
 
-#[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+#[cfg(all(target_os = "linux", feature = "hevc"))]
 pub mod dmabuf;
-#[cfg(feature = "ffmpeg")]
+#[cfg(feature = "hevc")]
 mod ffmpeg;
+#[cfg(feature = "mjpeg")]
 pub mod mjpeg;
 
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -31,9 +32,9 @@ pub enum Picture {
     /// A validated PyroWave frame, decoded on the renderer's GPU when drawn.
     Pyro(crate::pyro::PyroPicture),
     /// A validated H.264 access unit, decoded with Vulkan Video on the renderer's GPU.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "h264"))]
     H264(Box<umac_h264::DecodeJob>),
-    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+    #[cfg(all(target_os = "linux", feature = "hevc"))]
     Dmabuf(dmabuf::DmabufFrame),
 }
 
@@ -42,9 +43,9 @@ impl Picture {
         match self {
             Picture::Cpu(f) => (f.width, f.height),
             Picture::Pyro(p) => (p.layout.width, p.layout.height),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "h264"))]
             Picture::H264(j) => j.sps.display_size(),
-            #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+            #[cfg(all(target_os = "linux", feature = "hevc"))]
             Picture::Dmabuf(f) => (f.width, f.height),
         }
     }
@@ -80,18 +81,23 @@ pub fn zero_copy_allowed() -> bool {
 /// (`UMAC_PYROWAVE=0` turns it off for comparisons). H.264 through Vulkan Video comes next,
 /// then what ffmpeg can decode, if built in.
 pub fn codecs() -> Vec<Codec> {
-    let pyro = std::env::var("UMAC_PYROWAVE").map_or(true, |v| v != "0") && pyrowave_gpu();
-    let mut c = if pyro { vec![Codec::PyroWave] } else { Vec::new() };
+    let mut c = Vec::new();
+    if cfg!(feature = "pyrowave") && std::env::var("UMAC_PYROWAVE").map_or(true, |v| v != "0") && pyrowave_gpu() {
+        c.push(Codec::PyroWave);
+    }
     if vulkan_h264() {
         c.push(Codec::H264);
     }
-    if cfg!(feature = "ffmpeg") {
+    // ffmpeg decodes H.264 too, used when Vulkan Video can't.
+    if cfg!(feature = "hevc") {
         c.push(Codec::Hevc);
         if !c.contains(&Codec::H264) {
             c.push(Codec::H264);
         }
     }
-    c.push(Codec::Mjpeg);
+    if cfg!(feature = "mjpeg") {
+        c.push(Codec::Mjpeg);
+    }
     match std::env::var("UMAC_CODECS") {
         Ok(only) => restrict(c, &only),
         Err(_) => c,
@@ -107,7 +113,7 @@ fn restrict(codecs: Vec<Codec>, only: &str) -> Vec<Codec> {
 /// Whether the GPU decodes H.264 with Vulkan Video (checked once). Fedora's stock Mesa leaves
 /// H.264 out; RPM Fusion's `mesa-vulkan-drivers-freeworld` has it.
 pub fn vulkan_h264() -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "h264"))]
     {
         static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *OK.get_or_init(|| {
@@ -118,8 +124,18 @@ pub fn vulkan_h264() -> bool {
             ok
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", feature = "h264")))]
     false
+}
+
+/// The cargo feature that builds `codec`'s decoder, for error messages.
+pub fn feature(codec: Codec) -> &'static str {
+    match codec {
+        Codec::PyroWave => "pyrowave",
+        Codec::H264 => "h264",
+        Codec::Hevc => "hevc",
+        Codec::Mjpeg => "mjpeg",
+    }
 }
 
 /// Whether a GPU adapter can run the PyroWave decoder (checked once).
@@ -144,7 +160,7 @@ pub trait Decoder: Send {
 
 /// An HEVC/H.264 decoder that always (or never) exports VA surfaces, regardless of the
 /// process-wide switch.
-#[cfg(all(test, feature = "ffmpeg"))]
+#[cfg(all(test, feature = "hevc"))]
 pub(crate) fn create_with_export(codec: Codec, export: bool) -> Result<Box<dyn Decoder>> {
     let mut d = ffmpeg::FfmpegDecoder::new(codec)?;
     d.export = Some(export);
@@ -156,26 +172,27 @@ pub fn create(codec: Codec, color: ColorFormat) -> Result<Box<dyn Decoder>> {
         bail!("{codec:?} streams are 4:2:0 only");
     }
     match codec {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "h264"))]
         Codec::H264 if vulkan_h264() => Ok(Box::new(H264Front::default())),
-        #[cfg(feature = "ffmpeg")]
+        #[cfg(feature = "hevc")]
         Codec::Hevc | Codec::H264 => Ok(Box::new(ffmpeg::FfmpegDecoder::new(codec)?)),
         Codec::PyroWave => bail!("PyroWave streams are decoded by the PyroWave path"),
+        #[cfg(feature = "mjpeg")]
         Codec::Mjpeg => Ok(Box::new(mjpeg::MjpegDecoder)),
         #[allow(unreachable_patterns)]
-        other => bail!("{other:?} is not supported by this build"),
+        other => bail!("{other:?} is not supported by this build (cargo feature `{}`)", feature(other)),
     }
 }
 
 /// The CPU half of Vulkan Video H.264 decoding: validates each access unit and tracks
 /// references, so the renderer only executes the job. Errors make the caller ask for a keyframe.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "h264"))]
 #[derive(Default)]
 struct H264Front {
     parser: umac_h264::Parser,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "h264"))]
 impl Decoder for H264Front {
     fn decode(&mut self, data: &[u8]) -> Result<Option<Picture>> {
         let job = self.parser.push(data)?;
@@ -191,7 +208,7 @@ impl Decoder for H264Front {
     }
 }
 
-#[cfg(all(test, feature = "ffmpeg"))]
+#[cfg(all(test, feature = "hevc"))]
 mod tests {
     use super::*;
     use crate::sample;
