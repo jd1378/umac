@@ -70,6 +70,19 @@ pub struct Gpu {
 }
 
 impl Gpu {
+    /// Bind group sampling a luma (R8) and CbCr (RG8) plane pair.
+    fn bind_planes(&self, y: &wgpu::TextureView, cbcr: &wgpu::TextureView) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("nv12"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(y) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(cbcr) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        })
+    }
+
     /// Creates the device, picking an adapter that can present to `surface` (the first window's).
     pub fn with_instance(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Result<Self> {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -256,6 +269,8 @@ struct FrameTextures {
 
 enum Source {
     Upload { y: wgpu::Texture, uv: wgpu::Texture },
+    /// The window's PyroWave decoder output planes (owned by `WindowRenderer::pyro`).
+    Pyro,
     /// Sampled in place; each draw hands the frame to the importer until the GPU is done.
     #[cfg(target_os = "linux")]
     Imported { frame: Arc<decode::dmabuf::DmabufFrame>, images: [ash::vk::Image; 2] },
@@ -269,6 +284,8 @@ pub struct WindowRenderer {
     config: wgpu::SurfaceConfiguration,
     frame: Option<FrameTextures>,
     fit: Fit,
+    /// PyroWave decoder for this window and the bind group sampling its output planes.
+    pyro: Option<(umac_pyrowave_decode::GpuDecoder, wgpu::BindGroup)>,
 }
 
 impl WindowRenderer {
@@ -292,7 +309,7 @@ impl WindowRenderer {
             color_space: Default::default(),
         };
         surface.configure(&gpu.device, &config);
-        Self { owner, surface, config, frame: None, fit: Fit::Exact }
+        Self { owner, surface, config, frame: None, fit: Fit::Exact, pyro: None }
     }
 
     pub fn set_fit(&mut self, fit: Fit) {
@@ -320,6 +337,26 @@ impl WindowRenderer {
 
     pub fn upload(&mut self, gpu: &mut Gpu, picture: Picture) {
         match picture {
+            Picture::Pyro(p) => {
+                if self.pyro.as_ref().is_none_or(|(d, _)| *d.layout() != p.layout) {
+                    match umac_pyrowave_decode::GpuDecoder::new(&gpu.device, &gpu.queue, p.layout.clone()) {
+                        Ok(d) => {
+                            let (y, c) = d.views();
+                            let bind_group = gpu.bind_planes(y, c);
+                            self.pyro = Some((d, bind_group));
+                        }
+                        Err(e) => {
+                            tracing::warn!("PyroWave decoder: {e}");
+                            return;
+                        }
+                    }
+                }
+                let (decoder, bind_group) = self.pyro.as_mut().unwrap();
+                // Same queue as the draw that follows, so the decode is ordered before it.
+                decoder.decode(&gpu.device, &gpu.queue, &p.frame);
+                let (width, height) = (p.layout.width, p.layout.height);
+                self.frame = Some(FrameTextures { source: Source::Pyro, bind_group: bind_group.clone(), width, height });
+            }
             Picture::Cpu(f) => {
                 let reusable = matches!(&self.frame, Some(t) if matches!(t.source, Source::Upload { .. }) && (t.width, t.height) == (f.width, f.height));
                 if !reusable {
@@ -404,21 +441,7 @@ impl FrameTextures {
         };
         let y = tex("y", wgpu::TextureFormat::R8Unorm, width, height);
         let uv = tex("uv", wgpu::TextureFormat::Rg8Unorm, width.div_ceil(2), height.div_ceil(2));
-        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("nv12"),
-            layout: &gpu.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&y.create_view(&Default::default())),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&uv.create_view(&Default::default())),
-                },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&gpu.sampler) },
-            ],
-        });
+        let bind_group = gpu.bind_planes(&y.create_view(&Default::default()), &uv.create_view(&Default::default()));
         FrameTextures { source: Source::Upload { y, uv }, bind_group, width, height }
     }
 }

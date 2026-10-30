@@ -147,6 +147,10 @@ pub enum ClientMsg {
     /// The user closed the window on the client: close it on the Mac too (its close button),
     /// which may show a save prompt first. Popups and desktops are only unsubscribed.
     CloseWindow { window: WindowId },
+    /// PyroWave receive report since the previous one (sent about every 500 ms while a stream
+    /// is active): datagrams received and datagrams missing from completed frames. The host
+    /// lowers the per frame budget on loss.
+    VideoFeedback { window: WindowId, received: u32, lost: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

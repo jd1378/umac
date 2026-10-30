@@ -26,6 +26,8 @@ pub struct Nv12Frame {
 /// A decoded picture: copied to CPU memory, or still in the decoder's GPU surface.
 pub enum Picture {
     Cpu(Nv12Frame),
+    /// A validated PyroWave frame, decoded on the renderer's GPU when drawn.
+    Pyro(crate::pyro::PyroPicture),
     #[cfg(target_os = "linux")]
     Dmabuf(dmabuf::DmabufFrame),
 }
@@ -34,6 +36,7 @@ impl Picture {
     pub fn size(&self) -> (u32, u32) {
         match self {
             Picture::Cpu(f) => (f.width, f.height),
+            Picture::Pyro(p) => (p.layout.width, p.layout.height),
             #[cfg(target_os = "linux")]
             Picture::Dmabuf(f) => (f.width, f.height),
         }
@@ -63,6 +66,29 @@ pub fn set_zero_copy(on: bool) {
 /// `UMAC_ZERO_COPY=0` forces the copy path, for comparisons.
 pub fn zero_copy_allowed() -> bool {
     std::env::var("UMAC_ZERO_COPY").map_or(true, |v| v != "0")
+}
+
+/// Codecs to offer the host, most preferred first. PyroWave needs no ffmpeg and decodes in
+/// well under a millisecond, so it leads whenever a GPU can run its compute decoder;
+/// `UMAC_PYROWAVE=0` turns it off for comparisons.
+pub fn codecs() -> Vec<Codec> {
+    let pyro = std::env::var("UMAC_PYROWAVE").map_or(true, |v| v != "0") && pyrowave_gpu();
+    let mut c = if pyro { vec![Codec::PyroWave] } else { Vec::new() };
+    c.extend([Codec::Hevc, Codec::H264]);
+    c
+}
+
+/// Whether a GPU adapter can run the PyroWave decoder (checked once).
+fn pyrowave_gpu() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return false };
+        let ok = adapter.limits().max_storage_buffers_per_shader_stage >= 6
+            && adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS);
+        tracing::info!(ok, adapter = ?adapter.get_info().name, "PyroWave GPU decoder");
+        ok
+    })
 }
 
 pub trait Decoder: Send {

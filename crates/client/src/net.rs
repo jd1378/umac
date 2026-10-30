@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use umac_proto::{
     ClientMsg, Codec, ColorFormat, DisplayInfo, Hello, HelloReply, HostMsg, InputEvent, LaunchAction, PROTOCOL_VERSION, WindowId,
     WindowInfo, WindowKind,
-    video::{HEADER_LEN, ShardHeader},
+    video::{self, HEADER_LEN, PYRO_HEADER_LEN, PyroHeader, ShardHeader},
 };
 use umac_transport::{
     SERVER_NAME, client_endpoint,
@@ -31,8 +31,12 @@ use crate::{
     gate::KeyframeGate,
     ids::{HostKey, IdMap},
     latency::{self, ClockSync, FrameTiming, HostStages},
+    pyro::{self, PyroRx},
     ui::{FrameSlot, UiEvent, UiSender},
 };
+
+/// How often PyroWave streams check for timed out frames and report loss.
+const PYRO_TICK: Duration = Duration::from_millis(2);
 
 /// Clock probes: a burst when the session starts, then a few every interval.
 const PROBE_EVERY: Duration = Duration::from_secs(2);
@@ -92,7 +96,7 @@ pub async fn connect(store: &Store, host: &HostEntry, pairing_token: Option<Stri
     let hello = Hello {
         version: PROTOCOL_VERSION,
         client_name: client_name(),
-        codecs: vec![Codec::Hevc, Codec::H264],
+        codecs: decode::codecs(),
         pairing_token,
     };
     write_msg(&mut ctrl_send, &hello).await?;
@@ -190,6 +194,8 @@ struct Stream {
     reassembler: Reassembler,
     gate: KeyframeGate,
     decode_tx: SyncSender<Arrived>,
+    /// PyroWave streams: frames are assembled here and decoded on the renderer's GPU.
+    pyro: Option<(PyroRx, Arc<FrameSlot>)>,
     /// When the first datagram of each frame still being assembled arrived.
     first_seen: HashMap<u32, Instant>,
     frames: u32,
@@ -257,6 +263,8 @@ async fn host_loop(
 
     let mut ctrl_send = session.ctrl_send;
     let mut tick = tokio::time::interval(TICK);
+    let mut pyro_tick = tokio::time::interval(PYRO_TICK);
+    pyro_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_stats = Instant::now();
     let mut clock = ClockSync::default();
     let mut probe = tokio::time::interval(PROBE_EVERY);
@@ -322,6 +330,17 @@ async fn host_loop(
                     Ok(d) => d,
                     Err(e) => bail!("connection lost: {e}"),
                 };
+                if video::is_pyro(&dgram) {
+                    let Ok(h) = PyroHeader::parse(&dgram) else { continue };
+                    let Some(s) = streams.get_mut(&h.window) else { continue };
+                    s.bytes += dgram.len() as u64;
+                    let now = Instant::now();
+                    let ready = s.pyro.as_mut().and_then(|(rx, _)| rx.push(&h, &dgram[PYRO_HEADER_LEN..], now));
+                    if let Some(r) = ready {
+                        deliver(s, r, &clock, ui, now);
+                    }
+                    continue;
+                }
                 let Ok(h) = ShardHeader::parse(&dgram) else { continue };
                 let Some(s) = streams.get_mut(&h.window) else { continue };
                 s.bytes += dgram.len() as u64;
@@ -443,7 +462,12 @@ async fn host_loop(
                             li.parent = parent.and_then(|p| ids.find(&ctx.key, p));
                             (local, li)
                         };
-                        let decode_tx = spawn_decoder(window, local, codec, color, ui.clone(), cmd_tx.clone())?;
+                        let (decode_tx, pyro) = if codec == Codec::PyroWave {
+                            tracing::info!(window, "decoder: pyrowave (GPU compute)");
+                            (sync_channel(1).0, Some((PyroRx::new(Instant::now()), Arc::new(FrameSlot::default()))))
+                        } else {
+                            (spawn_decoder(window, local, codec, color, ui.clone(), cmd_tx.clone())?, None)
+                        };
                         streams.insert(window, Stream {
                             parent,
                             pid: info.pid,
@@ -453,6 +477,7 @@ async fn host_loop(
                             reassembler: Reassembler::default(),
                             gate: KeyframeGate::new(Instant::now()),
                             decode_tx,
+                            pyro,
                             first_seen: HashMap::new(),
                             frames: 0,
                             bytes: 0,
@@ -540,9 +565,30 @@ async fn host_loop(
                     }
                 }
             }
+            _ = pyro_tick.tick() => {
+                let now = Instant::now();
+                let mut feedback = Vec::new();
+                for (&window, s) in streams.iter_mut() {
+                    let Some((rx, _)) = s.pyro.as_mut() else { continue };
+                    let ready = rx.poll(now);
+                    if let Some((received, lost)) = rx.feedback(now) {
+                        s.losses += lost;
+                        feedback.push(ClientMsg::VideoFeedback { window, received, lost });
+                    }
+                    if let Some(r) = ready {
+                        deliver(s, r, &clock, ui, now);
+                    }
+                }
+                for msg in feedback {
+                    write_msg(&mut ctrl_send, &msg).await?;
+                }
+            }
             _ = tick.tick() => {
                 let now = Instant::now();
                 for (&window, s) in streams.iter_mut() {
+                    if s.pyro.is_some() {
+                        continue;
+                    }
                     let mut request = false;
                     if s.reassembler.expire(now) {
                         s.losses += 1;
@@ -661,6 +707,16 @@ fn remove_with_popups(streams: &mut HashMap<WindowId, Stream>, window: WindowId)
     removed
 }
 
+/// Hands a ready PyroWave frame to the UI, which decodes it on its GPU when drawing.
+fn deliver(s: &mut Stream, r: pyro::Ready, clock: &ClockSync, ui: &UiSender, now: Instant) {
+    let Some((_, slot)) = s.pyro.as_ref() else { return };
+    let timing = FrameTiming { capture: clock.capture_instant(r.capture_us, now), first_datagram: r.first_datagram, complete: now, decoded: now };
+    s.frames += 1;
+    if slot.put(decode::Picture::Pyro(r.picture), timing) {
+        ui.send(UiEvent::Frame { window: s.local, slot: slot.clone() });
+    }
+}
+
 /// Decodes one window on its own thread. `window` is the Mac id (for keyframe requests),
 /// `local` the UI's id. A panic in the decoder closes only this window.
 fn spawn_decoder(
@@ -750,6 +806,7 @@ mod tests {
             reassembler: Reassembler::default(),
             gate: KeyframeGate::new(Instant::now()),
             decode_tx: sync_channel(1).0,
+            pyro: None,
             first_seen: HashMap::new(),
             frames: 0,
             bytes: 0,

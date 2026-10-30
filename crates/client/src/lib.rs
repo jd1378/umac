@@ -18,6 +18,7 @@ pub mod keymap;
 pub mod latency;
 pub mod manager;
 pub mod net;
+pub mod pyro;
 pub mod render;
 pub mod sample;
 pub mod shortcuts;

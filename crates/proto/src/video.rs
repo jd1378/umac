@@ -98,6 +98,10 @@ const PYRO_MAGIC: u8 = 0xB8;
 pub mod pyro_flags {
     /// 4:4:4 chroma; otherwise 4:2:0.
     pub const CHROMA_444: u8 = 1 << 0;
+    /// The encoder packet continues in the datagram with the next `packet_index`. A coded
+    /// block can exceed one datagram; such a packet is split, and the receiver joins the
+    /// pieces (in index order, until one without this flag) before parsing it.
+    pub const CONTINUED: u8 = 1 << 1;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -3307,6 +3307,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "umac-proto",
+ "umac-pyrowave-decode",
  "umac-transport",
  "url",
  "wgpu",
@@ -3319,6 +3320,7 @@ name = "umac-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "clap",
  "core-foundation 0.10.1",
  "core-graphics 0.25.0",
@@ -3340,6 +3342,16 @@ dependencies = [
  "postcard",
  "serde",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "umac-pyrowave-decode"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "pollster",
+ "thiserror 2.0.21",
+ "wgpu",
 ]
 
 [[package]]
