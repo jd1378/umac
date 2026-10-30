@@ -276,7 +276,12 @@ mod tests {
         assert!(try_lock(&dir).unwrap().is_none());
         assert!(is_running(&dir).unwrap());
         drop(first);
-        assert!(!is_running(&dir).unwrap());
+        // A process another test forks inherits the lock fd until it execs, so allow a moment.
+        let released = (0..50).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            !is_running(&dir).unwrap()
+        });
+        assert!(released);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
