@@ -4,6 +4,9 @@
 use umac_proto::keys::*;
 use winit::keyboard::KeyCode;
 
+/// evdev code of F11 (linux/input-event-codes.h), used locally to toggle fullscreen.
+pub const EVDEV_F11: u32 = 87;
+
 /// Linux evdev keycode (as sent by `wl_keyboard`, without the xkb +8 offset). Goes through
 /// winit's evdev table so both shells share one mapping.
 #[cfg(target_os = "linux")]

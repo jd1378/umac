@@ -82,6 +82,33 @@ pub enum WindowKind {
     Normal,
     /// Menus, tooltips, popovers: short lived, placed relative to `parent`.
     Popup,
+    /// A whole display, streamed with the Mac cursor drawn in.
+    Desktop,
+}
+
+/// Stream ids at or above this are displays, not windows. `CGWindowID`s stay far below it.
+pub const DESKTOP_ID_BASE: WindowId = 0x8000_0000;
+
+/// Stream id for display `index` (position in `HostMsg::Displays`).
+pub fn desktop_id(index: u32) -> WindowId {
+    DESKTOP_ID_BASE | (index & !DESKTOP_ID_BASE)
+}
+
+/// Display index of a desktop stream id, or `None` for a window id.
+pub fn desktop_index(id: WindowId) -> Option<u32> {
+    (id & DESKTOP_ID_BASE != 0).then_some(id & !DESKTOP_ID_BASE)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisplayInfo {
+    /// Index used by `SubscribeDisplay`; stable while the display set does not change.
+    pub index: u32,
+    pub name: String,
+    /// Size in pixels (backing store, so 2x points on HiDPI modes).
+    pub width: u32,
+    pub height: u32,
+    pub scale: f32,
+    pub main: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,6 +129,10 @@ pub enum ClientMsg {
     /// Decoder lost state (loss, corruption); next frame must be a keyframe.
     RequestKeyframe { window: WindowId },
     Ping { nonce: u64 },
+    ListDisplays,
+    /// Stream a whole display. The host replies with `StreamStarted` (kind `Desktop`, id from
+    /// [`desktop_id`]) or `Error`; all other messages then use that id.
+    SubscribeDisplay { index: u32, max_fps: u16, bitrate_kbps: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -126,6 +157,7 @@ pub enum HostMsg {
     /// A paste is about to happen on the Mac (e.g. a context-menu Paste item was clicked);
     /// the client answers with `InputEvent::SetClipboard` carrying the same nonce.
     ClipboardRequest { nonce: u64 },
+    Displays(Vec<DisplayInfo>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +212,16 @@ pub fn decode_body<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, CodecErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_ids_do_not_collide_with_windows() {
+        assert_eq!(desktop_index(desktop_id(0)), Some(0));
+        assert_eq!(desktop_index(desktop_id(3)), Some(3));
+        assert_eq!(desktop_index(612), None);
+        assert_eq!(desktop_index(DESKTOP_ID_BASE - 1), None);
+        // An out-of-range index never escapes into window id space.
+        assert!(desktop_index(desktop_id(u32::MAX)).is_some());
+    }
 
     #[test]
     fn frame_roundtrip() {

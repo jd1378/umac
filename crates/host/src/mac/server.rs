@@ -18,7 +18,7 @@ use tokio::{
 };
 use umac_proto::{
     ClientMsg, Codec, ColorFormat, Hello, HelloReply, HostMsg, InputEvent, MAX_CLIPBOARD_BYTES, PROTOCOL_VERSION,
-    WindowId, WindowInfo, WindowKind,
+    WindowId, WindowInfo, WindowKind, desktop_id,
 };
 use umac_transport::{
     Fingerprint, Identity,
@@ -28,7 +28,7 @@ use umac_transport::{
 };
 
 use super::{
-    capture::{Rect, display_at, find_window},
+    capture::{self, Rect, display_at, find_window},
     input::{self, ClipboardLink, Command, Reply, Target, Targets},
     pasteboard, permissions,
     stream::{StreamParams, WindowStream},
@@ -303,6 +303,8 @@ struct ActiveStream {
     inset: f64,
     /// Set for popups: the streamed window they belong to.
     popup_of: Option<WindowId>,
+    /// Set for desktop streams: the captured display (`CGDirectDisplayID`).
+    display: Option<u32>,
 }
 
 struct Session {
@@ -397,6 +399,21 @@ impl Session {
                 };
                 write_msg(send, &reply).await?;
             }
+            ClientMsg::ListDisplays => {
+                let reply = match tokio::task::spawn_blocking(capture::displays).await? {
+                    Ok(list) => HostMsg::Displays(windows::display_infos(&list)),
+                    Err(e) => HostMsg::Error { window: None, message: format!("{e:#}") },
+                };
+                write_msg(send, &reply).await?;
+            }
+            ClientMsg::SubscribeDisplay { index, max_fps, bitrate_kbps } => {
+                let window = desktop_id(index);
+                let reply = match self.subscribe_display(index, max_fps, bitrate_kbps).await {
+                    Ok(info) => HostMsg::StreamStarted { window, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info },
+                    Err(e) => HostMsg::Error { window: Some(window), message: format!("{e:#}") },
+                };
+                write_msg(send, &reply).await?;
+            }
             ClientMsg::Unsubscribe { window } => {
                 // Closing a popup on the client does not dismiss it on the Mac: a synthetic
                 // Escape could land in another window if the menu already closed itself. The
@@ -413,14 +430,19 @@ impl Session {
             }
             ClientMsg::Focus { window } => {
                 *self.shared.active.lock().unwrap() = Some(window);
-                if self.streams.get(&window).is_some_and(|s| s.popup_of.is_none()) {
-                    let _ = self.shared.input.send(Command::Focus(window));
+                let Some(s) = self.streams.get(&window) else { return Ok(()) };
+                if s.popup_of.is_none() {
+                    // A desktop has no window to raise; the user picks windows on the Mac.
+                    if s.display.is_none() {
+                        let _ = self.shared.input.send(Command::Focus(window));
+                    }
                     self.shared.clip.with_focus(|f| f.focus(self.id, window));
                 }
             }
             ClientMsg::Resize { window, width, height } => {
                 let Some(s) = self.streams.get(&window) else { return Ok(()) };
-                if s.popup_of.is_some() {
+                // Popups follow the Mac; a desktop is scaled on the client instead.
+                if s.popup_of.is_some() || s.display.is_some() {
                     return Ok(());
                 }
                 let (pid, scale) = (s.info.pid, s.info.scale.max(1.0) as f64);
@@ -472,13 +494,59 @@ impl Session {
         };
         self.set_target(&info, &geometry, inset);
         tracing::info!(window, app = %info.app_name, size = ?stream.size, inset, ?params, "stream started");
-        self.streams.insert(window, ActiveStream { stream, info: info.clone(), geometry, inset, popup_of: None });
+        self.streams.insert(window, ActiveStream { stream, info: info.clone(), geometry, inset, popup_of: None, display: None });
+        Ok(info)
+    }
+
+    async fn subscribe_display(&mut self, index: u32, max_fps: u16, bitrate_kbps: u32) -> anyhow::Result<WindowInfo> {
+        let window = desktop_id(index);
+        if let Some(s) = self.streams.get(&window) {
+            s.stream.request_keyframe();
+            return Ok(s.info.clone());
+        }
+        let params = StreamParams {
+            window,
+            codec: self.codec,
+            fps: (max_fps as u32).clamp(1, 120),
+            bitrate_kbps: self.shared.settings.clamp_bitrate(bitrate_kbps),
+        };
+        let tx = self.frames_tx.clone();
+        let on_encoded = Arc::new(move |w: WindowId, f: EncodedFrame| tx.try_send((w, f)).is_ok());
+        let (stream, display_id, name) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let list = capture::displays()?;
+            let d = list.get(index as usize).ok_or_else(|| anyhow!("no display {index}"))?;
+            let name = windows::display_infos(&list).swap_remove(index as usize).name;
+            Ok((WindowStream::start_display(d, params, on_encoded)?, d.display_id(), name))
+        })
+        .await??;
+        let (x, y, width, height) = windows::display_bounds(display_id);
+        let geometry = Geometry { x, y, width, height, title: name.clone(), on_screen: true };
+        let info = WindowInfo {
+            id: window,
+            pid: 0,
+            app_name: "Desktop".into(),
+            bundle_id: None,
+            title: name,
+            width: stream.size.0,
+            height: stream.size.1,
+            scale: stream.scale(),
+            parent: None,
+            offset: (0, 0),
+            kind: WindowKind::Desktop,
+        };
+        self.set_target(&info, &geometry, 0.0);
+        tracing::info!(window, display = display_id, size = ?stream.size, ?params, "desktop stream started");
+        self.streams.insert(
+            window,
+            ActiveStream { stream, info: info.clone(), geometry, inset: 0.0, popup_of: None, display: Some(display_id) },
+        );
         Ok(info)
     }
 
     fn set_target(&self, info: &WindowInfo, g: &Geometry, inset: f64) {
         if let Ok(mut t) = self.shared.targets.write() {
-            t.insert(info.id, Target { pid: info.pid, placement: g.placement(info.scale as f64, inset), popup: false });
+            let desktop = info.kind == WindowKind::Desktop;
+            t.insert(info.id, Target { pid: info.pid, placement: g.placement(info.scale as f64, inset), popup: false, desktop });
         }
     }
 
@@ -515,6 +583,10 @@ impl Session {
             if s.popup_of.is_some() {
                 continue;
             }
+            if let Some(display) = s.display {
+                self.poll_display(id, display, send).await?;
+                continue;
+            }
             let Some(g) = windows::geometry(id) else {
                 self.close(id, send).await?;
                 continue;
@@ -547,10 +619,34 @@ impl Session {
         Ok(())
     }
 
+    /// Follows a display resolution change; scale changes need a new stream (not handled).
+    async fn poll_display(&mut self, id: WindowId, display: u32, send: &mut Ctl) -> anyhow::Result<()> {
+        let (x, y, width, height) = windows::display_bounds(display);
+        let s = self.streams.get_mut(&id).unwrap();
+        if (x, y, width, height) == (s.geometry.x, s.geometry.y, s.geometry.width, s.geometry.height) {
+            return Ok(());
+        }
+        if width <= 0.0 || height <= 0.0 {
+            return self.close(id, send).await;
+        }
+        if let Err(e) = s.stream.set_region(Rect { x, y, width, height }) {
+            tracing::warn!(window = id, "resizing desktop capture: {e:#}");
+            return Ok(());
+        }
+        (s.geometry.x, s.geometry.y, s.geometry.width, s.geometry.height) = (x, y, width, height);
+        (s.info.width, s.info.height) = s.stream.size;
+        let (info, geometry) = (s.info.clone(), s.geometry.clone());
+        self.set_target(&info, &geometry, 0.0);
+        write_msg(send, &HostMsg::WindowChanged(info)).await?;
+        Ok(())
+    }
+
     /// Finds popups opened by streamed apps, follows their geometry and closes them when
     /// they disappear.
     async fn poll_popups(&mut self, send: &mut Ctl) -> anyhow::Result<()> {
-        let pids: HashSet<i32> = self.streams.values().filter(|s| s.popup_of.is_none()).map(|s| s.info.pid).collect();
+        // Desktop streams show popups as part of the display already.
+        let pids: HashSet<i32> =
+            self.streams.values().filter(|s| s.popup_of.is_none() && s.display.is_none()).map(|s| s.info.pid).collect();
         if pids.is_empty() && self.dismissed.is_empty() {
             return Ok(());
         }
@@ -581,7 +677,11 @@ impl Session {
 
     fn popup_parent(&self, pid: i32) -> Option<WindowId> {
         let candidates: Vec<Candidate> =
-            self.streams.values().map(|s| Candidate { id: s.info.id, pid: s.info.pid, popup_of: s.popup_of }).collect();
+            self.streams
+                .values()
+                .filter(|s| s.display.is_none())
+                .map(|s| Candidate { id: s.info.id, pid: s.info.pid, popup_of: s.popup_of })
+                .collect();
         popup::choose_parent(pid, *self.shared.active.lock().unwrap(), &candidates)
     }
 
@@ -636,7 +736,7 @@ impl Session {
         }
         let geometry = Geometry { x: w.x, y: w.y, width: w.width, height: w.height, title: String::new(), on_screen: true };
         self.set_popup_target(&info, &geometry);
-        self.streams.insert(id, ActiveStream { stream, info: info.clone(), geometry, inset: 0.0, popup_of: Some(parent) });
+        self.streams.insert(id, ActiveStream { stream, info: info.clone(), geometry, inset: 0.0, popup_of: Some(parent), display: None });
         write_msg(send, &HostMsg::StreamStarted { window: id, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info })
             .await?;
         Ok(())
@@ -645,7 +745,7 @@ impl Session {
     fn set_popup_target(&self, info: &WindowInfo, g: &Geometry) {
         if let Ok(mut t) = self.shared.targets.write() {
             let placement = Placement { x: g.x, y: g.y, width: g.width, height: g.height, scale: info.scale as f64 };
-            t.insert(info.id, Target { pid: info.pid, placement, popup: true });
+            t.insert(info.id, Target { pid: info.pid, placement, popup: true, desktop: false });
         }
     }
 

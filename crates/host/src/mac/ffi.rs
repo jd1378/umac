@@ -155,6 +155,7 @@ unsafe extern "C" {
     pub static kAXTrustedCheckOptionPrompt: CFStringRef;
     pub fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
     pub fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+    pub fn AXUIElementGetPid(el: AXUIElementRef, pid: *mut i32) -> AXError;
     pub fn AXUIElementCopyElementAtPosition(el: AXUIElementRef, x: f32, y: f32, out: *mut AXUIElementRef) -> AXError;
     pub fn AXUIElementCopyAttributeValue(el: AXUIElementRef, attr: CFStringRef, out: *mut CFTypeRef) -> AXError;
     pub fn AXUIElementSetAttributeValue(el: AXUIElementRef, attr: CFStringRef, value: CFTypeRef) -> AXError;

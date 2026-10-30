@@ -31,6 +31,8 @@ pub struct Target {
     pub pid: i32,
     pub placement: Placement,
     pub popup: bool,
+    /// A whole display: menus are part of the picture, so any click may hit one.
+    pub desktop: bool,
 }
 
 pub type Targets = Arc<RwLock<HashMap<WindowId, Target>>>;
@@ -219,17 +221,18 @@ impl Injector {
         let InputEvent::MouseButton { window, x, y, pressed: false, .. } = *ev else { return false };
         let Some(t) = self.target(window) else { return false };
         let pos = t.placement.to_global(x, y);
-        let Some(popup) = self.targets.read().ok().and_then(|ts| ts.values().find(|t| t.popup && t.placement.contains(pos)).copied())
-        else {
+        let popup_pid = self.targets.read().ok().and_then(|ts| ts.values().find(|t| t.popup && t.placement.contains(pos)).map(|t| t.pid));
+        if popup_pid.is_none() && !t.desktop {
             return false;
-        };
+        }
         let now = Instant::now();
-        let Some(item) = ax::menu_item_at(pos.0, pos.1) else { return false };
-        let titles = match self.paste_titles.get(&popup.pid) {
+        let Some((item, owner)) = ax::menu_item_at(pos.0, pos.1) else { return false };
+        let pid = popup_pid.unwrap_or(owner);
+        let titles = match self.paste_titles.get(&pid) {
             Some((at, t)) if now.duration_since(*at) < PASTE_TITLES_TTL => t,
             _ => {
-                let t = ax::paste_titles(popup.pid);
-                &self.paste_titles.entry(popup.pid).insert_entry((now, t)).into_mut().1
+                let t = ax::paste_titles(pid);
+                &self.paste_titles.entry(pid).insert_entry((now, t)).into_mut().1
             }
         };
         let paste = is_paste_item(&item, titles);

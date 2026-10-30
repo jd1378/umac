@@ -12,7 +12,7 @@ use core_graphics::window::{
     kCGWindowName, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use screencapturekit::prelude::*;
-use umac_proto::{WindowId, WindowInfo, WindowKind};
+use umac_proto::{DisplayInfo, WindowId, WindowInfo, WindowKind};
 
 use crate::input_state::Placement;
 
@@ -50,6 +50,40 @@ pub fn list() -> anyhow::Result<Vec<WindowInfo>> {
             })
         })
         .collect())
+}
+
+/// Client-facing description of each display, indexed by position in `displays`.
+pub fn display_infos(displays: &[SCDisplay]) -> Vec<DisplayInfo> {
+    let main = core_graphics::display::CGDisplay::main().id;
+    displays
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let f = d.frame();
+            let scale = display_scale(d.display_id());
+            DisplayInfo {
+                index: i as u32,
+                name: format!("Display {} ({}x{} pt)", d.display_id(), f.size.width, f.size.height),
+                width: (f.size.width * scale).round() as u32,
+                height: (f.size.height * scale).round() as u32,
+                scale: scale as f32,
+                main: d.display_id() == main,
+            }
+        })
+        .collect()
+}
+
+/// Global bounds of a display in points, cheap enough to poll.
+pub fn display_bounds(id: u32) -> (f64, f64, f64, f64) {
+    let b = core_graphics::display::CGDisplay::new(id).bounds();
+    (b.origin.x, b.origin.y, b.size.width, b.size.height)
+}
+
+fn display_scale(id: u32) -> f64 {
+    match core_graphics::display::CGDisplay::new(id).display_mode() {
+        Some(m) if m.width() > 0 => m.pixel_width() as f64 / m.width() as f64,
+        _ => 1.0,
+    }
 }
 
 fn main_display_scale() -> f64 {

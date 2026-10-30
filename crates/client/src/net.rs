@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc;
 use umac_proto::{
-    ClientMsg, Codec, ColorFormat, Hello, HelloReply, HostMsg, InputEvent, PROTOCOL_VERSION, WindowId,
+    ClientMsg, Codec, ColorFormat, DisplayInfo, Hello, HelloReply, HostMsg, InputEvent, PROTOCOL_VERSION, WindowId,
     WindowInfo, WindowKind,
     video::{HEADER_LEN, ShardHeader},
 };
@@ -92,6 +92,18 @@ pub async fn connect(store: &Store, host: &HostEntry, pairing_token: Option<Stri
 }
 
 impl Session {
+    pub async fn list_displays(&mut self) -> Result<Vec<DisplayInfo>> {
+        write_msg(&mut self.ctrl_send, &ClientMsg::ListDisplays).await?;
+        loop {
+            match read_msg(&mut self.ctrl_recv).await? {
+                Some(HostMsg::Displays(d)) => return Ok(d),
+                Some(HostMsg::Error { message, .. }) => bail!("host error: {message}"),
+                Some(_) => continue,
+                None => bail!("host closed the control stream"),
+            }
+        }
+    }
+
     pub async fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
         write_msg(&mut self.ctrl_send, &ClientMsg::ListWindows).await?;
         loop {
@@ -105,11 +117,26 @@ impl Session {
     }
 }
 
-/// Which windows to open.
+/// Which windows and displays to open.
 #[derive(Debug, Default, Clone)]
 pub struct Targets {
     pub windows: Vec<WindowId>,
     pub apps: Vec<String>,
+    /// Display indexes from `umac displays`, shown as whole desktops.
+    pub displays: Vec<u32>,
+    /// Desktop bitrate in kbit/s; derived from the display size when unset.
+    pub desktop_bitrate_kbps: Option<u32>,
+}
+
+/// Highest automatic desktop bitrate: the Mac may be on Wi-Fi, and FEC adds on top.
+const MAX_DESKTOP_KBPS: u32 = 80_000;
+const MIN_DESKTOP_KBPS: u32 = 5_000;
+
+/// Scales the per-window bitrate (meant for about 1080p) with the display's pixel count.
+pub fn desktop_bitrate(base_kbps: u32, width: u32, height: u32) -> u32 {
+    let pixels = width as u64 * height as u64;
+    let scaled = base_kbps as u64 * pixels / (1920 * 1080);
+    scaled.clamp(MIN_DESKTOP_KBPS as u64, MAX_DESKTOP_KBPS as u64) as u32
 }
 
 impl Targets {
@@ -148,11 +175,16 @@ pub async fn run_open(
     cmd_tx: mpsc::UnboundedSender<NetCmd>,
     mut cmd_rx: mpsc::UnboundedReceiver<NetCmd>,
 ) -> Result<()> {
-    let available = session.list_windows().await?;
-    let ids = targets.resolve(&available);
-    if ids.is_empty() {
-        bail!("no matching windows; see `umac list`");
-    }
+    let ids = if targets.windows.is_empty() && targets.apps.is_empty() {
+        Vec::new()
+    } else {
+        let ids = targets.resolve(&session.list_windows().await?);
+        if ids.is_empty() {
+            bail!("no matching windows; see `umac list`");
+        }
+        ids
+    };
+    let displays = if targets.displays.is_empty() { Vec::new() } else { session.list_displays().await? };
     let conn = session.conn.clone();
     let mut input = conn.open_uni().await?;
     let mut pending: HashSet<WindowId> = HashSet::new();
@@ -160,6 +192,13 @@ pub async fn run_open(
         let msg = ClientMsg::Subscribe { window, max_fps: cfg.max_fps, bitrate_kbps: cfg.bitrate_kbps };
         write_msg(&mut session.ctrl_send, &msg).await?;
         pending.insert(window);
+    }
+    for &index in &targets.displays {
+        let d = displays.iter().find(|d| d.index == index).with_context(|| format!("no display {index}; see `umac displays`"))?;
+        let bitrate_kbps = targets.desktop_bitrate_kbps.unwrap_or_else(|| desktop_bitrate(cfg.bitrate_kbps, d.width, d.height));
+        tracing::info!(display = index, w = d.width, h = d.height, bitrate_kbps, "opening desktop");
+        write_msg(&mut session.ctrl_send, &ClientMsg::SubscribeDisplay { index, max_fps: cfg.max_fps, bitrate_kbps }).await?;
+        pending.insert(umac_proto::desktop_id(index));
     }
 
     // read_msg is not cancel safe, so control messages get their own reader task.
@@ -402,6 +441,14 @@ fn spawn_decoder(
 mod tests {
     use super::*;
 
+    #[test]
+    fn desktop_bitrate_scales_with_pixels() {
+        assert_eq!(desktop_bitrate(25_000, 1920, 1080), 25_000);
+        assert_eq!(desktop_bitrate(25_000, 2560, 1440), 44_444);
+        assert_eq!(desktop_bitrate(25_000, 3840, 2160), MAX_DESKTOP_KBPS);
+        assert_eq!(desktop_bitrate(25_000, 640, 360), MIN_DESKTOP_KBPS);
+    }
+
     fn win(id: WindowId, app: &str, kind: WindowKind) -> WindowInfo {
         WindowInfo {
             id,
@@ -462,9 +509,9 @@ mod tests {
     #[test]
     fn resolves_targets() {
         let all = [win(1, "Safari", WindowKind::Normal), win(2, "Safari", WindowKind::Popup), win(3, "Notes", WindowKind::Normal)];
-        let t = Targets { windows: vec![3], apps: vec!["safari".into()] };
+        let t = Targets { windows: vec![3], apps: vec!["safari".into()], ..Default::default() };
         assert_eq!(t.resolve(&all), vec![1, 3]);
-        let t = Targets { windows: vec![], apps: vec!["com.example.Notes".into()] };
+        let t = Targets { windows: vec![], apps: vec!["com.example.Notes".into()], ..Default::default() };
         assert_eq!(t.resolve(&all), vec![3]);
         assert!(Targets::default().resolve(&all).is_empty());
     }

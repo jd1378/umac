@@ -50,6 +50,14 @@ pub fn find_window(id: WindowId) -> anyhow::Result<SCWindow> {
 const DISPLAY_CACHE: std::time::Duration = std::time::Duration::from_secs(10);
 static DISPLAYS: std::sync::Mutex<Option<(Vec<SCDisplay>, std::time::Instant)>> = std::sync::Mutex::new(None);
 
+/// Fresh list of displays (also refreshes the cache). Index order is what clients see.
+pub fn displays() -> anyhow::Result<Vec<SCDisplay>> {
+    let content = SCShareableContent::get().map_err(|e| anyhow!("listing shareable content: {e}"))?;
+    let list = content.displays();
+    *DISPLAYS.lock().unwrap() = Some((list.clone(), std::time::Instant::now()));
+    Ok(list)
+}
+
 /// The display containing the global point, or the first display.
 pub fn display_at(x: f64, y: f64) -> anyhow::Result<SCDisplay> {
     let mut cache = DISPLAYS.lock().unwrap();
@@ -135,10 +143,21 @@ impl WindowCapture {
     /// pixels instead of the menu. Popups sit on top, so the region shows the popup, with the
     /// real backdrop behind its rounded corners.
     pub fn start_region(display: &SCDisplay, rect: Rect, fps: u32, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
+        Self::region(display, rect, fps, false, on_frame)
+    }
+
+    /// Captures a whole display with the Mac cursor drawn in (desktop mode).
+    pub fn start_display(display: &SCDisplay, fps: u32, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
+        let f = display.frame();
+        let rect = Rect { x: f.origin.x, y: f.origin.y, width: f.size.width, height: f.size.height };
+        Self::region(display, rect, fps, true, on_frame)
+    }
+
+    fn region(display: &SCDisplay, rect: Rect, fps: u32, cursor: bool, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
         let filter = SCContentFilter::create().with_display(display).build().map_err(|e| anyhow!("content filter: {e}"))?;
         let scale = filter.point_pixel_scale().max(1.0);
         let d = display.frame().origin;
-        let mut config = stream_config(2, 2, fps)?;
+        let mut config = stream_config(2, 2, fps)?.with_shows_cursor(cursor);
         let size = apply_region(&mut config, rect, (d.x, d.y), scale as f64);
         let stream = open_stream(&filter, &config, on_frame)?;
         Ok((Self { stream, config, scale, inset: 0.0, display_origin: Some((d.x, d.y)) }, size))

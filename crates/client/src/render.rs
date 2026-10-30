@@ -5,7 +5,10 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 
-use crate::{decode::Nv12Frame, viewport::Viewport};
+use crate::{
+    decode::Nv12Frame,
+    viewport::{Fit, Viewport},
+};
 
 const SHADER: &str = r#"
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
@@ -180,6 +183,7 @@ pub struct WindowRenderer {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     frame: Option<FrameTextures>,
+    fit: Fit,
 }
 
 impl WindowRenderer {
@@ -203,7 +207,11 @@ impl WindowRenderer {
             color_space: Default::default(),
         };
         surface.configure(&gpu.device, &config);
-        Self { surface, config, frame: None }
+        Self { surface, config, frame: None, fit: Fit::Exact }
+    }
+
+    pub fn set_fit(&mut self, fit: Fit) {
+        self.fit = fit;
     }
 
     pub fn resize(&mut self, gpu: &Gpu, width: u32, height: u32) {
@@ -222,7 +230,7 @@ impl WindowRenderer {
 
     pub fn viewport(&self) -> Option<Viewport> {
         let (w, h) = self.frame_size()?;
-        Some(Viewport::fit(w, h, self.config.width, self.config.height))
+        Some(Viewport::new(self.fit, w, h, self.config.width, self.config.height))
     }
 
     pub fn upload(&mut self, gpu: &Gpu, f: &Nv12Frame) {
@@ -335,7 +343,7 @@ mod tests {
         let textures = FrameTextures::new(gpu, f.width, f.height);
         textures.write(gpu, f);
         let view = target.create_view(&Default::default());
-        gpu.draw(&view, format, Some((&textures, Viewport::fit(f.width, f.height, w, h))));
+        gpu.draw(&view, format, Some((&textures, Viewport::new(Fit::Exact, f.width, f.height, w, h))));
         let buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: (256 * h) as u64,

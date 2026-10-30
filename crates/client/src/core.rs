@@ -16,6 +16,7 @@ use crate::{
     decode::Nv12Frame,
     net::NetCmd,
     render::{Gpu, WindowRenderer},
+    viewport::Fit,
 };
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -54,6 +55,21 @@ pub fn title(info: &WindowInfo) -> String {
 /// Popup offset as sent by the host, clamped to a sane range.
 pub fn popup_offset(info: &WindowInfo) -> (i32, i32) {
     (info.offset.0.clamp(-MAX_OFFSET, MAX_OFFSET), info.offset.1.clamp(-MAX_OFFSET, MAX_OFFSET))
+}
+
+/// Top-level kinds the user opened; the session ends when none are left.
+fn is_toplevel(kind: WindowKind) -> bool {
+    matches!(kind, WindowKind::Normal | WindowKind::Desktop)
+}
+
+/// Size to open a window at. Windows match the remote surface exactly; a desktop is capped
+/// to 90% of the local output so a large Mac display still fits on screen.
+pub fn initial_size(info: &WindowInfo, output: Option<(u32, u32)>) -> (u32, u32) {
+    let size = (info.width.max(1), info.height.max(1));
+    let Some((ow, oh)) = output.filter(|_| info.kind == WindowKind::Desktop) else { return size };
+    let (max_w, max_h) = (ow as f64 * 0.9, oh as f64 * 0.9);
+    let scale = (max_w / size.0 as f64).min(max_h / size.1 as f64).min(1.0);
+    (((size.0 as f64 * scale).round() as u32).max(1), ((size.1 as f64 * scale).round() as u32).max(1))
 }
 
 /// What a shell should do after the host changed a window.
@@ -139,9 +155,12 @@ impl Core {
         }
         let gpu = self.gpu.as_mut().unwrap();
         let mut renderer = WindowRenderer::new(gpu, surface, size.0, size.1);
+        if info.kind == WindowKind::Desktop {
+            renderer.set_fit(Fit::Scale);
+        }
         // Wayland maps a window only after its first buffer.
         renderer.render(gpu);
-        if info.kind == WindowKind::Normal {
+        if is_toplevel(info.kind) {
             self.opened_any = true;
         }
         self.remotes.insert(
@@ -173,7 +192,7 @@ impl Core {
 
     /// True once every normal window that was opened is gone.
     pub fn should_exit(&self) -> bool {
-        self.opened_any && !self.remotes.values().any(|r| r.info.kind == WindowKind::Normal)
+        self.opened_any && !self.remotes.values().any(|r| is_toplevel(r.info.kind))
     }
 
     pub fn frame(&mut self, window: WindowId, frame: &Nv12Frame) {
@@ -203,7 +222,7 @@ impl Core {
     }
 
     /// The local window was resized (by the user or compositor). Normal windows ask the host
-    /// to follow once the size has been stable for a moment.
+    /// to follow once the size has been stable for a moment; desktops just rescale.
     pub fn resized(&mut self, window: WindowId, size: (u32, u32)) {
         let Some(r) = self.apply_size(window, size) else { return };
         if r.info.kind != WindowKind::Normal {
@@ -223,8 +242,8 @@ impl Core {
         let r = self.remotes.get_mut(&info.id)?;
         let host_size = (info.width.max(1), info.height.max(1));
         // Apps snap to their own size steps (Terminal cells, minimum sizes), so adopt the size
-        // the Mac settled on unless the user is still resizing.
-        let snap = (r.resize_due.is_none() && r.size != host_size).then_some(host_size);
+        // the Mac settled on unless the user is still resizing. Desktops keep the user's size.
+        let snap = (info.kind != WindowKind::Desktop && r.resize_due.is_none() && r.size != host_size).then_some(host_size);
         let reposition = info.kind == WindowKind::Popup
             && (info.offset != r.info.offset || (info.width, info.height) != (r.info.width, r.info.height));
         let (title, id) = (title(&info), info.id);
@@ -300,9 +319,13 @@ impl Core {
         }
     }
 
+    pub fn is_desktop(&self, window: WindowId) -> bool {
+        self.info(window).is_some_and(|i| i.kind == WindowKind::Desktop)
+    }
+
     /// Focus changes of popups are ignored: raising a menu's owner would dismiss the menu.
     pub fn focus(&mut self, window: WindowId, focused: bool) {
-        if self.info(window).is_none_or(|i| i.kind != WindowKind::Normal) {
+        if self.info(window).is_none_or(|i| !is_toplevel(i.kind)) {
             return;
         }
         if focused {
@@ -330,6 +353,31 @@ pub fn popup_anchor(offset: (i32, i32), parent: (u32, u32)) -> ((i32, i32), (i32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(kind: WindowKind, width: u32, height: u32) -> WindowInfo {
+        WindowInfo {
+            id: 1,
+            pid: 0,
+            app_name: String::new(),
+            bundle_id: None,
+            title: String::new(),
+            width,
+            height,
+            scale: 1.0,
+            parent: None,
+            offset: (0, 0),
+            kind,
+        }
+    }
+
+    #[test]
+    fn initial_size_caps_only_desktops() {
+        let out = Some((2560, 1440));
+        assert_eq!(initial_size(&info(WindowKind::Desktop, 3840, 2160), out), (2304, 1296));
+        assert_eq!(initial_size(&info(WindowKind::Desktop, 1920, 1080), out), (1920, 1080));
+        assert_eq!(initial_size(&info(WindowKind::Desktop, 1920, 1080), None), (1920, 1080));
+        assert_eq!(initial_size(&info(WindowKind::Normal, 3000, 2000), out), (3000, 2000));
+    }
 
     #[test]
     fn popup_anchor_inside_parent() {

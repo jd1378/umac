@@ -11,8 +11,8 @@ use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::PhysicalKey,
-    window::{Window, WindowId as LocalId},
+    keyboard::{KeyCode, PhysicalKey},
+    window::{Fullscreen, Window, WindowId as LocalId},
 };
 
 use crate::{
@@ -55,8 +55,9 @@ impl App {
     }
 
     fn open(&mut self, el: &ActiveEventLoop, info: WindowInfo) -> anyhow::Result<()> {
-        let size = PhysicalSize::new(info.width.max(1), info.height.max(1));
-        let mut attrs = Window::default_attributes().with_title(core::title(&info)).with_inner_size(size);
+        let output = el.primary_monitor().map(|m| (m.size().width, m.size().height));
+        let (w, h) = core::initial_size(&info, output);
+        let mut attrs = Window::default_attributes().with_title(core::title(&info)).with_inner_size(PhysicalSize::new(w, h));
         if info.kind == WindowKind::Popup {
             let parent = info.parent.and_then(|p| self.window(p)).context("popup parent is not shown")?;
             let origin = parent.inner_position().unwrap_or_default();
@@ -64,6 +65,10 @@ impl App {
             attrs = attrs.with_decorations(false).with_position(PhysicalPosition::new(origin.x + dx, origin.y + dy));
         }
         let window = Arc::new(el.create_window(attrs)?);
+        // A desktop stream has the Mac cursor drawn in.
+        if info.kind == WindowKind::Desktop {
+            window.set_cursor_visible(false);
+        }
         let surface = self.core.instance().create_surface(window.clone())?;
         let size = window.inner_size();
         let id = info.id;
@@ -162,6 +167,17 @@ impl ApplicationHandler<UiEvent> for App {
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32, true),
                 };
                 core.scroll(remote, dx, dy, precise);
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.physical_key == PhysicalKey::Code(KeyCode::F11) && core.is_desktop(remote) =>
+            {
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && let Some((_, window)) = self.windows.get(&id)
+                {
+                    let full = window.fullscreen().is_none().then_some(Fullscreen::Borderless(None));
+                    window.set_fullscreen(full);
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key

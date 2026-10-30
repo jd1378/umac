@@ -152,6 +152,14 @@ impl WindowStream {
         Ok(Self { capture, shared, size })
     }
 
+    /// Streams a whole display, cursor included.
+    pub fn start_display(display: &SCDisplay, params: StreamParams, on_encoded: OnEncoded) -> anyhow::Result<Self> {
+        let shared = Shared::new(params, on_encoded);
+        let s = shared.clone();
+        let (capture, size) = WindowCapture::start_display(display, params.fps, Box::new(move |buf, t| s.submit(buf, t)))?;
+        Ok(Self { capture, shared, size })
+    }
+
     pub fn set_region(&mut self, rect: Rect) -> anyhow::Result<()> {
         self.size = self.capture.set_region(rect)?;
         Ok(())

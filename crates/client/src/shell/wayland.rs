@@ -202,6 +202,7 @@ impl Shape {
 
 struct Node {
     shape: Shape,
+    fullscreen: bool,
     /// Waiting for the first configure before the first buffer may be attached.
     pending: Option<(WindowInfo, wgpu::Surface<'static>)>,
 }
@@ -273,7 +274,7 @@ impl State {
                 let (id, kind) = (info.id, info.kind);
                 if let Err(e) = self.open(info) {
                     tracing::warn!(window = id, "opening window: {e:#}");
-                    if kind == WindowKind::Normal {
+                    if kind != WindowKind::Popup {
                         self.core.close_requested(id);
                     }
                 }
@@ -295,7 +296,7 @@ impl State {
     fn open(&mut self, info: WindowInfo) -> Result<()> {
         anyhow::ensure!(!self.nodes.contains_key(&info.id), "window {} already shown", info.id);
         let shape = match info.kind {
-            WindowKind::Normal => {
+            WindowKind::Normal | WindowKind::Desktop => {
                 let surface = self.compositor.create_surface(&self.qh);
                 let window = self.xdg.create_window(surface, WindowDecorations::RequestServer, &self.qh);
                 window.set_title(core::title(&info));
@@ -313,7 +314,7 @@ impl State {
         };
         let surface = self.wgpu_surface(shape.wl_surface())?;
         self.surfaces.insert(shape.wl_surface().id(), info.id);
-        self.nodes.insert(info.id, Node { shape, pending: Some((info, surface)) });
+        self.nodes.insert(info.id, Node { shape, fullscreen: false, pending: Some((info, surface)) });
         Ok(())
     }
 
@@ -389,11 +390,33 @@ impl State {
         self.nodes.clear();
     }
 
+    /// Logical size of the biggest output, to keep a desktop window on screen.
+    fn largest_output(&self) -> Option<(u32, u32)> {
+        self.outputs
+            .outputs()
+            .filter_map(|o| self.outputs.info(&o)?.logical_size)
+            .map(|(w, h)| (w.max(0) as u32, h.max(0) as u32))
+            .max_by_key(|&(w, h)| w as u64 * h as u64)
+    }
+
+    /// F11 on a desktop window toggles fullscreen.
+    fn toggle_fullscreen(&mut self, id: WindowId) {
+        let Some(node) = self.nodes.get_mut(&id) else { return };
+        let Shape::Toplevel(w) = &node.shape else { return };
+        if node.fullscreen {
+            w.unset_fullscreen();
+        } else {
+            w.set_fullscreen(None);
+        }
+        node.fullscreen = !node.fullscreen;
+    }
+
     /// First configure attaches the renderer; later ones follow the compositor's size.
     fn configured(&mut self, id: WindowId, size: Option<(u32, u32)>) {
+        let output = self.largest_output();
         let Some(node) = self.nodes.get_mut(&id) else { return };
         if let Some((info, surface)) = node.pending.take() {
-            let size = size.unwrap_or((info.width.max(1), info.height.max(1)));
+            let size = size.unwrap_or_else(|| core::initial_size(&info, output));
             if let Err(e) = self.core.attach(info, surface, size) {
                 tracing::error!(window = id, "showing window: {e:#}");
                 self.core.close_requested(id);
@@ -450,8 +473,9 @@ impl PointerHandler for State {
             match e.kind {
                 PointerEventKind::Enter { .. } => {
                     // Seam for cursor shape sync: the host's cursor would be applied here.
+                    // A desktop stream has the Mac cursor drawn in, so hide ours there.
                     if let Some(p) = &self.pointer {
-                        let _ = p.set_cursor(conn, CursorIcon::Default);
+                        let _ = if self.core.is_desktop(id) { p.hide_cursor() } else { p.set_cursor(conn, CursorIcon::Default) };
                     }
                     self.core.pointer_moved(id, x, y);
                 }
@@ -539,6 +563,15 @@ impl KeyboardHandler for State {
 
 impl State {
     fn key(&mut self, evdev: u32, pressed: bool) {
+        if let Some(id) = self.kb_focus
+            && evdev == keymap::EVDEV_F11
+            && self.core.is_desktop(id)
+        {
+            if pressed {
+                self.toggle_fullscreen(id);
+            }
+            return;
+        }
         if let Some(id) = self.kb_focus
             && let Some(keycode) = keymap::evdev_to_mac(evdev, self.core.swap_ctrl_cmd())
         {

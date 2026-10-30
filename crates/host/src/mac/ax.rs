@@ -87,7 +87,8 @@ pub fn paste_titles(pid: i32) -> Vec<String> {
 }
 
 /// The menu item under a global point, or `None` when no menu item is there.
-pub fn menu_item_at(x: f64, y: f64) -> Option<MenuItem> {
+/// The menu item under a global point and the pid of the app that owns it.
+pub fn menu_item_at(x: f64, y: f64) -> Option<(MenuItem, i32)> {
     let system = Element(unsafe { AXUIElementCreateSystemWide() });
     let mut hit: AXUIElementRef = ptr::null();
     if unsafe { AXUIElementCopyElementAtPosition(system.0, x as f32, y as f32, &mut hit) } != 0 || hit.is_null() {
@@ -98,8 +99,10 @@ pub fn menu_item_at(x: f64, y: f64) -> Option<MenuItem> {
     for _ in 0..4 {
         if role(el.as_CFTypeRef()) == "AXMenuItem" {
             let item = menu_item(el.as_CFTypeRef());
-            tracing::debug!(?item, "menu item under pointer");
-            return Some(item);
+            let mut pid = 0;
+            unsafe { AXUIElementGetPid(el.as_CFTypeRef(), &mut pid) };
+            tracing::debug!(?item, pid, "menu item under pointer");
+            return Some((item, pid));
         }
         el = attr(el.as_CFTypeRef(), "AXParent")?;
     }
