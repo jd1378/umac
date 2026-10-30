@@ -17,6 +17,10 @@ pub enum UiEvent {
     Frame { window: WindowId, slot: Arc<FrameSlot> },
     Changed(WindowInfo),
     Closed(WindowId),
+    /// Asked to open a window that is already shown: bring it to the front.
+    Raise(WindowId),
+    /// Close a window as if the user clicked its close button (`umac close`).
+    CloseRequest(WindowId),
     Shutdown(String),
     /// The Mac clipboard changed: put this text on the local clipboard.
     Clipboard(String),

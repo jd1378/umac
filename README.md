@@ -27,17 +27,27 @@ native popups for Mac menus; `umac open --backend winit` selects the fallback sh
 
 Linux tip: raise `net.core.rmem_max` to 8 MiB or more so keyframe bursts are not dropped.
 
-## Tray
+## Daemon and tray
 
-`umac` on its own starts the tray in the background when a Mac is paired (pairing starts it
-too); if it already runs, it just says so. `umac daemon` runs it in the foreground. Left click
-opens Apps; the right-click menu has Apps, Open a terminal window, Show Desktop, Show task
-manager, Paired hosts and Exit. Each action is its own `umac` process (`umac launch apps|
-terminal|activity-monitor|finder`, `umac desktop`), so closing or crashing one never affects
-the tray; failures show as desktop notifications. Exit also closes the windows the tray
-opened (streams started with `umac open` on the command line keep running; Ctrl+C or
-SIGTERM closes those cleanly). On macOS 27 the Apps launcher is an
+One `umac daemon` process per user owns every stream window, the tray and the connection to
+each Mac. `umac` on its own starts it in the background when a Mac is paired (pairing starts
+it too). `umac open`, `launch`, `desktop`, `list` and `displays` talk to it over a private
+socket (`$XDG_RUNTIME_DIR/umac/daemon.sock`, same user only) and start it when needed, so a
+Mac window is never shown twice: asking for one that is already open brings it to the front.
+`umac status` lists the windows shown, `umac quit` stops the daemon and closes them all.
+The daemon needs a Wayland session; `--no-daemon` on `open`, `launch`, `desktop`, `list`
+and `displays` runs that one command in its own process instead (debugging, X11), ending
+with its last window.
+
+Left click on the tray opens Apps; the right-click menu has Apps, Open a terminal window,
+Show Desktop, Show task manager, Paired hosts and Exit, which closes every window and stops
+the daemon. Failures show as desktop notifications. On macOS 27 the Apps launcher is an
 overlay that cannot be streamed, so Apps shows a Finder window on /Applications instead.
+
+Closing a window here closes it on the Mac too, with its close button, so an unsaved
+document asks first (the prompt opens here as a dialog) and the window goes away once the
+Mac closed it. `"close_on_mac": false` only stops streaming instead. Popups and desktops
+are only stopped.
 
 Paired hosts lists every paired Mac as `name (address)`; the checked one is what the tray and
 any command without `--host` use (`"selected_host"` in config.json). The icon's line color

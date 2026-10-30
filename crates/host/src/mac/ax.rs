@@ -232,6 +232,16 @@ impl AxWindow {
         Ok(())
     }
 
+    /// Presses the window's close button, as a click on the red traffic light would.
+    pub fn close(&self) -> anyhow::Result<()> {
+        let button = attr(self.el(), "AXCloseButton").ok_or_else(|| anyhow!("window has no close button"))?;
+        let err = unsafe { AXUIElementPerformAction(button.as_CFTypeRef(), CFString::new("AXPress").as_concrete_TypeRef()) };
+        if err != 0 {
+            bail!("pressing the close button: AXError {err}");
+        }
+        Ok(())
+    }
+
     /// Height in points of a plain title bar above the window content, or 0 when the top of
     /// the window is interactive (unified toolbar, full-size content view) or unknown.
     /// The client draws its own title bar, so a plain macOS one would just be duplicated.

@@ -1,30 +1,34 @@
-//! `umac daemon`: the tray. One instance per user (file lock). Every action runs as its own
-//! `umac` process, so a crashing stream never takes the tray down.
+//! `umac daemon`: one process per user (file lock) that owns every stream window, the tray,
+//! the host sessions and the control socket the `umac` commands talk to.
 
 use std::{
     fs::File,
     os::fd::AsRawFd,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc;
+use umac_proto::LaunchAction;
 
 use crate::{
     config::Store,
+    core::Core,
+    ipc::{self, Reply, Request},
+    manager::Manager,
+    shell::{Backend, Shell},
     tray::{self, Action, Menu, Tray},
+    ui::{UiEvent, UiSender},
 };
 
 /// How often the menu picks up hosts paired or selected from the command line.
 const REFRESH: Duration = Duration::from_secs(2);
 /// A repeat of the same tray action within this window is ignored.
 const DEBOUNCE: Duration = Duration::from_millis(500);
-/// Stream processes started from the tray at once.
-const MAX_CHILDREN: usize = 16;
-/// Set on processes started from the tray: they report failures as desktop notifications.
-pub const NOTIFY_ENV: &str = "UMAC_NOTIFY";
+/// How long a command waits for a daemon it started to listen.
+const START_WAIT: Duration = Duration::from_secs(5);
 
 /// Held while the daemon runs; the lock is released when the file closes.
 pub struct InstanceLock(#[allow(dead_code)] File);
@@ -78,16 +82,37 @@ pub fn spawn_detached(config_dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// The `umac` arguments that perform a tray action against host `host`.
-pub fn action_args(action: &Action, host: &str) -> Option<Vec<String>> {
-    let launch = |what: &str| vec!["launch".into(), what.into(), "--host".into(), host.into()];
-    Some(match action {
-        Action::Apps => launch("apps"),
-        Action::Terminal => launch("terminal"),
-        Action::TaskManager => launch("activity-monitor"),
-        Action::Desktop => vec!["desktop".into(), "--host".into(), host.into()],
-        Action::SelectHost(_) | Action::Exit => return None,
-    })
+/// Sends `req` to the daemon, starting it first if it is not running.
+pub async fn request(store: &Store, config_dir: Option<&Path>, req: &Request) -> Result<Reply> {
+    let dir = lock_dir(store.dir());
+    match ipc::call(&dir, req).await {
+        Ok(reply) => return Ok(reply),
+        Err(e) if is_running(&dir)? => return Err(e.context("the daemon is running but did not answer")),
+        Err(_) => {}
+    }
+    spawn_detached(config_dir)?;
+    let deadline = Instant::now() + START_WAIT;
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match ipc::call(&dir, req).await {
+            Ok(reply) => return Ok(reply),
+            Err(e) if Instant::now() >= deadline => {
+                return Err(e.context("the daemon did not start; see ~/.local/state/umac/daemon.log"));
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Ends the shell when the process is asked to stop (SIGTERM, Ctrl+C).
+pub async fn shutdown_on_signal(ui: UiSender) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+    ui.send(UiEvent::Shutdown(String::new()));
 }
 
 fn menu(store: &Store) -> Menu {
@@ -96,26 +121,83 @@ fn menu(store: &Store) -> Menu {
     Menu::new(&hosts, selected.as_ref())
 }
 
-pub async fn run(store: Store, config_dir: Option<PathBuf>) -> Result<()> {
-    let Some(_lock) = try_lock(&lock_dir(store.dir()))? else {
+/// Runs the daemon on this thread (the Wayland event loop) until Exit, `umac quit` or a signal.
+pub fn run(rt: &tokio::runtime::Runtime, store: Store) -> Result<()> {
+    let dir = lock_dir(store.dir());
+    let Some(_lock) = try_lock(&dir)? else {
         println!("umac is already running in the tray");
         return Ok(());
     };
     let cfg = store.config()?;
+    let shell = Shell::new(Backend::Wayland).context("the umac daemon needs a Wayland session")?;
+    let ui = shell.sender();
+    let _rt = rt.enter();
+    let (manager, cmd_tx) = Manager::new(store.clone(), cfg.clone(), ui.clone());
+    let listener = ipc::bind(&dir)?;
+    rt.spawn(ipc::serve(listener, {
+        let (manager, store, ui) = (manager.clone(), store.clone(), ui.clone());
+        move |req| handle(req, manager.clone(), store.clone(), ui.clone())
+    }));
+    rt.spawn(tray_loop(store.clone(), cfg.tray_icon_color, manager.clone(), ui.clone()));
+    rt.spawn(shutdown_on_signal(ui));
+    tracing::info!("daemon ready");
+    let result = shell.run(Core::new(cfg, cmd_tx).persistent());
+    rt.block_on(manager.shutdown());
+    let _ = std::fs::remove_file(ipc::socket_path(&dir));
+    tracing::info!("daemon stopped");
+    match result? {
+        Some(e) => bail!(e),
+        None => Ok(()),
+    }
+}
+
+async fn handle(req: Request, manager: Manager, store: Store, ui: UiSender) -> Reply {
+    let done = |r: Result<String>| match r {
+        Ok(message) => Reply::Done { message },
+        Err(e) => Reply::Error { message: format!("{e:#}") },
+    };
+    match req {
+        Request::Open { host, windows, apps } => done(manager.open(host.as_deref(), windows, apps).await),
+        Request::Launch { host, action } => done(manager.launch(host.as_deref(), action).await),
+        Request::Desktop { host, display, bitrate_kbps } => done(manager.desktop(host.as_deref(), display, bitrate_kbps).await),
+        Request::List { host } => manager.list(host.as_deref()).await.map(|windows| Reply::Windows { windows }).unwrap_or_else(err),
+        Request::Displays { host } => manager.displays(host.as_deref()).await.map(|displays| Reply::Displays { displays }).unwrap_or_else(err),
+        Request::Hosts => store.hosts().map(|hosts| Reply::Hosts { hosts }).unwrap_or_else(err),
+        Request::Status => Reply::Status { windows: manager.status() },
+        Request::Close { host, window } => done(manager.close(host.as_deref(), window)),
+        Request::Quit => {
+            ui.send(UiEvent::Shutdown(String::new()));
+            Reply::Done { message: "umac stopped".into() }
+        }
+    }
+}
+
+fn err(e: anyhow::Error) -> Reply {
+    Reply::Error { message: format!("{e:#}") }
+}
+
+/// The tray: menu clicks act through the manager in this process. Exit stops the daemon.
+async fn tray_loop(store: Store, color: crate::config::TrayIconColor, manager: Manager, ui: UiSender) {
     let kdeglobals = dirs::config_dir().and_then(|d| std::fs::read_to_string(d.join("kdeglobals")).ok());
-    let icon = tray::icon::pixmaps(tray::icon::line_color(cfg.tray_icon_color, kdeglobals.as_deref()));
+    let icon = tray::icon::pixmaps(tray::icon::line_color(color, kdeglobals.as_deref()));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut shown = menu(&store);
-    let tray = Tray::spawn(icon, shown.clone(), tx).await?;
-    tracing::info!("tray ready");
-    let exe = std::env::current_exe()?;
-    let mut children: Vec<Child> = Vec::new();
+    let tray = match Tray::spawn(icon, shown.clone(), tx).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("no tray icon: {e:#}");
+            return;
+        }
+    };
     let mut last: Option<(Action, Instant)> = None;
     let mut tick = tokio::time::interval(REFRESH);
     loop {
         tokio::select! {
             Some(action) = rx.recv() => match action {
-                Action::Exit => break,
+                Action::Exit => {
+                    ui.send(UiEvent::Shutdown(String::new()));
+                    break;
+                }
                 Action::SelectHost(fp) => {
                     if let Err(e) = store.select_host(&fp) {
                         tracing::warn!("saving the selected host: {e:#}");
@@ -124,46 +206,30 @@ pub async fn run(store: Store, config_dir: Option<PathBuf>) -> Result<()> {
                     tray.set_menu(shown.clone()).await;
                 }
                 action => {
-                    // Any process on the session bus can trigger tray actions; a burst must not
-                    // turn into a pile of processes.
-                    children.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
+                    // Any process on the session bus can trigger tray actions; ignore bursts.
                     let now = Instant::now();
-                    if last.as_ref().is_some_and(|(a, t)| *a == action && now.duration_since(*t) < DEBOUNCE)
-                        || children.len() >= MAX_CHILDREN
-                    {
-                        tracing::info!(?action, children = children.len(), "ignoring repeated tray action");
+                    if last.as_ref().is_some_and(|(a, t)| *a == action && now.duration_since(*t) < DEBOUNCE) {
+                        tracing::info!(?action, "ignoring repeated tray action");
                         continue;
                     }
                     last = Some((action.clone(), now));
-                    let Ok(host) = store.host(None) else {
-                        tracing::warn!("no host selected; pick one under Paired hosts");
-                        continue;
-                    };
-                    let Some(args) = action_args(&action, &host.name) else { continue };
-                    tracing::info!(?action, host = %host.name, "starting");
-                    let child = Command::new(&exe)
-                        .args(base_args(config_dir.as_deref()))
-                        .args(&args)
-                        .env(NOTIFY_ENV, "1")
-                        .stdin(Stdio::null())
-                        .spawn();
-                    match child {
-                        Ok(c) => children.push(c),
-                        Err(e) => tracing::warn!("starting {args:?}: {e}"),
-                    }
+                    let manager = manager.clone();
+                    tokio::spawn(async move {
+                        let result = match action {
+                            Action::Apps => manager.launch(None, LaunchAction::Apps).await,
+                            Action::Terminal => manager.launch(None, LaunchAction::Terminal).await,
+                            Action::TaskManager => manager.launch(None, LaunchAction::ActivityMonitor).await,
+                            Action::Desktop => manager.desktop(None, None, None).await,
+                            Action::SelectHost(_) | Action::Exit => return,
+                        };
+                        if let Err(e) = result {
+                            tracing::warn!(?action, "{e:#}");
+                            notify("umac", &format!("{e:#}")).await;
+                        }
+                    });
                 }
             },
             _ = tick.tick() => {
-                children.retain_mut(|c| match c.try_wait() {
-                    Ok(Some(status)) => {
-                        if !status.success() {
-                            tracing::info!(pid = c.id(), %status, "action exited");
-                        }
-                        false
-                    }
-                    Ok(None) => true,
-                    Err(_) => false,
-                });
                 let fresh = menu(&store);
                 if fresh != shown {
                     shown = fresh;
@@ -173,31 +239,6 @@ pub async fn run(store: Store, config_dir: Option<PathBuf>) -> Result<()> {
         }
     }
     tray.shutdown().await;
-    close_children(&mut children).await;
-    tracing::info!("tray closed");
-    Ok(())
-}
-
-/// Asks every stream process started from the tray to close (SIGTERM: each one tells the Mac
-/// it is leaving), then kills whatever is still running after a grace period.
-async fn close_children(children: &mut Vec<Child>) {
-    const GRACE: Duration = Duration::from_secs(2);
-    for c in children.iter() {
-        if let Ok(pid) = i32::try_from(c.id()) {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-        }
-    }
-    let deadline = Instant::now() + GRACE;
-    while !children.is_empty() && Instant::now() < deadline {
-        children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    for c in children.iter_mut() {
-        tracing::warn!(pid = c.id(), "stream did not exit in time; killing it");
-        let _ = c.kill();
-        let _ = c.wait();
-    }
-    children.clear();
 }
 
 /// Shows a desktop notification (org.freedesktop.Notifications). Best effort.
@@ -236,14 +277,5 @@ mod tests {
         drop(first);
         assert!(!is_running(&dir).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn actions_map_to_commands() {
-        assert_eq!(action_args(&Action::Apps, "mac-a").unwrap(), ["launch", "apps", "--host", "mac-a"]);
-        assert_eq!(action_args(&Action::TaskManager, "mac-a").unwrap()[1], "activity-monitor");
-        assert_eq!(action_args(&Action::Desktop, "m").unwrap(), ["desktop", "--host", "m"]);
-        assert!(action_args(&Action::Exit, "m").is_none());
-        assert_eq!(base_args(Some(Path::new("/c"))), ["--config-dir", "/c"]);
     }
 }

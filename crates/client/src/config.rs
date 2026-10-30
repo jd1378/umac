@@ -35,6 +35,9 @@ pub struct Config {
     /// Open the window the Mac focuses when it is not shown yet: an app started from a
     /// streamed window, a password prompt or alert that pops up, a Cmd+Tab switch.
     pub follow_focus: bool,
+    /// Closing a window here closes it on the Mac too (its close button; unsaved documents ask
+    /// first). Off: closing only stops streaming it.
+    pub close_on_mac: bool,
     /// Log per-window latency stages every 2 s (also `--stats`).
     pub show_stats: bool,
     /// Keep every frame's stages for a summary when the session ends (`umac latency`).
@@ -65,6 +68,7 @@ impl Default for Config {
             tray_icon_color: TrayIconColor::Auto,
             follow_new_windows: true,
             follow_focus: true,
+            close_on_mac: true,
             show_stats: false,
             latency_summary: false,
         }
@@ -95,6 +99,7 @@ impl HostEntry {
     }
 }
 
+#[derive(Clone)]
 pub struct Store {
     dir: PathBuf,
 }

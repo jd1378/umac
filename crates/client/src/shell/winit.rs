@@ -140,7 +140,7 @@ impl ApplicationHandler<UiEvent> for App {
                 if let Err(e) = self.open(el, info) {
                     tracing::error!("opening window: {e:#}");
                     if !popup {
-                        self.core.close_requested(id);
+                        self.core.abandon(id);
                     }
                 }
             }
@@ -168,6 +168,16 @@ impl ApplicationHandler<UiEvent> for App {
                 }
             }
             UiEvent::Closed(window) => self.close(el, window),
+            UiEvent::CloseRequest(window) => {
+                if self.window(window).is_some() && self.core.close_requested(window) {
+                    self.close(el, window);
+                }
+            }
+            UiEvent::Raise(window) => {
+                if let Some(w) = self.window(window) {
+                    w.focus_window();
+                }
+            }
             UiEvent::Shutdown(reason) => {
                 if !reason.is_empty() {
                     self.core.error = Some(reason);
@@ -194,8 +204,9 @@ impl ApplicationHandler<UiEvent> for App {
         let core = &mut self.core;
         match event {
             WindowEvent::CloseRequested => {
-                core.close_requested(remote);
-                self.close(el, remote);
+                if core.close_requested(remote) {
+                    self.close(el, remote);
+                }
             }
             WindowEvent::Resized(size) => core.resized(remote, (size.width, size.height)),
             WindowEvent::RedrawRequested => core.redraw(remote),

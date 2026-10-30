@@ -3,16 +3,16 @@
 //! (through a [`UiSender`]) and [`NetCmd`].
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex,
         mpsc::{SyncSender, TrySendError, sync_channel},
     },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use umac_proto::{
     ClientMsg, Codec, ColorFormat, DisplayInfo, Hello, HelloReply, HostMsg, InputEvent, LaunchAction, PROTOCOL_VERSION, WindowId,
     WindowInfo, WindowKind,
@@ -26,9 +26,10 @@ use umac_transport::{
 };
 use crate::{
     config::{Config, HostEntry, Store},
-    core::MAX_POPUPS,
+    core::{self, MAX_POPUPS},
     decode,
     gate::KeyframeGate,
+    ids::{HostKey, IdMap},
     latency::{self, ClockSync, FrameTiming, HostStages},
     ui::{FrameSlot, UiEvent, UiSender},
 };
@@ -48,8 +49,6 @@ struct Arrived {
 }
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-/// The host waits up to 5 s for a launched app's window; allow for that plus the network.
-const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_millis(20);
 const STATS_EVERY: Duration = Duration::from_secs(5);
 /// Encoded frames queued for a decode thread. More means the decoder is behind; drop instead.
@@ -111,61 +110,6 @@ pub async fn connect(store: &Store, host: &HostEntry, pairing_token: Option<Stri
     }
 }
 
-impl Session {
-    pub async fn list_displays(&mut self) -> Result<Vec<DisplayInfo>> {
-        write_msg(&mut self.ctrl_send, &ClientMsg::ListDisplays).await?;
-        loop {
-            match read_msg(&mut self.ctrl_recv).await? {
-                Some(HostMsg::Displays(d)) => return Ok(d),
-                Some(HostMsg::Error { message, .. }) => bail!("host error: {message}"),
-                Some(_) => continue,
-                None => bail!("host closed the control stream"),
-            }
-        }
-    }
-
-    /// Asks the host to run `action` and returns the window it opened, ready to stream.
-    pub async fn launch(&mut self, action: LaunchAction) -> Result<WindowInfo> {
-        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
-        write_msg(&mut self.ctrl_send, &ClientMsg::Launch { nonce, action }).await?;
-        let answer = async {
-            loop {
-                match read_msg(&mut self.ctrl_recv).await? {
-                    Some(HostMsg::Launched { nonce: n, result }) if n == nonce => {
-                        return result.map_err(|e| anyhow::anyhow!("host could not launch {action:?}: {e}"));
-                    }
-                    Some(HostMsg::Error { message, .. }) => bail!("host error: {message}"),
-                    Some(_) => continue,
-                    None => bail!("host closed the control stream"),
-                }
-            }
-        };
-        tokio::time::timeout(LAUNCH_TIMEOUT, answer).await.context("host did not answer the launch in time")?
-    }
-
-    pub async fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
-        write_msg(&mut self.ctrl_send, &ClientMsg::ListWindows).await?;
-        loop {
-            match read_msg(&mut self.ctrl_recv).await? {
-                Some(HostMsg::Windows(w)) => return Ok(w),
-                Some(HostMsg::Error { message, .. }) => bail!("host error: {message}"),
-                Some(_) => continue,
-                None => bail!("host closed the control stream"),
-            }
-        }
-    }
-}
-
-/// Which windows and displays to open.
-#[derive(Debug, Default, Clone)]
-pub struct Targets {
-    pub windows: Vec<WindowId>,
-    pub apps: Vec<String>,
-    /// Display indexes from `umac displays`, shown as whole desktops.
-    pub displays: Vec<u32>,
-    /// Desktop bitrate in kbit/s; derived from the display size when unset.
-    pub desktop_bitrate_kbps: Option<u32>,
-}
 
 /// Highest automatic desktop bitrate: the Mac may be on Wi-Fi, and FEC adds on top.
 const MAX_DESKTOP_KBPS: u32 = 80_000;
@@ -178,21 +122,60 @@ pub fn desktop_bitrate(base_kbps: u32, width: u32, height: u32) -> u32 {
     scaled.clamp(MIN_DESKTOP_KBPS as u64, MAX_DESKTOP_KBPS as u64) as u32
 }
 
-impl Targets {
-    pub fn resolve(&self, available: &[WindowInfo]) -> Vec<WindowId> {
-        let mut ids: Vec<WindowId> = Vec::new();
-        for w in available {
-            let by_id = self.windows.contains(&w.id);
-            let by_app = w.kind == WindowKind::Normal
-                && self.apps.iter().any(|a| {
-                    w.app_name.eq_ignore_ascii_case(a) || w.bundle_id.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(a))
-                });
-            if (by_id || by_app) && !ids.contains(&w.id) {
-                ids.push(w.id);
-            }
+/// Windows matching explicit ids or apps (by name or bundle id; normal windows only).
+pub fn resolve(windows: &[WindowId], apps: &[String], available: &[WindowInfo]) -> Vec<WindowId> {
+    let mut ids: Vec<WindowId> = Vec::new();
+    for w in available {
+        let by_id = windows.contains(&w.id);
+        let by_app = w.kind == WindowKind::Normal
+            && apps.iter().any(|a| w.app_name.eq_ignore_ascii_case(a) || w.bundle_id.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(a)));
+        if (by_id || by_app) && !ids.contains(&w.id) {
+            ids.push(w.id);
         }
-        ids
     }
+    ids
+}
+
+pub type Reply<T> = oneshot::Sender<Result<T>>;
+
+/// Requests the manager hands to a host's session task.
+pub enum HostReq {
+    /// Streams windows by id or app; already shown ones are raised instead.
+    Open { windows: Vec<WindowId>, apps: Vec<String>, reply: Reply<String> },
+    Launch { action: LaunchAction, reply: Reply<String> },
+    /// A whole display (the main one when `display` is `None`).
+    Desktop { display: Option<u32>, bitrate_kbps: Option<u32>, reply: Reply<String> },
+    List { reply: Reply<Vec<WindowInfo>> },
+    Displays { reply: Reply<Vec<DisplayInfo>> },
+    /// Ends the session cleanly (daemon exit).
+    Close,
+}
+
+/// A request waiting for a `Windows` or `Displays` answer. The host answers list requests in
+/// order, so they queue up.
+enum Query {
+    List(Reply<Vec<WindowInfo>>),
+    Open { windows: Vec<WindowId>, apps: Vec<String>, reply: Reply<String> },
+    Displays(Reply<Vec<DisplayInfo>>),
+    Desktop { display: Option<u32>, bitrate_kbps: Option<u32>, reply: Reply<String> },
+}
+
+impl Query {
+    fn fail(self, e: String) {
+        match self {
+            Query::List(r) => drop(r.send(Err(anyhow::anyhow!(e)))),
+            Query::Open { reply, .. } | Query::Desktop { reply, .. } => drop(reply.send(Err(anyhow::anyhow!(e)))),
+            Query::Displays(r) => drop(r.send(Err(anyhow::anyhow!(e)))),
+        }
+    }
+}
+
+/// What a host's session task needs besides its connection.
+pub struct HostCtx {
+    pub key: HostKey,
+    pub ids: Arc<Mutex<IdMap>>,
+    pub ui: UiSender,
+    pub cfg: Config,
 }
 
 struct Stream {
@@ -202,6 +185,8 @@ struct Stream {
     kind: WindowKind,
     /// Opened by the host on its own (popup, new window, dialog), not requested here.
     auto: bool,
+    /// Id the UI knows this window by.
+    local: WindowId,
     reassembler: Reassembler,
     gate: KeyframeGate,
     decode_tx: SyncSender<Arrived>,
@@ -212,39 +197,41 @@ struct Stream {
     losses: u32,
 }
 
-pub async fn run_open(
-    mut session: Session,
-    targets: Targets,
-    cfg: Config,
-    ui: UiSender,
+/// One host's session: streams any number of windows until the connection drops or the
+/// manager closes it. Every window it showed is closed in the UI when it ends.
+pub async fn run_host(
+    session: Session,
+    ctx: HostCtx,
+    mut req_rx: mpsc::UnboundedReceiver<HostReq>,
     cmd_tx: mpsc::UnboundedSender<NetCmd>,
     mut cmd_rx: mpsc::UnboundedReceiver<NetCmd>,
 ) -> Result<()> {
-    let ids = if targets.windows.is_empty() && targets.apps.is_empty() {
-        Vec::new()
-    } else {
-        let ids = targets.resolve(&session.list_windows().await?);
-        if ids.is_empty() {
-            bail!("no matching windows; see `umac list`");
-        }
-        ids
-    };
-    let displays = if targets.displays.is_empty() { Vec::new() } else { session.list_displays().await? };
+    let conn = session.conn.clone();
+    let mut streams: HashMap<WindowId, Stream> = HashMap::new();
+    let result = host_loop(session, &ctx, &mut req_rx, &cmd_tx, &mut cmd_rx, &mut streams).await;
+    conn.close(0u32.into(), b"bye");
+    let gone = ctx.ids.lock().unwrap().release_host(&ctx.key);
+    for local in gone {
+        ctx.ui.send(UiEvent::Closed(local));
+    }
+    result
+}
+
+async fn host_loop(
+    session: Session,
+    ctx: &HostCtx,
+    req_rx: &mut mpsc::UnboundedReceiver<HostReq>,
+    cmd_tx: &mpsc::UnboundedSender<NetCmd>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<NetCmd>,
+    streams: &mut HashMap<WindowId, Stream>,
+) -> Result<()> {
+    let (cfg, ui) = (&ctx.cfg, &ctx.ui);
     let conn = session.conn.clone();
     let mut input = conn.open_uni().await?;
     let mut pending: HashSet<WindowId> = HashSet::new();
-    for &window in &ids {
-        let msg = ClientMsg::Subscribe { window, max_fps: cfg.max_fps, bitrate_kbps: cfg.bitrate_kbps };
-        write_msg(&mut session.ctrl_send, &msg).await?;
-        pending.insert(window);
-    }
-    for &index in &targets.displays {
-        let d = displays.iter().find(|d| d.index == index).with_context(|| format!("no display {index}; see `umac displays`"))?;
-        let bitrate_kbps = targets.desktop_bitrate_kbps.unwrap_or_else(|| desktop_bitrate(cfg.bitrate_kbps, d.width, d.height));
-        tracing::info!(display = index, w = d.width, h = d.height, bitrate_kbps, "opening desktop");
-        write_msg(&mut session.ctrl_send, &ClientMsg::SubscribeDisplay { index, max_fps: cfg.max_fps, bitrate_kbps }).await?;
-        pending.insert(umac_proto::desktop_id(index));
-    }
+    let mut queries: VecDeque<Query> = VecDeque::new();
+    let mut launches: HashMap<u64, (LaunchAction, Reply<String>)> = HashMap::new();
+    let mut nonce = 0u64;
 
     // read_msg is not cancel safe, so control messages get their own reader task.
     let (host_tx, mut host_rx) = mpsc::channel::<HostMsg>(64);
@@ -258,33 +245,72 @@ pub async fn run_open(
                     }
                 }
                 Ok(None) => break,
+                // Also how it ends when we close the session ourselves; the session loop
+                // reports real failures.
                 Err(e) => {
-                    tracing::warn!("control stream: {e}");
+                    tracing::debug!("control stream: {e}");
                     break;
                 }
             }
         }
     });
 
-    let mut streams: HashMap<WindowId, Stream> = HashMap::new();
     let mut ctrl_send = session.ctrl_send;
     let mut tick = tokio::time::interval(TICK);
     let mut last_stats = Instant::now();
-    // SIGTERM (tray Exit) and Ctrl+C end the session cleanly, so the Mac stops streaming at
-    // once instead of waiting for the connection to time out.
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut clock = ClockSync::default();
     let mut probe = tokio::time::interval(PROBE_EVERY);
     let mut probe_nonce = 0u64;
     if cfg.show_stats {
         write_msg(&mut ctrl_send, &ClientMsg::WantStats { on: true }).await?;
     }
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
+    // Streams a Mac window, or brings it to the front if it is already shown.
+    macro_rules! show {
+        ($mac:expr) => {{
+            let mac: WindowId = $mac;
+            match plan_show(streams, &pending, mac) {
+                Show::Raise(local) => {
+                    ui.send(UiEvent::Raise(local));
+                }
+                Show::Subscribe => {
+                    pending.insert(mac);
+                    write_msg(&mut ctrl_send, &ClientMsg::Subscribe { window: mac, max_fps: cfg.max_fps, bitrate_kbps: cfg.bitrate_kbps }).await?;
+                }
+                Show::Wait => {}
+            }
+        }};
+    }
 
     loop {
         tokio::select! {
-            _ = terminate.recv() => break,
-            _ = interrupt.recv() => break,
+            req = req_rx.recv() => {
+                let Some(req) = req else { return Ok(()) };
+                match req {
+                    HostReq::Close => return Ok(()),
+                    HostReq::Open { windows, apps, reply } => {
+                        write_msg(&mut ctrl_send, &ClientMsg::ListWindows).await?;
+                        queries.push_back(Query::Open { windows, apps, reply });
+                    }
+                    HostReq::List { reply } => {
+                        write_msg(&mut ctrl_send, &ClientMsg::ListWindows).await?;
+                        queries.push_back(Query::List(reply));
+                    }
+                    HostReq::Displays { reply } => {
+                        write_msg(&mut ctrl_send, &ClientMsg::ListDisplays).await?;
+                        queries.push_back(Query::Displays(reply));
+                    }
+                    HostReq::Desktop { display, bitrate_kbps, reply } => {
+                        write_msg(&mut ctrl_send, &ClientMsg::ListDisplays).await?;
+                        queries.push_back(Query::Desktop { display, bitrate_kbps, reply });
+                    }
+                    HostReq::Launch { action, reply } => {
+                        nonce += 1;
+                        write_msg(&mut ctrl_send, &ClientMsg::Launch { nonce, action }).await?;
+                        launches.insert(nonce, (action, reply));
+                    }
+                }
+            }
             _ = probe.tick() => {
                 for _ in 0..PROBES_PER_ROUND {
                     probe_nonce += 1;
@@ -335,24 +361,95 @@ pub async fn run_open(
             msg = host_rx.recv() => {
                 let Some(msg) = msg else { bail!("host closed the control stream") };
                 match msg {
+                    HostMsg::Windows(list) => match queries.pop_front() {
+                        Some(Query::List(reply)) => drop(reply.send(Ok(list))),
+                        Some(Query::Open { windows, apps, reply }) => {
+                            let ids = resolve(&windows, &apps, &list);
+                            if ids.is_empty() {
+                                let _ = reply.send(Err(anyhow::anyhow!("no matching windows; see `umac list`")));
+                                continue;
+                            }
+                            for &mac in &ids {
+                                show!(mac);
+                            }
+                            let _ = reply.send(Ok(format!("{} window(s)", ids.len())));
+                        }
+                        other => {
+                            tracing::debug!("window list nobody asked for");
+                            if let Some(q) = other {
+                                q.fail("unexpected answer from the host".into());
+                            }
+                        }
+                    },
+                    HostMsg::Displays(list) => match queries.pop_front() {
+                        Some(Query::Displays(reply)) => drop(reply.send(Ok(list))),
+                        Some(Query::Desktop { display, bitrate_kbps, reply }) => {
+                            let d = match display {
+                                Some(i) => list.iter().find(|d| d.index == i),
+                                None => list.iter().find(|d| d.main).or(list.first()),
+                            };
+                            let Some(d) = d else {
+                                let _ = reply.send(Err(anyhow::anyhow!("no such display; see `umac displays`")));
+                                continue;
+                            };
+                            let mac = umac_proto::desktop_id(d.index);
+                            if let Show::Raise(local) = plan_show(streams, &pending, mac) {
+                                ui.send(UiEvent::Raise(local));
+                            } else if pending.insert(mac) {
+                                let bitrate_kbps = bitrate_kbps.unwrap_or_else(|| desktop_bitrate(cfg.bitrate_kbps, d.width, d.height));
+                                tracing::info!(display = d.index, w = d.width, h = d.height, bitrate_kbps, "opening desktop");
+                                write_msg(&mut ctrl_send, &ClientMsg::SubscribeDisplay { index: d.index, max_fps: cfg.max_fps, bitrate_kbps }).await?;
+                            }
+                            let _ = reply.send(Ok(d.name.clone()));
+                        }
+                        other => {
+                            if let Some(q) = other {
+                                q.fail("unexpected answer from the host".into());
+                            }
+                        }
+                    },
+                    HostMsg::Launched { nonce: answered, result } => {
+                        let Some((action, reply)) = launches.remove(&answered) else { continue };
+                        match result {
+                            Ok(info) => {
+                                show!(info.id);
+                                let _ = reply.send(Ok(core::title(&info)));
+                            }
+                            // The Apps launcher is an overlay on recent macOS; show /Applications.
+                            Err(e) if action == LaunchAction::Apps => {
+                                tracing::info!("{e}; showing /Applications instead");
+                                nonce_retry(&mut ctrl_send, &mut nonce, &mut launches, reply).await?;
+                            }
+                            Err(e) => drop(reply.send(Err(anyhow::anyhow!("host could not launch {action:?}: {e}")))),
+                        }
+                    }
                     HostMsg::StreamStarted { window, codec, color, info } => {
                         let requested = pending.remove(&window);
                         if streams.contains_key(&window) {
                             continue;
                         }
-                        if !requested && !accept_unsolicited(&info, &streams, Follow { new_windows: cfg.follow_new_windows, focus: cfg.follow_focus }) {
+                        if !requested && !accept_unsolicited(&info, streams, Follow { new_windows: cfg.follow_new_windows, focus: cfg.follow_focus }) {
                             tracing::debug!(window, kind = ?info.kind, parent = ?info.parent, "refusing unsolicited stream");
                             write_msg(&mut ctrl_send, &ClientMsg::Unsubscribe { window }).await?;
                             continue;
                         }
                         tracing::info!(window, ?codec, kind = ?info.kind, w = info.width, h = info.height, "stream started: {}", info.title);
-                        let decode_tx = spawn_decoder(window, codec, color, ui.clone(), cmd_tx.clone())?;
                         let parent = if requested { None } else { info.parent };
+                        let (local, local_info) = {
+                            let mut ids = ctx.ids.lock().unwrap();
+                            let local = ids.local(&ctx.key, window, info.kind, &core::title(&info));
+                            let mut li = info.clone();
+                            li.id = local;
+                            li.parent = parent.and_then(|p| ids.find(&ctx.key, p));
+                            (local, li)
+                        };
+                        let decode_tx = spawn_decoder(window, local, codec, color, ui.clone(), cmd_tx.clone())?;
                         streams.insert(window, Stream {
                             parent,
                             pid: info.pid,
                             kind: info.kind,
                             auto: !requested,
+                            local,
                             reassembler: Reassembler::default(),
                             gate: KeyframeGate::new(Instant::now()),
                             decode_tx,
@@ -361,33 +458,43 @@ pub async fn run_open(
                             bytes: 0,
                             losses: 0,
                         });
-                        ui.send(UiEvent::Open(info));
+                        ui.send(UiEvent::Open(local_info));
                     }
                     HostMsg::TimeReply { client_us, host_us, .. } => clock.add(client_us, host_us, latency::now_us()),
                     HostMsg::StreamStats { window, encode_p50_us, encode_p95_us, send_p50_us, .. } => {
+                        let Some(s) = streams.get(&window) else { continue };
                         let host = HostStages {
                             encode_p50: encode_p50_us,
                             encode_p95: encode_p95_us,
                             send_p50: send_p50_us,
                             uncertainty: clock.uncertainty_us().unwrap_or(0),
                         };
-                        ui.send(UiEvent::HostStats { window, host });
+                        ui.send(UiEvent::HostStats { window: s.local, host });
                     }
-                    HostMsg::WindowChanged(info) if streams.contains_key(&info.id) => {
+                    HostMsg::WindowChanged(mut info) => {
+                        let Some(s) = streams.get(&info.id) else { continue };
+                        let ids = &mut ctx.ids.lock().unwrap();
+                        ids.set_title(s.local, &core::title(&info));
+                        info.parent = s.parent.and_then(|p| ids.find(&ctx.key, p));
+                        info.id = s.local;
                         ui.send(UiEvent::Changed(info));
                     }
                     HostMsg::WindowClosed { window } => {
                         pending.remove(&window);
-                        for w in remove_with_popups(&mut streams, window) {
-                            ui.send(UiEvent::Closed(w));
-                        }
+                        close_streams(ctx, streams, window, true);
                     }
                     HostMsg::Error { window, message } => {
                         tracing::warn!(?window, "host error: {message}");
-                        if let Some(w) = window
-                            && pending.remove(&w)
-                        {
-                            ui.send(UiEvent::Closed(w));
+                        match window {
+                            Some(w) => {
+                                pending.remove(&w);
+                            }
+                            // List requests fail as a whole.
+                            None => {
+                                if let Some(q) = queries.pop_front() {
+                                    q.fail(format!("host error: {message}"));
+                                }
+                            }
                         }
                     }
                     HostMsg::Clipboard { text } => {
@@ -397,6 +504,7 @@ pub async fn run_open(
                         }
                     }
                     HostMsg::ClipboardRequest { nonce } => {
+                        ctx.ids.lock().unwrap().clipboard_request(&ctx.key, nonce);
                         ui.send(UiEvent::ClipboardRequest(nonce));
                     }
                     HostMsg::Cursor(c) => {
@@ -409,13 +517,13 @@ pub async fn run_open(
                 }
             }
             cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { break };
+                let Some(cmd) = cmd else { return Ok(()) };
                 match cmd {
                     NetCmd::Control(msg) => {
                         if let ClientMsg::Unsubscribe { window } = msg {
                             pending.remove(&window);
                             write_msg(&mut ctrl_send, &msg).await?;
-                            for w in remove_with_popups(&mut streams, window).into_iter().filter(|&w| w != window) {
+                            for w in close_streams(ctx, streams, window, false).into_iter().filter(|&w| w != window) {
                                 write_msg(&mut ctrl_send, &ClientMsg::Unsubscribe { window: w }).await?;
                             }
                             continue;
@@ -462,12 +570,53 @@ pub async fn run_open(
                 }
             }
         }
-        if pending.is_empty() && streams.values().all(|s| s.kind == WindowKind::Popup) {
-            break;
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Show {
+    /// Already shown here: bring the local window to the front.
+    Raise(WindowId),
+    Subscribe,
+    /// Requested already; its window is on the way.
+    Wait,
+}
+
+/// What a request for Mac window `mac` should do: there is one local window per Mac window.
+fn plan_show(streams: &HashMap<WindowId, Stream>, pending: &HashSet<WindowId>, mac: WindowId) -> Show {
+    match streams.get(&mac) {
+        Some(s) => Show::Raise(s.local),
+        None if pending.contains(&mac) => Show::Wait,
+        None => Show::Subscribe,
+    }
+}
+
+/// Asks for /Applications in Finder instead of the Apps launcher, answering `reply` when done.
+async fn nonce_retry(
+    ctrl_send: &mut quinn::SendStream,
+    nonce: &mut u64,
+    launches: &mut HashMap<u64, (LaunchAction, Reply<String>)>,
+    reply: Reply<String>,
+) -> Result<()> {
+    *nonce += 1;
+    write_msg(ctrl_send, &ClientMsg::Launch { nonce: *nonce, action: LaunchAction::FinderApplications }).await?;
+    launches.insert(*nonce, (LaunchAction::FinderApplications, reply));
+    Ok(())
+}
+
+/// Removes `window` and the popups and dialogs above it, forgets their local ids and, when
+/// the host closed them, tells the UI. Returns the Mac ids removed.
+fn close_streams(ctx: &HostCtx, streams: &mut HashMap<WindowId, Stream>, window: WindowId, notify: bool) -> Vec<WindowId> {
+    let removed = remove_with_popups(streams, window);
+    let mut ids = ctx.ids.lock().unwrap();
+    for &w in &removed {
+        if let Some(local) = ids.release(&ctx.key, w)
+            && notify
+        {
+            ctx.ui.send(UiEvent::Closed(local));
         }
     }
-    conn.close(0u32.into(), b"bye");
-    Ok(())
+    removed
 }
 
 /// Windows the host opens on its own (each kind capped). Popups need a streamed parent. New
@@ -512,8 +661,11 @@ fn remove_with_popups(streams: &mut HashMap<WindowId, Stream>, window: WindowId)
     removed
 }
 
+/// Decodes one window on its own thread. `window` is the Mac id (for keyframe requests),
+/// `local` the UI's id. A panic in the decoder closes only this window.
 fn spawn_decoder(
     window: WindowId,
+    local: WindowId,
     codec: Codec,
     color: ColorFormat,
     ui: UiSender,
@@ -523,30 +675,37 @@ fn spawn_decoder(
     tracing::info!(window, "decoder: {}", decoder.describe());
     let (tx, rx) = sync_channel::<Arrived>(DECODE_QUEUE);
     std::thread::Builder::new().name(format!("decode-{window}")).spawn(move || {
-        let slot = Arc::new(FrameSlot::default());
-        let (mut n, mut total, mut since) = (0u32, Duration::ZERO, Instant::now());
-        while let Ok(a) = rx.recv() {
-            let t = Instant::now();
-            match decoder.decode(&a.frame.data) {
-                Ok(Some(frame)) => {
-                    total += t.elapsed();
-                    n += 1;
-                    let timing = FrameTiming { capture: a.capture, first_datagram: a.first_datagram, complete: a.complete, decoded: Instant::now() };
-                    if slot.put(frame, timing) && !ui.send(UiEvent::Frame { window, slot: slot.clone() }) {
-                        break;
+        let run = std::panic::AssertUnwindSafe(|| {
+            let slot = Arc::new(FrameSlot::default());
+            let (mut n, mut total, mut since) = (0u32, Duration::ZERO, Instant::now());
+            while let Ok(a) = rx.recv() {
+                let t = Instant::now();
+                match decoder.decode(&a.frame.data) {
+                    Ok(Some(frame)) => {
+                        total += t.elapsed();
+                        n += 1;
+                        let timing = FrameTiming { capture: a.capture, first_datagram: a.first_datagram, complete: a.complete, decoded: Instant::now() };
+                        if slot.put(frame, timing) && !ui.send(UiEvent::Frame { window: local, slot: slot.clone() }) {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(window, "decode failed: {e}");
+                        let _ = cmd_tx.send(NetCmd::DecodeError(window));
                     }
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(window, "decode failed: {e}");
-                    let _ = cmd_tx.send(NetCmd::DecodeError(window));
+                if since.elapsed() >= STATS_EVERY && n > 0 {
+                    let ms = total.as_secs_f64() * 1e3 / n as f64;
+                    tracing::info!(window, decode_ms = format_args!("{ms:.2}"), skipped = slot.take_dropped(), "decode");
+                    (n, total, since) = (0, Duration::ZERO, Instant::now());
                 }
             }
-            if since.elapsed() >= STATS_EVERY && n > 0 {
-                let ms = total.as_secs_f64() * 1e3 / n as f64;
-                tracing::info!(window, decode_ms = format_args!("{ms:.2}"), skipped = slot.take_dropped(), "decode");
-                (n, total, since) = (0, Duration::ZERO, Instant::now());
-            }
+        });
+        if std::panic::catch_unwind(run).is_err() {
+            tracing::error!(window, "decoder crashed; closing the window");
+            ui.send(UiEvent::Closed(local));
+            let _ = cmd_tx.send(NetCmd::Control(ClientMsg::Unsubscribe { window }));
         }
     })?;
     Ok(tx)
@@ -587,6 +746,7 @@ mod tests {
             pid: 1,
             kind,
             auto: parent.is_some(),
+            local: 0,
             reassembler: Reassembler::default(),
             gate: KeyframeGate::new(Instant::now()),
             decode_tx: sync_channel(1).0,
@@ -668,12 +828,21 @@ mod tests {
     }
 
     #[test]
+    fn a_shown_window_is_raised_not_opened_twice() {
+        let mut s = stream(None);
+        s.local = 7;
+        let streams = HashMap::from([(1, s)]);
+        let pending = HashSet::from([2]);
+        assert_eq!(plan_show(&streams, &pending, 1), Show::Raise(7));
+        assert_eq!(plan_show(&streams, &pending, 2), Show::Wait);
+        assert_eq!(plan_show(&streams, &pending, 3), Show::Subscribe);
+    }
+
+    #[test]
     fn resolves_targets() {
         let all = [win(1, "Safari", WindowKind::Normal), win(2, "Safari", WindowKind::Popup), win(3, "Notes", WindowKind::Normal)];
-        let t = Targets { windows: vec![3], apps: vec!["safari".into()], ..Default::default() };
-        assert_eq!(t.resolve(&all), vec![1, 3]);
-        let t = Targets { windows: vec![], apps: vec!["com.example.Notes".into()], ..Default::default() };
-        assert_eq!(t.resolve(&all), vec![3]);
-        assert!(Targets::default().resolve(&all).is_empty());
+        assert_eq!(resolve(&[3], &["safari".into()], &all), vec![1, 3]);
+        assert_eq!(resolve(&[], &["com.example.Notes".into()], &all), vec![3]);
+        assert!(resolve(&[], &[], &all).is_empty());
     }
 }

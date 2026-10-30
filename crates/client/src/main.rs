@@ -1,17 +1,20 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use std::future::Future;
+
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use tokio::sync::mpsc;
-use umac_proto::LaunchAction;
+use umac_proto::{DisplayInfo, LaunchAction, WindowInfo};
 use umac_client::{
     autostart,
     config::{HostEntry, PairingLink, Store},
-    daemon,
     core::Core,
-    net::{self, Targets},
+    daemon,
+    ipc::{Reply, Request},
+    manager::Manager,
+    net,
     shell::{Backend, Shell},
-    ui::UiEvent,
+    ui::{UiEvent, UiSender},
 };
 
 #[derive(Parser)]
@@ -72,8 +75,23 @@ enum Cmd {
     List {
         #[arg(long)]
         host: Option<String>,
+        /// Ask the host directly instead of through the daemon.
+        #[arg(long)]
+        no_daemon: bool,
     },
-    /// Stream windows; each opens as its own local window.
+    /// Windows shown here right now (from the daemon).
+    Status,
+    /// Stop the daemon: closes every stream window and the tray.
+    Quit,
+    /// Close a shown window like its close button (and on the Mac, with close_on_mac).
+    Close {
+        #[arg(long)]
+        host: Option<String>,
+        /// Mac window id from `umac status`.
+        #[arg(long)]
+        window: u32,
+    },
+    /// Stream windows; each opens as its own local window. Already shown ones come to the front.
     Open {
         #[arg(long)]
         host: Option<String>,
@@ -83,12 +101,8 @@ enum Cmd {
         /// Every normal window of an app, by name or bundle id (repeatable).
         #[arg(long = "app")]
         apps: Vec<String>,
-        /// Windowing backend.
-        #[arg(long, value_enum, default_value_t = Backend::Auto)]
-        backend: Backend,
-        /// Log latency per stage every 2 s.
-        #[arg(long)]
-        stats: bool,
+        #[command(flatten)]
+        standalone: Standalone,
     },
     /// Open something on the Mac (a new Terminal window, Activity Monitor...) and stream it.
     Launch {
@@ -96,11 +110,8 @@ enum Cmd {
         what: LaunchArg,
         #[arg(long)]
         host: Option<String>,
-        #[arg(long, value_enum, default_value_t = Backend::Auto)]
-        backend: Backend,
-        /// Log latency per stage every 2 s.
-        #[arg(long)]
-        stats: bool,
+        #[command(flatten)]
+        standalone: Standalone,
     },
     /// Run the tray in the foreground (`umac` alone starts it in the background).
     Daemon,
@@ -113,6 +124,9 @@ enum Cmd {
     Displays {
         #[arg(long)]
         host: Option<String>,
+        /// Ask the host directly instead of through the daemon.
+        #[arg(long)]
+        no_daemon: bool,
     },
     /// Show a whole Mac display in one window (F11 toggles fullscreen).
     Desktop {
@@ -124,11 +138,8 @@ enum Cmd {
         /// Bitrate in kbit/s (default: scaled with the display size).
         #[arg(long)]
         bitrate: Option<u32>,
-        #[arg(long, value_enum, default_value_t = Backend::Auto)]
-        backend: Backend,
-        /// Log latency per stage every 2 s.
-        #[arg(long)]
-        stats: bool,
+        #[command(flatten)]
+        standalone: Standalone,
     },
     /// Measure latency: streams the desktop for a while, then prints a per-stage summary.
     Latency {
@@ -142,6 +153,20 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Backend::Auto)]
         backend: Backend,
     },
+}
+
+/// Running a stream in this process instead of the daemon (debugging, latency runs).
+#[derive(clap::Args, Clone, Copy)]
+struct Standalone {
+    /// Show the windows from this process instead of the daemon; it ends with its last window.
+    #[arg(long)]
+    no_daemon: bool,
+    /// Windowing backend (with --no-daemon; the daemon always uses Wayland).
+    #[arg(long, value_enum, default_value_t = Backend::Auto)]
+    backend: Backend,
+    /// Log latency per stage every 2 s (with --no-daemon; for the daemon set show_stats).
+    #[arg(long)]
+    stats: bool,
 }
 
 /// Latency reporting for a streaming session.
@@ -163,13 +188,7 @@ fn main() -> Result<()> {
     let config_dir = cli.config_dir.clone();
     let store = Store::new(cli.config_dir)?;
     let rt = tokio::runtime::Runtime::new()?;
-    let result = run(&rt, store, config_dir, cli.cmd);
-    if let Err(e) = &result
-        && std::env::var_os(daemon::NOTIFY_ENV).is_some()
-    {
-        rt.block_on(daemon::notify("umac", &format!("{e:#}")));
-    }
-    result
+    run(&rt, store, config_dir, cli.cmd)
 }
 
 fn run(rt: &tokio::runtime::Runtime, store: Store, config_dir: Option<PathBuf>, cmd: Option<Cmd>) -> Result<()> {
@@ -206,35 +225,57 @@ fn run(rt: &tokio::runtime::Runtime, store: Store, config_dir: Option<PathBuf>, 
                 println!("{}\t{}\t{}", h.name, h.addr, h.fingerprint);
             }
         }
-        Cmd::List { host } => {
-            let entry = store.host(host.as_deref())?;
-            let windows = rt.block_on(async {
-                let mut s = net::connect(&store, &entry, None).await?;
-                s.list_windows().await
-            })?;
-            println!("{:>8}  {:<24} {:>11}  title", "id", "app", "size");
-            for w in windows {
-                let size = format!("{}x{}", w.width, w.height);
-                println!("{:>8}  {:<24} {:>11}  {}", w.id, w.app_name, size, w.title);
-            }
-        }
-        Cmd::Launch { what, host, backend, stats } => {
-            let entry = store.host(host.as_deref())?;
-            let action = LaunchAction::from(what);
-            let info = rt.block_on(async {
-                let mut s = net::connect(&store, &entry, None).await?;
-                match s.launch(action).await {
-                    Err(e) if action == LaunchAction::Apps => {
-                        tracing::info!("{e:#}; showing /Applications instead");
-                        s.launch(LaunchAction::FinderApplications).await
-                    }
-                    r => r,
+        Cmd::List { host, no_daemon } => {
+            let windows = if no_daemon {
+                rt.block_on(direct(&store, |m| async move { m.list(host.as_deref()).await }))?
+            } else {
+                match ask(rt, &store, &config_dir, Request::List { host })? {
+                    Reply::Windows { windows } => windows,
+                    other => bail!("unexpected reply: {other:?}"),
                 }
-            })?;
-            let stats = Stats { show: stats, ..Default::default() };
-            run_streams(rt, store, entry, Targets { windows: vec![info.id], ..Default::default() }, backend, stats)?;
+            };
+            print_windows(&windows);
         }
-        Cmd::Daemon => rt.block_on(daemon::run(store, config_dir))?,
+        Cmd::Displays { host, no_daemon } => {
+            let displays = if no_daemon {
+                rt.block_on(direct(&store, |m| async move { m.displays(host.as_deref()).await }))?
+            } else {
+                match ask(rt, &store, &config_dir, Request::Displays { host })? {
+                    Reply::Displays { displays } => displays,
+                    other => bail!("unexpected reply: {other:?}"),
+                }
+            };
+            print_displays(&displays);
+        }
+        Cmd::Status => match ask(rt, &store, &config_dir, Request::Status)? {
+            Reply::Status { windows } if windows.is_empty() => println!("no windows shown"),
+            Reply::Status { windows } => {
+                println!("{:<24} {:>8}  {:<8} title", "host", "mac id", "kind");
+                for w in windows {
+                    println!("{:<24} {:>8}  {:<8} {}", w.host, w.mac_id, w.kind, w.title);
+                }
+            }
+            other => bail!("unexpected reply: {other:?}"),
+        },
+        Cmd::Close { host, window } => done(ask(rt, &store, &config_dir, Request::Close { host, window })?)?,
+        Cmd::Quit => {
+            let dir = daemon::lock_dir(store.dir());
+            if !daemon::is_running(&dir)? {
+                println!("umac is not running");
+                return Ok(());
+            }
+            rt.block_on(umac_client::ipc::call(&dir, &Request::Quit))?;
+            println!("umac stopped");
+        }
+        Cmd::Launch { what, host, standalone } => {
+            let action = LaunchAction::from(what);
+            if standalone.no_daemon {
+                let stats = Stats { show: standalone.stats, ..Default::default() };
+                return run_alone(rt, store, standalone.backend, stats, move |m| async move { m.launch(host.as_deref(), action).await });
+            }
+            done(ask(rt, &store, &config_dir, Request::Launch { host, action })?)?;
+        }
+        Cmd::Daemon => daemon::run(rt, store)?,
         Cmd::Autostart { action } => {
             let paths = autostart::Paths::for_user()?;
             let exe = std::env::current_exe()?;
@@ -258,50 +299,72 @@ fn run(rt: &tokio::runtime::Runtime, store: Store, config_dir: Option<PathBuf>, 
                 },
             }
         }
-        Cmd::Displays { host } => {
-            let entry = store.host(host.as_deref())?;
-            let displays = rt.block_on(async {
-                let mut s = net::connect(&store, &entry, None).await?;
-                s.list_displays().await
-            })?;
-            println!("{:>5}  {:>11}  {:>5}  name", "index", "pixels", "scale");
-            for d in displays {
-                let size = format!("{}x{}", d.width, d.height);
-                println!("{:>5}  {:>11}  {:>5}  {}{}", d.index, size, d.scale, d.name, if d.main { " (main)" } else { "" });
+        Cmd::Desktop { host, display, bitrate, standalone } => {
+            if standalone.no_daemon {
+                let stats = Stats { show: standalone.stats, ..Default::default() };
+                return run_alone(rt, store, standalone.backend, stats, move |m| async move { m.desktop(host.as_deref(), display, bitrate).await });
             }
-        }
-        Cmd::Desktop { host, display, bitrate, backend, stats } => {
-            let entry = store.host(host.as_deref())?;
-            let index = display_index(rt, &store, &entry, display)?;
-            let targets = Targets { displays: vec![index], desktop_bitrate_kbps: bitrate, ..Default::default() };
-            run_streams(rt, store, entry, targets, backend, Stats { show: stats, ..Default::default() })?;
+            done(ask(rt, &store, &config_dir, Request::Desktop { host, display, bitrate_kbps: bitrate })?)?;
         }
         Cmd::Latency { host, display, seconds, backend } => {
-            let entry = store.host(host.as_deref())?;
-            let index = display_index(rt, &store, &entry, display)?;
-            let targets = Targets { displays: vec![index], ..Default::default() };
             let stats = Stats { show: true, run_for: Some(std::time::Duration::from_secs(seconds.max(1))) };
-            run_streams(rt, store, entry, targets, backend, stats)?;
+            run_alone(rt, store, backend, stats, move |m| async move { m.desktop(host.as_deref(), display, None).await })?;
             print_summary(seconds);
         }
-        Cmd::Open { host, windows, apps, backend, stats } => {
+        Cmd::Open { host, windows, apps, standalone } => {
             anyhow::ensure!(!windows.is_empty() || !apps.is_empty(), "give at least one --window or --app");
-            let entry = store.host(host.as_deref())?;
-            run_streams(rt, store, entry, Targets { windows, apps, ..Default::default() }, backend, Stats { show: stats, ..Default::default() })?;
+            if standalone.no_daemon {
+                let stats = Stats { show: standalone.stats, ..Default::default() };
+                return run_alone(rt, store, standalone.backend, stats, move |m| async move { m.open(host.as_deref(), windows, apps).await });
+            }
+            done(ask(rt, &store, &config_dir, Request::Open { host, windows, apps })?)?;
         }
     }
     Ok(())
 }
 
-fn display_index(rt: &tokio::runtime::Runtime, store: &Store, entry: &HostEntry, display: Option<u32>) -> Result<u32> {
-    if let Some(i) = display {
-        return Ok(i);
+/// Sends a request to the daemon, starting it if needed.
+fn ask(rt: &tokio::runtime::Runtime, store: &Store, config_dir: &Option<PathBuf>, req: Request) -> Result<Reply> {
+    rt.block_on(daemon::request(store, config_dir.as_deref(), &req))
+}
+
+fn done(reply: Reply) -> Result<()> {
+    match reply {
+        Reply::Done { message } => {
+            println!("{message}");
+            Ok(())
+        }
+        Reply::Error { message } => bail!(message),
+        other => bail!("unexpected reply: {other:?}"),
     }
-    rt.block_on(async {
-        let mut s = net::connect(store, entry, None).await?;
-        let list = s.list_displays().await?;
-        anyhow::Ok(list.iter().find(|d| d.main).or(list.first()).context("host has no displays")?.index)
-    })
+}
+
+/// Runs `f` against the host without a daemon and without windows (lists only).
+async fn direct<T, F, Fut>(store: &Store, f: F) -> Result<T>
+where
+    F: FnOnce(Manager) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let (manager, _ui_commands) = Manager::new(store.clone(), store.config()?, UiSender::new(|_| true));
+    let result = f(manager.clone()).await;
+    manager.shutdown().await;
+    result
+}
+
+fn print_windows(windows: &[WindowInfo]) {
+    println!("{:>8}  {:<24} {:>11}  title", "id", "app", "size");
+    for w in windows {
+        let size = format!("{}x{}", w.width, w.height);
+        println!("{:>8}  {:<24} {:>11}  {}", w.id, w.app_name, size, w.title);
+    }
+}
+
+fn print_displays(displays: &[DisplayInfo]) {
+    println!("{:>5}  {:>11}  {:>5}  name", "index", "pixels", "scale");
+    for d in displays {
+        let size = format!("{}x{}", d.width, d.height);
+        println!("{:>5}  {:>11}  {:>5}  {}{}", d.index, size, d.scale, d.name, if d.main { " (main)" } else { "" });
+    }
 }
 
 fn print_summary(seconds: u64) {
@@ -327,20 +390,17 @@ fn print_summary(seconds: u64) {
     }
 }
 
-/// Streams `targets` until every window is closed (or `stats.run_for` passed).
-fn run_streams(
-    rt: &tokio::runtime::Runtime,
-    store: Store,
-    entry: HostEntry,
-    targets: Targets,
-    backend: Backend,
-    stats: Stats,
-) -> Result<()> {
+/// Shows windows from this process (no daemon) until the last one closes, `stats.run_for`
+/// passed, or Ctrl+C. `start` asks the manager for what to show.
+fn run_alone<F, Fut>(rt: &tokio::runtime::Runtime, store: Store, backend: Backend, stats: Stats, start: F) -> Result<()>
+where
+    F: FnOnce(Manager) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<String>> + Send + 'static,
+{
     let mut cfg = store.config()?;
     cfg.show_stats |= stats.show;
     cfg.latency_summary = stats.run_for.is_some();
     if let Some(after) = stats.run_for {
-        // The session already ends cleanly on SIGTERM.
         std::thread::spawn(move || {
             std::thread::sleep(after);
             unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) };
@@ -348,20 +408,19 @@ fn run_streams(
     }
     let shell = Shell::new(backend)?;
     let ui = shell.sender();
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let net_cmd_tx = cmd_tx.clone();
-    let net_cfg = cfg.clone();
+    let _rt = rt.enter();
+    let (manager, cmd_tx) = Manager::new(store, cfg.clone(), ui.clone());
+    rt.spawn(daemon::shutdown_on_signal(ui.clone()));
+    let m = manager.clone();
     rt.spawn(async move {
-        let result = async {
-            let session = net::connect(&store, &entry, None).await?;
-            net::run_open(session, targets, net_cfg, ui.clone(), net_cmd_tx, cmd_rx).await
+        if let Err(e) = start(m).await {
+            ui.send(UiEvent::Shutdown(format!("{e:#}")));
         }
-        .await;
-        let reason = result.err().map(|e| format!("{e:#}")).unwrap_or_default();
-        ui.send(UiEvent::Shutdown(reason));
     });
-    if let Some(e) = shell.run(Core::new(cfg, cmd_tx)).context("window system")? {
-        anyhow::bail!(e);
+    let result = shell.run(Core::new(cfg, cmd_tx));
+    rt.block_on(manager.shutdown());
+    if let Some(e) = result? {
+        bail!(e);
     }
     Ok(())
 }

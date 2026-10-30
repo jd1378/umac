@@ -16,6 +16,7 @@ use std::{
 use anyhow::{Context, Result};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use smithay_client_toolkit::{
+    activation::{ActivationHandler, ActivationState, RequestData},
     compositor::{CompositorHandler, CompositorState},
     data_device_manager::{
         DataDeviceManagerState, WritePipe,
@@ -194,6 +195,8 @@ impl Shell {
             hover: None,
             cursor_image: None,
             kb_focus: None,
+            activation: ActivationState::bind(&globals, &qh).ok(),
+            seat: None,
             presentation: globals.bind::<WpPresentation, _, _>(&qh, 1..=2, PresentationData).ok(),
             presentation_clock: DEFAULT_PRESENTATION_CLOCK,
             exit: false,
@@ -276,6 +279,9 @@ struct State {
     hover: Option<(WindowId, u32)>,
     cursor_image: Option<ImageCursor>,
     kb_focus: Option<WindowId>,
+    /// Brings an already shown window to the front (xdg-activation); absent on some compositors.
+    activation: Option<ActivationState>,
+    seat: Option<wl_seat::WlSeat>,
     /// Reports when frames actually reach the screen; absent on some compositors.
     presentation: Option<WpPresentation>,
     presentation_clock: u32,
@@ -340,7 +346,7 @@ impl State {
                 if let Err(e) = self.open(info) {
                     tracing::warn!(window = id, "opening window: {e:#}");
                     if kind != WindowKind::Popup {
-                        self.core.close_requested(id);
+                        self.core.abandon(id);
                     }
                 }
             }
@@ -348,6 +354,8 @@ impl State {
             UiEvent::HostStats { window, host } => self.core.host_stats(window, host),
             UiEvent::Changed(info) => self.changed(info),
             UiEvent::Closed(window) => self.close(window),
+            UiEvent::Raise(window) => self.raise(window),
+            UiEvent::CloseRequest(window) => self.user_close(window),
             UiEvent::Shutdown(reason) => {
                 if !reason.is_empty() {
                     self.core.error = Some(reason);
@@ -501,6 +509,29 @@ impl State {
         }
     }
 
+    /// The user closed a window: with `close_on_mac` it stays until the Mac closed it.
+    fn user_close(&mut self, id: WindowId) {
+        if self.nodes.contains_key(&id) && self.core.close_requested(id) {
+            self.close(id);
+        }
+    }
+
+    /// Asks the compositor to activate an already shown toplevel. The token carries our last
+    /// keyboard serial; without recent input the compositor may only mark it as wanting
+    /// attention.
+    fn raise(&mut self, window: WindowId) {
+        let Some(Shape::Toplevel(w)) = self.nodes.get(&window).map(|n| &n.shape) else { return };
+        let Some(activation) = &self.activation else { return };
+        let focused = self.kb_focus.and_then(|f| self.nodes.get(&f)).map(|n| n.shape.wl_surface().clone());
+        let data = RequestData {
+            app_id: Some(APP_ID.to_owned()),
+            seat_and_serial: self.seat.clone().zip(self.clip.serial),
+            surface: focused.or_else(|| Some(w.wl_surface().clone())),
+            udata: window,
+        };
+        activation.request_token(&self.qh, data);
+    }
+
     /// Closes a window and the popups above it, topmost first as xdg-shell requires.
     fn close(&mut self, window: WindowId) {
         let mut order = self.core.descendants(window);
@@ -562,7 +593,7 @@ impl State {
             let size = size.unwrap_or_else(|| core::initial_size(&info, output));
             if let Err(e) = self.core.attach(info, surface, size) {
                 tracing::error!(window = id, "showing window: {e:#}");
-                self.core.close_requested(id);
+                self.core.abandon(id);
                 self.close(id);
             }
             return;
@@ -575,11 +606,20 @@ impl State {
     }
 }
 
+impl ActivationHandler for State {
+    type RequestUdata = WindowId;
+
+    fn new_token(&mut self, token: String, data: &RequestData<WindowId>) {
+        if let (Some(activation), Some(node)) = (&self.activation, self.nodes.get(&data.udata)) {
+            activation.activate::<State>(node.shape.wl_surface(), token);
+        }
+    }
+}
+
 impl WindowHandler for State {
     fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &Window) {
         if let Some(id) = self.id_of(window.wl_surface()) {
-            self.core.close_requested(id);
-            self.close(id);
+            self.user_close(id);
         }
     }
 
@@ -728,12 +768,14 @@ impl SeatHandler for State {
     }
 
     fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.seat.get_or_insert_with(|| seat.clone());
         self.ensure_data_device(qh, &seat);
     }
 
     fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
         // Seats present at startup are bound by SeatState::new without a new_seat callback,
         // so the first capability is the earliest reliable point to attach the data device.
+        self.seat.get_or_insert_with(|| seat.clone());
         self.ensure_data_device(qh, &seat);
         match capability {
             Capability::Keyboard if self.keyboard.is_none() => match self.seats.get_keyboard(qh, &seat, None) {

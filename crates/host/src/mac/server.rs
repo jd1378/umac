@@ -558,6 +558,28 @@ impl Session {
                 self.focus.dismissed(window);
                 self.close(window, send).await?;
             }
+            ClientMsg::CloseWindow { window } => {
+                self.touch();
+                let Some(s) = self.streams.get(&window) else { return Ok(()) };
+                let target = (s.popup_of.is_none() && s.display.is_none()).then_some(s.info.pid);
+                let pressed = match target {
+                    Some(pid) => tokio::task::spawn_blocking(move || AxWindow::find(pid, window)?.close()).await?,
+                    None => Err(anyhow!("popups and desktops are only unsubscribed")),
+                };
+                match pressed {
+                    // The stream ends when the window is gone (WindowClosed from the poll). If the
+                    // app asks to save first, that prompt is followed as a dialog of this window.
+                    Ok(()) => tracing::info!(window, "closing the window on the Mac for the client"),
+                    Err(e) => {
+                        tracing::info!(window, "not closing on the Mac ({e:#}); unsubscribing");
+                        if self.streams.get(&window).is_some_and(|s| s.popup_of.is_some() || s.auto) {
+                            self.dismissed.insert(window);
+                        }
+                        self.focus.dismissed(window);
+                        self.close(window, send).await?;
+                    }
+                }
+            }
             ClientMsg::RequestKeyframe { window } => {
                 if let Some(s) = self.streams.get(&window) {
                     s.stream.request_keyframe();

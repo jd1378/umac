@@ -143,6 +143,9 @@ pub enum ClientMsg {
     TimeProbe { nonce: u64, client_us: u64 },
     /// Turns per-stream `StreamStats` from the host on or off.
     WantStats { on: bool },
+    /// The user closed the window on the client: close it on the Mac too (its close button),
+    /// which may show a save prompt first. Popups and desktops are only unsubscribed.
+    CloseWindow { window: WindowId },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

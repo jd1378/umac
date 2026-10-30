@@ -11,8 +11,12 @@ pub mod cursor;
 pub mod daemon;
 pub mod decode;
 pub mod gate;
+#[cfg(target_os = "linux")]
+pub mod ipc;
+pub mod ids;
 pub mod keymap;
 pub mod latency;
+pub mod manager;
 pub mod net;
 pub mod render;
 pub mod sample;

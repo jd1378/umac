@@ -68,6 +68,8 @@ pub struct Core {
     held: std::collections::BTreeSet<u16>,
     swallow_s: bool,
     titles: Vec<(WindowId, String)>,
+    /// The daemon keeps running with no windows; a one-off `umac open` ends with its last one.
+    persistent: bool,
     pub error: Option<String>,
 }
 
@@ -78,6 +80,12 @@ pub fn title(info: &WindowInfo) -> String {
 /// Popup offset as sent by the host, clamped to a sane range.
 pub fn popup_offset(info: &WindowInfo) -> (i32, i32) {
     (info.offset.0.clamp(-MAX_OFFSET, MAX_OFFSET), info.offset.1.clamp(-MAX_OFFSET, MAX_OFFSET))
+}
+
+/// Whether closing a local window of `kind` closes the Mac window too. Popups and desktops
+/// have no Mac window of their own to close.
+pub fn closes_on_mac(close_on_mac: bool, kind: WindowKind) -> bool {
+    close_on_mac && matches!(kind, WindowKind::Normal | WindowKind::Dialog)
 }
 
 /// Top-level kinds the user opened; the session ends when none are left.
@@ -120,8 +128,15 @@ impl Core {
             held: Default::default(),
             swallow_s: false,
             titles: Vec::new(),
+            persistent: false,
             error: None,
         }
+    }
+
+    /// Keeps the shell running after the last window closed (the daemon).
+    pub fn persistent(mut self) -> Self {
+        self.persistent = true;
+        self
     }
 
     /// Window titles to set, after the latency readout was toggled or refreshed.
@@ -269,9 +284,9 @@ impl Core {
         out
     }
 
-    /// True once every normal window that was opened is gone.
+    /// True once every normal window that was opened is gone (never for the daemon).
     pub fn should_exit(&self) -> bool {
-        self.opened_any && !self.remotes.values().any(|r| is_toplevel(r.info.kind))
+        !self.persistent && self.opened_any && !self.remotes.values().any(|r| is_toplevel(r.info.kind))
     }
 
     /// Draws the picture waiting in `slot`, if the decoder has not already replaced it with a
@@ -370,8 +385,20 @@ impl Core {
         next
     }
 
-    /// The user closed a local window: stop streaming it (the Mac window stays open).
-    pub fn close_requested(&mut self, window: WindowId) {
+    /// The user closed a local window. With `close_on_mac` a window or dialog is closed on the
+    /// Mac and stays here until the Mac reports it gone (a save prompt may come first); returns
+    /// true if the shell should close it right away instead.
+    pub fn close_requested(&mut self, window: WindowId) -> bool {
+        if self.info(window).is_some_and(|i| closes_on_mac(self.cfg.close_on_mac, i.kind)) {
+            self.send(NetCmd::Control(ClientMsg::CloseWindow { window }));
+            return false;
+        }
+        self.abandon(window);
+        true
+    }
+
+    /// Stops streaming a window that could not be shown; the Mac window stays open.
+    pub fn abandon(&mut self, window: WindowId) {
         self.send(NetCmd::Control(ClientMsg::Unsubscribe { window }));
     }
 
@@ -565,6 +592,15 @@ mod tests {
             offset: (0, 0),
             kind,
         }
+    }
+
+    #[test]
+    fn closing_reaches_the_mac_only_for_windows_and_dialogs() {
+        assert!(closes_on_mac(true, WindowKind::Normal));
+        assert!(closes_on_mac(true, WindowKind::Dialog));
+        assert!(!closes_on_mac(true, WindowKind::Popup));
+        assert!(!closes_on_mac(true, WindowKind::Desktop));
+        assert!(!closes_on_mac(false, WindowKind::Normal));
     }
 
     #[test]
