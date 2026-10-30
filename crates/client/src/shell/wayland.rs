@@ -80,7 +80,9 @@ const READ_TIMEOUT: Duration = Duration::from_millis(300);
 struct Clip {
     manager: Option<DataDeviceManagerState>,
     device: Option<DataDevice>,
-    /// Latest input serial on our surfaces; setting the selection needs one.
+    /// Latest keyboard serial (enter or key press). KWin rejects a selection set with a
+    /// pointer serial from a popup, which never has keyboard focus, so pointer serials are
+    /// not used.
     serial: Option<u32>,
     /// Our current selection and its text, while we own it.
     own: Option<(CopyPasteSource, Arc<str>)>,
@@ -481,10 +483,7 @@ impl PointerHandler for State {
                 }
                 PointerEventKind::Leave { .. } => {}
                 PointerEventKind::Motion { .. } => self.core.pointer_moved(id, x, y),
-                PointerEventKind::Press { button, serial, .. } => {
-                    self.clip.serial = Some(serial);
-                    self.core.button(id, mouse_button(button), true);
-                }
+                PointerEventKind::Press { button, .. } => self.core.button(id, mouse_button(button), true),
                 PointerEventKind::Release { button, .. } => self.core.button(id, mouse_button(button), false),
                 PointerEventKind::Axis { horizontal, vertical, source, .. } => {
                     let continuous = matches!(
@@ -740,6 +739,7 @@ impl DataSourceHandler for State {
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
         // Another app took the clipboard.
         if self.clip.own.as_ref().is_some_and(|(s, _)| s.inner() == source) {
+            tracing::debug!("local clipboard replaced by another app (or the compositor refused ours)");
             self.clip.own = None;
         }
     }
