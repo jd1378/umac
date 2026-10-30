@@ -340,6 +340,7 @@ impl Session {
             height: stream.size.1,
             scale: stream.scale(),
             parent: None,
+            offset: (0, 0),
             kind: umac_proto::WindowKind::Normal,
         };
         self.set_target(&info, &geometry, inset);

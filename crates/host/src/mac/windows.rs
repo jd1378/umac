@@ -43,6 +43,7 @@ pub fn list() -> anyhow::Result<Vec<WindowInfo>> {
                 height: (f.size.height * scale).round() as u32,
                 scale: scale as f32,
                 parent: None,
+                offset: (0, 0),
                 kind: WindowKind::Normal,
             })
         })

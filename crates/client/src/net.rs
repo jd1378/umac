@@ -375,6 +375,7 @@ mod tests {
             height: 10,
             scale: 1.0,
             parent: None,
+            offset: (0, 0),
             kind,
         }
     }

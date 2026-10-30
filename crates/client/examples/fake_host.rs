@@ -88,6 +88,7 @@ async fn serve(
         height: 720,
         scale: 1.0,
         parent: None,
+        offset: (0, 0),
         kind: WindowKind::Normal,
     };
     let restart = Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -9,10 +9,10 @@ pub mod video;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible wire change. Peers with different versions refuse to talk.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// ALPN advertised on the QUIC handshake.
-pub const ALPN: &[u8] = b"umac/1";
+pub const ALPN: &[u8] = b"umac/2";
 
 pub const DEFAULT_PORT: u16 = 47_810;
 
@@ -68,6 +68,9 @@ pub struct WindowInfo {
     pub scale: f32,
     /// Window that owns this one (sheets, menus, popovers), if known.
     pub parent: Option<WindowId>,
+    /// Top-left of this window relative to the parent's surface origin, in parent surface
+    /// pixels. Can be negative or extend past the parent. Zero when there is no parent.
+    pub offset: (i32, i32),
     pub kind: WindowKind,
 }
 
@@ -101,13 +104,15 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HostMsg {
     Windows(Vec<WindowInfo>),
+    /// Reply to `Subscribe`, or sent unsolicited for a popup (menu, tooltip) that opened from
+    /// a streamed window; the client shows it relative to `info.parent` until `WindowClosed`.
     StreamStarted {
         window: WindowId,
         codec: Codec,
         color: ColorFormat,
         info: WindowInfo,
     },
-    /// Window geometry or title changed; size changes are followed by a keyframe.
+    /// Window geometry, offset or title changed; size changes are followed by a keyframe.
     WindowChanged(WindowInfo),
     /// The Mac window closed; client should close its window too.
     WindowClosed { window: WindowId },
