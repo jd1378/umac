@@ -347,7 +347,9 @@ impl State {
         let (w, h) = (img.width as i32, img.height as i32);
         let mut pool = SlotPool::new((w * h * 4) as usize, &self.shm).inspect_err(|e| tracing::debug!("cursor pool: {e}")).ok()?;
         let (buffer, canvas) = pool.create_buffer(w, h, w * 4, wl_shm::Format::Argb8888).ok()?;
-        canvas.copy_from_slice(&img.bgra_premultiplied());
+        // The pool rounds slots up (to 64 bytes), so the canvas can be longer than the image.
+        let pixels = img.bgra_premultiplied();
+        canvas.get_mut(..pixels.len())?.copy_from_slice(&pixels);
         let surface = self.compositor.create_surface(&self.qh);
         buffer.attach_to(&surface).ok()?;
         surface.damage_buffer(0, 0, w, h);
