@@ -66,7 +66,7 @@ pub fn popup_offset(info: &WindowInfo) -> (i32, i32) {
 
 /// Top-level kinds the user opened; the session ends when none are left.
 fn is_toplevel(kind: WindowKind) -> bool {
-    matches!(kind, WindowKind::Normal | WindowKind::Desktop)
+    matches!(kind, WindowKind::Normal | WindowKind::Desktop | WindowKind::Dialog)
 }
 
 /// Size to open a window at. Windows match the remote surface exactly; a desktop is capped

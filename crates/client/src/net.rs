@@ -14,7 +14,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc;
 use umac_proto::{
-    ClientMsg, Codec, ColorFormat, DisplayInfo, Hello, HelloReply, HostMsg, InputEvent, PROTOCOL_VERSION, WindowId,
+    ClientMsg, Codec, ColorFormat, DisplayInfo, Hello, HelloReply, HostMsg, InputEvent, LaunchAction, PROTOCOL_VERSION, WindowId,
     WindowInfo, WindowKind,
     video::{HEADER_LEN, ShardHeader},
 };
@@ -33,6 +33,8 @@ use crate::{
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The host waits up to 5 s for a launched app's window; allow for that plus the network.
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_millis(20);
 const STATS_EVERY: Duration = Duration::from_secs(5);
 /// Encoded frames queued for a decode thread. More means the decoder is behind; drop instead.
@@ -107,6 +109,25 @@ impl Session {
         }
     }
 
+    /// Asks the host to run `action` and returns the window it opened, ready to stream.
+    pub async fn launch(&mut self, action: LaunchAction) -> Result<WindowInfo> {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+        write_msg(&mut self.ctrl_send, &ClientMsg::Launch { nonce, action }).await?;
+        let answer = async {
+            loop {
+                match read_msg(&mut self.ctrl_recv).await? {
+                    Some(HostMsg::Launched { nonce: n, result }) if n == nonce => {
+                        return result.map_err(|e| anyhow::anyhow!("host could not launch {action:?}: {e}"));
+                    }
+                    Some(HostMsg::Error { message, .. }) => bail!("host error: {message}"),
+                    Some(_) => continue,
+                    None => bail!("host closed the control stream"),
+                }
+            }
+        };
+        tokio::time::timeout(LAUNCH_TIMEOUT, answer).await.context("host did not answer the launch in time")?
+    }
+
     pub async fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
         write_msg(&mut self.ctrl_send, &ClientMsg::ListWindows).await?;
         loop {
@@ -160,8 +181,12 @@ impl Targets {
 }
 
 struct Stream {
-    /// Set for popups; they close together with their parent.
+    /// Set for popups and dialogs; they close together with their parent.
     parent: Option<WindowId>,
+    pid: i32,
+    kind: WindowKind,
+    /// Opened by the host on its own (popup, new window, dialog), not requested here.
+    auto: bool,
     reassembler: Reassembler,
     gate: KeyframeGate,
     decode_tx: SyncSender<fec::Frame>,
@@ -270,12 +295,12 @@ pub async fn run_open(
                 match msg {
                     HostMsg::StreamStarted { window, codec, color, info } => {
                         let requested = pending.remove(&window);
-                        if !requested && !accept_popup(&info, &streams) {
-                            tracing::debug!(window, parent = ?info.parent, "refusing unsolicited stream");
-                            write_msg(&mut ctrl_send, &ClientMsg::Unsubscribe { window }).await?;
+                        if streams.contains_key(&window) {
                             continue;
                         }
-                        if streams.contains_key(&window) {
+                        if !requested && !accept_unsolicited(&info, &streams, cfg.follow_new_windows) {
+                            tracing::debug!(window, kind = ?info.kind, parent = ?info.parent, "refusing unsolicited stream");
+                            write_msg(&mut ctrl_send, &ClientMsg::Unsubscribe { window }).await?;
                             continue;
                         }
                         tracing::info!(window, ?codec, kind = ?info.kind, w = info.width, h = info.height, "stream started: {}", info.title);
@@ -283,6 +308,9 @@ pub async fn run_open(
                         let parent = if requested { None } else { info.parent };
                         streams.insert(window, Stream {
                             parent,
+                            pid: info.pid,
+                            kind: info.kind,
+                            auto: !requested,
                             reassembler: Reassembler::default(),
                             gate: KeyframeGate::new(Instant::now()),
                             decode_tx,
@@ -381,7 +409,7 @@ pub async fn run_open(
                 }
             }
         }
-        if pending.is_empty() && streams.values().all(|s| s.parent.is_some()) {
+        if pending.is_empty() && streams.values().all(|s| s.kind == WindowKind::Popup) {
             break;
         }
     }
@@ -389,12 +417,26 @@ pub async fn run_open(
     Ok(())
 }
 
-/// Popups are accepted only as children of a window being streamed, and only up to a cap.
-fn accept_popup(info: &WindowInfo, streams: &HashMap<WindowId, Stream>) -> bool {
-    info.kind == WindowKind::Popup
-        && info.parent.is_some_and(|p| streams.contains_key(&p))
-        && streams.values().filter(|s| s.parent.is_some()).count() < MAX_POPUPS
+/// Windows the host opens on its own (each kind capped). Popups need a streamed parent. New
+/// windows and dialogs need `follow_new_windows` and either a streamed parent (file panels
+/// come from another process) or another streamed window of the same app.
+fn accept_unsolicited(info: &WindowInfo, streams: &HashMap<WindowId, Stream>, follow_new_windows: bool) -> bool {
+    let parent_streamed = info.parent.is_some_and(|p| streams.contains_key(&p));
+    let count = |kinds: &[WindowKind]| streams.values().filter(|s| s.auto && kinds.contains(&s.kind)).count();
+    match info.kind {
+        WindowKind::Popup => parent_streamed && count(&[WindowKind::Popup]) < MAX_POPUPS,
+        WindowKind::Normal | WindowKind::Dialog => {
+            let app_streamed = streams.values().any(|s| s.pid == info.pid && s.kind != WindowKind::Popup);
+            follow_new_windows
+                && (parent_streamed || app_streamed)
+                && count(&[WindowKind::Normal, WindowKind::Dialog]) < MAX_AUTO_WINDOWS
+        }
+        WindowKind::Desktop => false,
+    }
 }
+
+/// New windows and dialogs followed at once.
+const MAX_AUTO_WINDOWS: usize = 16;
 
 /// Removes `window` and every popup below it; returns the ids that were streaming.
 fn remove_with_popups(streams: &mut HashMap<WindowId, Stream>, window: WindowId) -> Vec<WindowId> {
@@ -477,8 +519,12 @@ mod tests {
     }
 
     fn stream(parent: Option<WindowId>) -> Stream {
+        let kind = if parent.is_some() { WindowKind::Popup } else { WindowKind::Normal };
         Stream {
             parent,
+            pid: 1,
+            kind,
+            auto: parent.is_some(),
             reassembler: Reassembler::default(),
             gate: KeyframeGate::new(Instant::now()),
             decode_tx: sync_channel(1).0,
@@ -493,12 +539,12 @@ mod tests {
         let mut streams = HashMap::from([(1, stream(None)), (2, stream(Some(1))), (3, stream(Some(2))), (9, stream(None))]);
         let mut popup = win(4, "Safari", WindowKind::Popup);
         popup.parent = Some(1);
-        assert!(accept_popup(&popup, &streams));
+        assert!(accept_unsolicited(&popup, &streams, true));
         popup.parent = Some(77);
-        assert!(!accept_popup(&popup, &streams));
+        assert!(!accept_unsolicited(&popup, &streams, true));
         popup.parent = None;
-        assert!(!accept_popup(&popup, &streams));
-        assert!(!accept_popup(&win(5, "Safari", WindowKind::Normal), &streams));
+        assert!(!accept_unsolicited(&popup, &streams, true));
+        assert!(!accept_unsolicited(&win(6, "Safari", WindowKind::Desktop), &streams, true));
 
         let mut removed = remove_with_popups(&mut streams, 1);
         removed.sort();
@@ -514,7 +560,31 @@ mod tests {
         }
         let mut popup = win(4, "Safari", WindowKind::Popup);
         popup.parent = Some(1);
-        assert!(!accept_popup(&popup, &streams));
+        assert!(!accept_unsolicited(&popup, &streams, true));
+    }
+
+    #[test]
+    fn new_windows_and_dialogs_follow_streamed_apps() {
+        let mut streams: HashMap<WindowId, Stream> = HashMap::from([(1, stream(None))]);
+        let mut other_app = win(5, "Notes", WindowKind::Normal);
+        other_app.pid = 2;
+        // Same app (pid 1) as the streamed window: followed unless disabled.
+        assert!(accept_unsolicited(&win(5, "Safari", WindowKind::Normal), &streams, true));
+        assert!(!accept_unsolicited(&win(5, "Safari", WindowKind::Normal), &streams, false));
+        assert!(!accept_unsolicited(&other_app, &streams, true));
+        // A file panel comes from another process but names a streamed parent.
+        let mut panel = win(6, "Open and Save Panel Service", WindowKind::Dialog);
+        panel.pid = 3;
+        assert!(!accept_unsolicited(&panel, &streams, true));
+        panel.parent = Some(1);
+        assert!(accept_unsolicited(&panel, &streams, true));
+        // Capped.
+        for i in 0..MAX_AUTO_WINDOWS as u32 {
+            let mut s = stream(None);
+            s.auto = true;
+            streams.insert(200 + i, s);
+        }
+        assert!(!accept_unsolicited(&panel, &streams, true));
     }
 
     #[test]

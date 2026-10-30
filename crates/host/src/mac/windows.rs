@@ -9,7 +9,7 @@ use core_foundation::{
 use core_graphics::window::{
     copy_window_info, kCGNullWindowID, kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowLayer,
     kCGWindowListExcludeDesktopElements, kCGWindowListOptionIncludingWindow, kCGWindowListOptionOnScreenOnly,
-    kCGWindowName, kCGWindowNumber, kCGWindowOwnerPID,
+    kCGWindowName, kCGWindowNumber, kCGWindowOwnerName, kCGWindowOwnerPID,
 };
 use screencapturekit::prelude::*;
 use umac_proto::{DisplayInfo, WindowId, WindowInfo, WindowKind};
@@ -152,6 +152,15 @@ pub fn on_screen() -> Vec<OnScreen> {
 
 fn number(d: &CFDictionary<CFString, CFType>, k: &str) -> Option<f64> {
     d.find(CFString::new(k))?.downcast::<CFNumber>()?.to_f64()
+}
+
+/// Name of the process that owns a window.
+pub fn owner_name(id: WindowId) -> Option<String> {
+    let list = copy_window_info(kCGWindowListOptionIncludingWindow, id)?;
+    let raw = *list.iter().next()?;
+    let info: CFDictionary<CFString, CFType> = unsafe { CFDictionary::wrap_under_get_rule(raw as _) };
+    let key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerName) };
+    Some(info.find(key)?.downcast::<CFString>()?.to_string())
 }
 
 /// Current bounds (global points) and title of a window, or `None` once it is gone.

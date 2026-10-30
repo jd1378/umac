@@ -26,6 +26,21 @@ pub struct Config {
     pub clipboard_to_pc: bool,
     /// When this computer's clipboard is sent to the Mac.
     pub clipboard_to_mac: ClipboardToMac,
+    /// Fingerprint of the host the tray and commands without `--host` use.
+    pub selected_host: Option<String>,
+    /// Tray icon line color; `auto` follows the desktop color scheme.
+    pub tray_icon_color: TrayIconColor,
+    /// Open windows, dialogs and sheets that a streamed Mac app opens by itself.
+    pub follow_new_windows: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrayIconColor {
+    #[default]
+    Auto,
+    Black,
+    White,
 }
 
 impl Default for Config {
@@ -38,6 +53,9 @@ impl Default for Config {
             scroll_lines: 3.0,
             clipboard_to_pc: true,
             clipboard_to_mac: ClipboardToMac::OnPaste,
+            selected_host: None,
+            tray_icon_color: TrayIconColor::Auto,
+            follow_new_windows: true,
         }
     }
 }
@@ -88,6 +106,23 @@ impl Store {
         read_json_or_default(&self.dir.join("config.json"))
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Writes the config file.
+    pub fn save_config(&self, cfg: &Config) -> Result<()> {
+        identity::write_private(&self.dir.join("config.json"), &serde_json::to_vec_pretty(cfg)?)?;
+        Ok(())
+    }
+
+    /// Makes `fingerprint` the host used when no `--host` is given.
+    pub fn select_host(&self, fingerprint: &str) -> Result<()> {
+        let mut cfg = self.config()?;
+        cfg.selected_host = Some(fingerprint.to_owned());
+        self.save_config(&cfg)
+    }
+
     pub fn hosts(&self) -> Result<Vec<HostEntry>> {
         read_json_or_default(&self.dir.join("hosts.json"))
     }
@@ -101,11 +136,13 @@ impl Store {
         Ok(())
     }
 
-    /// Picks the named host, or the only paired host when no name is given.
+    /// Picks the named host; without a name the selected host, else the only paired host.
     pub fn host(&self, name: Option<&str>) -> Result<HostEntry> {
         let hosts = self.hosts()?;
+        let selected = self.config()?.selected_host;
         match name {
             Some(n) => hosts.into_iter().find(|h| h.name == n).ok_or_else(|| anyhow!("unknown host {n}")),
+            None if let Some(h) = selected.and_then(|fp| hosts.iter().find(|h| h.fingerprint == fp)) => Ok(h.clone()),
             None if hosts.len() == 1 => Ok(hosts.into_iter().next().unwrap()),
             None if hosts.is_empty() => bail!("no paired host; run `umac pair <link>` first"),
             None => bail!("several hosts paired; pick one with --host"),
@@ -197,6 +234,28 @@ mod tests {
         store.save_host(e.clone()).unwrap();
         assert_eq!(store.host(None).unwrap(), e);
         assert_eq!(store.config().unwrap().bitrate_kbps, 25_000);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn selected_host_is_used_and_persisted() {
+        let dir = std::env::temp_dir().join(format!("umac-client-select-{}", std::process::id()));
+        let store = Store::new(Some(dir.clone())).unwrap();
+        let fp2 = FP.replace("00", "11");
+        let a = HostEntry { name: "a".into(), addr: "1.1.1.1:1".into(), fingerprint: FP.into() };
+        let b = HostEntry { name: "b".into(), addr: "2.2.2.2:2".into(), fingerprint: fp2.clone() };
+        store.save_host(a.clone()).unwrap();
+        store.save_host(b.clone()).unwrap();
+        assert!(store.host(None).is_err());
+        store.select_host(&fp2).unwrap();
+        assert_eq!(store.host(None).unwrap(), b);
+        assert_eq!(store.host(Some("a")).unwrap(), a);
+        // Survives a reload and does not clobber other settings.
+        assert_eq!(Store::new(Some(dir.clone())).unwrap().config().unwrap().selected_host.as_deref(), Some(fp2.as_str()));
+        assert_eq!(store.config().unwrap().max_fps, 60);
+        // A stale selection falls back to the normal rules.
+        store.select_host("ff").unwrap();
+        assert!(store.host(None).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 }

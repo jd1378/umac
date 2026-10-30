@@ -141,6 +141,39 @@ pub fn log_menu_items(x: f64, y: f64) {
 /// Tallest title bar we are willing to crop, in points. Anything deeper is real content.
 const MAX_TITLEBAR: f64 = 64.0;
 
+/// Role, subrole and whether `id` is a sheet attached to another window of `pid`. Sheets are
+/// not in the app's window list, so their parents' children are searched too.
+pub fn window_kind(pid: i32, id: WindowId) -> Option<crate::newwin::AxKind> {
+    let app = Element(unsafe { AXUIElementCreateApplication(pid) });
+    let windows = attr(app.0, "AXWindows")?;
+    let windows: CFArray<CFType> = unsafe { CFArray::wrap_under_get_rule(windows.as_CFTypeRef() as _) };
+    let window_id = |el: AXUIElementRef| {
+        let mut wid = 0u32;
+        (unsafe { _AXUIElementGetWindow(el, &mut wid) } == 0).then_some(wid)
+    };
+    let flag = |el: AXUIElementRef, name: &str| attr(el, name).and_then(|v| v.downcast::<CFBoolean>()).is_some_and(bool::from);
+    let kind = |el: AXUIElementRef, sheet: bool| crate::newwin::AxKind {
+        role: role(el),
+        subrole: attr(el, "AXSubrole").and_then(|v| v.downcast::<CFString>()).map(|s| s.to_string()).unwrap_or_default(),
+        sheet,
+        modal: flag(el, "AXModal"),
+        minimizable: attr(el, "AXMinimizeButton").is_some_and(|b| flag(b.as_CFTypeRef(), "AXEnabled")),
+    };
+    for w in windows.iter() {
+        if window_id(w.as_CFTypeRef()) == Some(id) {
+            return Some(kind(w.as_CFTypeRef(), false));
+        }
+    }
+    for w in windows.iter() {
+        for c in children(w.as_CFTypeRef()) {
+            if role(c.as_CFTypeRef()) == "AXSheet" && window_id(c.as_CFTypeRef()) == Some(id) {
+                return Some(kind(c.as_CFTypeRef(), true));
+            }
+        }
+    }
+    None
+}
+
 pub struct AxWindow {
     app: Element,
     window: CFType,

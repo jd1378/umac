@@ -27,6 +27,34 @@ native popups for Mac menus; `umac open --backend winit` selects the fallback sh
 
 Linux tip: raise `net.core.rmem_max` to 8 MiB or more so keyframe bursts are not dropped.
 
+## Tray
+
+`umac` on its own starts the tray in the background when a Mac is paired (pairing starts it
+too); if it already runs, it just says so. `umac daemon` runs it in the foreground. Left click
+opens Apps; the right-click menu has Apps, Open a terminal window, Show Desktop, Show task
+manager, Paired hosts and Exit. Each action is its own `umac` process (`umac launch apps|
+terminal|activity-monitor|finder`, `umac desktop`), so closing or crashing one never affects
+the tray; failures show as desktop notifications. On macOS 27 the Apps launcher is an
+overlay that cannot be streamed, so Apps shows a Finder window on /Applications instead.
+
+Paired hosts lists every paired Mac as `name (address)`; the checked one is what the tray and
+any command without `--host` use (`"selected_host"` in config.json). The icon's line color
+follows the KDE color scheme (`"tray_icon_color": "auto" | "black" | "white"`).
+
+    umac autostart enable    # start the tray at login (~/.config/autostart/umac.desktop)
+    umac autostart status
+    umac autostart disable
+
+The tray uses the StatusNotifierItem D-Bus protocol (KDE, and GNOME with the AppIndicator
+extension).
+
+## New windows and dialogs
+
+When a streamed app opens a window by itself it opens on the PC too (`"follow_new_windows":
+true`, default). New documents become their own windows; dialogs, sheets, file panels and
+settings windows stay above the window they belong to. Closing one of these on the PC only
+stops streaming it; dismiss it on the Mac side (its buttons, Escape) to close it there.
+
 ## Clipboard
 
 Text only, up to about 900 KB.

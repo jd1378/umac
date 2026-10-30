@@ -1,10 +1,13 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tokio::sync::mpsc;
+use umac_proto::LaunchAction;
 use umac_client::{
+    autostart,
     config::{HostEntry, PairingLink, Store},
+    daemon,
     core::Core,
     net::{self, Targets},
     shell::{Backend, Shell},
@@ -12,13 +15,46 @@ use umac_client::{
 };
 
 #[derive(Parser)]
-#[command(name = "umac", about = "Show individual Mac windows as native windows on this PC")]
+#[command(
+    name = "umac",
+    about = "Show individual Mac windows as native windows on this PC",
+    after_help = "Without a command, starts the tray in the background if a Mac is paired."
+)]
 struct Cli {
     /// Directory for identity, paired hosts and settings (default: ~/.config/umac).
     #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LaunchArg {
+    /// The Mac's Apps launcher (a Finder window on /Applications where it cannot be streamed).
+    Apps,
+    /// A new Terminal window.
+    Terminal,
+    ActivityMonitor,
+    /// A Finder window on /Applications.
+    Finder,
+}
+
+impl From<LaunchArg> for LaunchAction {
+    fn from(a: LaunchArg) -> Self {
+        match a {
+            LaunchArg::Apps => LaunchAction::Apps,
+            LaunchArg::Terminal => LaunchAction::Terminal,
+            LaunchArg::ActivityMonitor => LaunchAction::ActivityMonitor,
+            LaunchArg::Finder => LaunchAction::FinderApplications,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AutostartArg {
+    Enable,
+    Disable,
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -51,6 +87,22 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Backend::Auto)]
         backend: Backend,
     },
+    /// Open something on the Mac (a new Terminal window, Activity Monitor...) and stream it.
+    Launch {
+        #[arg(value_enum)]
+        what: LaunchArg,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long, value_enum, default_value_t = Backend::Auto)]
+        backend: Backend,
+    },
+    /// Run the tray in the foreground (`umac` alone starts it in the background).
+    Daemon,
+    /// Start the tray at login, or stop doing so.
+    Autostart {
+        #[arg(value_enum)]
+        action: AutostartArg,
+    },
     /// List the host's displays.
     Displays {
         #[arg(long)]
@@ -79,9 +131,31 @@ fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    let config_dir = cli.config_dir.clone();
     let store = Store::new(cli.config_dir)?;
     let rt = tokio::runtime::Runtime::new()?;
-    match cli.cmd {
+    let result = run(&rt, store, config_dir, cli.cmd);
+    if let Err(e) = &result
+        && std::env::var_os(daemon::NOTIFY_ENV).is_some()
+    {
+        rt.block_on(daemon::notify("umac", &format!("{e:#}")));
+    }
+    result
+}
+
+fn run(rt: &tokio::runtime::Runtime, store: Store, config_dir: Option<PathBuf>, cmd: Option<Cmd>) -> Result<()> {
+    let Some(cmd) = cmd else {
+        if store.hosts()?.is_empty() {
+            println!("No Mac paired yet. Run `umac-host pair` on the Mac, then `umac pair '<link>'` here.");
+        } else if daemon::is_running(&daemon::lock_dir(store.dir()))? {
+            println!("umac is already running in the tray.");
+        } else {
+            daemon::spawn_detached(config_dir.as_deref())?;
+            println!("umac started in the tray.");
+        }
+        return Ok(());
+    };
+    match cmd {
         Cmd::Pair { link, name } => {
             let link: PairingLink = link.parse()?;
             let mut entry =
@@ -89,7 +163,14 @@ fn main() -> Result<()> {
             let session = rt.block_on(net::connect(&store, &entry, Some(link.token)))?;
             entry.name = name.unwrap_or(session.host_name);
             store.save_host(entry.clone())?;
+            if store.host(None).is_err() {
+                store.select_host(&entry.fingerprint)?;
+            }
             println!("paired with {} at {}", entry.name, entry.addr);
+            if !daemon::is_running(&daemon::lock_dir(store.dir()))? {
+                daemon::spawn_detached(config_dir.as_deref())?;
+                println!("umac started in the tray.");
+            }
         }
         Cmd::Hosts => {
             for h in store.hosts()? {
@@ -106,6 +187,45 @@ fn main() -> Result<()> {
             for w in windows {
                 let size = format!("{}x{}", w.width, w.height);
                 println!("{:>8}  {:<24} {:>11}  {}", w.id, w.app_name, size, w.title);
+            }
+        }
+        Cmd::Launch { what, host, backend } => {
+            let entry = store.host(host.as_deref())?;
+            let action = LaunchAction::from(what);
+            let info = rt.block_on(async {
+                let mut s = net::connect(&store, &entry, None).await?;
+                match s.launch(action).await {
+                    Err(e) if action == LaunchAction::Apps => {
+                        tracing::info!("{e:#}; showing /Applications instead");
+                        s.launch(LaunchAction::FinderApplications).await
+                    }
+                    r => r,
+                }
+            })?;
+            run_streams(rt, store, entry, Targets { windows: vec![info.id], ..Default::default() }, backend)?;
+        }
+        Cmd::Daemon => rt.block_on(daemon::run(store, config_dir))?,
+        Cmd::Autostart { action } => {
+            let paths = autostart::Paths::for_user()?;
+            let exe = std::env::current_exe()?;
+            match action {
+                AutostartArg::Enable => {
+                    autostart::enable(&paths, &exe)?;
+                    println!("umac starts in the tray at login ({})", paths.entry.display());
+                }
+                AutostartArg::Disable => match autostart::disable(&paths)? {
+                    true => println!("umac no longer starts at login"),
+                    false => println!("autostart was not enabled"),
+                },
+                AutostartArg::Status => match autostart::status(&paths, &exe)? {
+                    autostart::Status::Disabled => println!("autostart: disabled"),
+                    autostart::Status::Enabled { exec, current } => {
+                        println!("autostart: enabled\nExec={exec}");
+                        if !current {
+                            println!("warning: this runs a different binary than {}; run `umac autostart enable` to update it", exe.display());
+                        }
+                    }
+                },
             }
         }
         Cmd::Displays { host } => {
@@ -131,12 +251,12 @@ fn main() -> Result<()> {
                 })?,
             };
             let targets = Targets { displays: vec![index], desktop_bitrate_kbps: bitrate, ..Default::default() };
-            run_streams(&rt, store, entry, targets, backend)?;
+            run_streams(rt, store, entry, targets, backend)?;
         }
         Cmd::Open { host, windows, apps, backend } => {
             anyhow::ensure!(!windows.is_empty() || !apps.is_empty(), "give at least one --window or --app");
             let entry = store.host(host.as_deref())?;
-            run_streams(&rt, store, entry, Targets { windows, apps, ..Default::default() }, backend)?;
+            run_streams(rt, store, entry, Targets { windows, apps, ..Default::default() }, backend)?;
         }
     }
     Ok(())

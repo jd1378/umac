@@ -1,0 +1,13 @@
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; ksni 0.3.7 still requires zbus 5" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; same blocker" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; same blocker" },
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

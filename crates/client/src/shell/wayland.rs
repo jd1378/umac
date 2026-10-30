@@ -368,6 +368,12 @@ impl State {
                 let window = self.xdg.create_window(surface, WindowDecorations::RequestServer, &self.qh);
                 window.set_title(core::title(&info));
                 window.set_app_id(APP_ID);
+                // Dialogs stay above their parent, grouped with it like native dialogs.
+                if info.kind == WindowKind::Dialog
+                    && let Some(Shape::Toplevel(parent)) = info.parent.and_then(|p| self.nodes.get(&p)).map(|n| &n.shape)
+                {
+                    window.set_parent(Some(parent));
+                }
                 window.commit();
                 Shape::Toplevel(window)
             }

@@ -35,7 +35,7 @@ use super::{
     pasteboard, permissions,
     stream::{StreamParams, WindowStream},
     windows::{self, Geometry, OnScreen},
-    ax::AxWindow,
+    ax::{self, AxWindow},
 };
 use crate::{
     auth::AuthStore,
@@ -43,6 +43,7 @@ use crate::{
     config::Settings,
     encode::EncodedFrame,
     input_state::Placement,
+    newwin,
     popup::{self, Candidate},
     status::Status,
 };
@@ -217,6 +218,8 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
         codec,
         streams: HashMap::new(),
         dismissed: HashSet::new(),
+        known: None,
+        pending_new: HashMap::new(),
         frames_tx,
         replies: reply_tx,
     };
@@ -319,6 +322,8 @@ struct ActiveStream {
     popup_of: Option<WindowId>,
     /// Set for desktop streams: the captured display (`CGDirectDisplayID`).
     display: Option<u32>,
+    /// Opened by the app itself (new window, dialog), not subscribed by the client.
+    auto: bool,
 }
 
 struct Session {
@@ -326,8 +331,13 @@ struct Session {
     shared: Arc<Shared>,
     codec: Codec,
     streams: HashMap<WindowId, ActiveStream>,
-    /// Popups the client closed while they are still open on the Mac; not restarted.
+    /// Popups and followed windows the client closed while they are still open on the Mac;
+    /// not restarted.
     dismissed: HashSet<WindowId>,
+    /// Layer 0 windows seen by the last poll, to spot the ones streamed apps open.
+    known: Option<HashSet<WindowId>>,
+    /// New windows waiting for Accessibility to describe them, with when they appeared.
+    pending_new: HashMap<WindowId, Instant>,
     frames_tx: mpsc::Sender<(WindowId, EncodedFrame)>,
     /// Messages from background work (input thread, launches) to this session's client.
     replies: Reply,
@@ -463,7 +473,7 @@ impl Session {
                 // Closing a popup on the client does not dismiss it on the Mac: a synthetic
                 // Escape could land in another window if the menu already closed itself. The
                 // click that dismissed it on the client reaches the Mac and closes it there.
-                if self.streams.get(&window).is_some_and(|s| s.popup_of.is_some()) {
+                if self.streams.get(&window).is_some_and(|s| s.popup_of.is_some() || s.auto) {
                     self.dismissed.insert(window);
                 }
                 self.close(window, send).await?;
@@ -513,6 +523,18 @@ impl Session {
             fps: (max_fps as u32).clamp(1, 120),
             bitrate_kbps: self.shared.settings.clamp_bitrate(bitrate_kbps),
         };
+        self.start_window(params, WindowKind::Normal, None, false).await
+    }
+
+    /// Captures one Mac window with its title bar cropped. `parent` places dialogs.
+    async fn start_window(
+        &mut self,
+        params: StreamParams,
+        kind: WindowKind,
+        parent: Option<WindowId>,
+        auto: bool,
+    ) -> anyhow::Result<WindowInfo> {
+        let window = params.window;
         let tx = self.frames_tx.clone();
         let on_encoded = Arc::new(move |w: WindowId, f: EncodedFrame| tx.try_send((w, f)).is_ok());
         let (stream, sc_info, inset) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -524,6 +546,7 @@ impl Session {
         })
         .await??;
         let geometry = windows::geometry(window).ok_or_else(|| anyhow!("window {window} vanished"))?;
+        let offset = parent.and_then(|p| self.dialog_offset(p, &geometry, inset)).unwrap_or((0, 0));
         let info = WindowInfo {
             id: window,
             pid: sc_info.0,
@@ -533,14 +556,72 @@ impl Session {
             width: stream.size.0,
             height: stream.size.1,
             scale: stream.scale(),
-            parent: None,
-            offset: (0, 0),
-            kind: umac_proto::WindowKind::Normal,
+            parent,
+            offset,
+            kind,
         };
         self.set_target(&info, &geometry, inset);
-        tracing::info!(window, app = %info.app_name, size = ?stream.size, inset, ?params, "stream started");
-        self.streams.insert(window, ActiveStream { stream, info: info.clone(), geometry, inset, popup_of: None, display: None });
+        tracing::info!(window, app = %info.app_name, ?kind, ?parent, auto, size = ?stream.size, inset, ?params, "stream started");
+        self.streams.insert(window, ActiveStream { stream, info: info.clone(), geometry, inset, popup_of: None, display: None, auto });
         Ok(info)
+    }
+
+    /// Dialog content origin relative to its parent's surface, in parent surface pixels.
+    fn dialog_offset(&self, parent: WindowId, g: &Geometry, inset: f64) -> Option<(i32, i32)> {
+        let (origin, scale) = self.parent_origin(parent)?;
+        Some(popup::offset((g.x, g.y + inset), origin, scale))
+    }
+
+    /// Follows a window the app opened by itself, once Accessibility can describe it.
+    /// Returns false while it should be retried on a later poll.
+    async fn follow_new(&mut self, w: OnScreen, seen: Instant, pids: &HashSet<i32>, send: &mut Ctl) -> anyhow::Result<bool> {
+        if w.width < newwin::MIN_SIZE || w.height < newwin::MIN_SIZE || self.dismissed.contains(&w.id) {
+            return Ok(true);
+        }
+        let panel = !pids.contains(&w.pid);
+        if panel && !tokio::task::spawn_blocking(move || windows::owner_name(w.id)).await?.is_some_and(|n| newwin::is_panel_service(&n)) {
+            return Ok(true);
+        }
+        if self.streams.values().filter(|s| s.auto).count() >= newwin::MAX_AUTO {
+            tracing::info!(window = w.id, "not following new window: limit reached");
+            return Ok(true);
+        }
+        let (pid, id) = (w.pid, w.id);
+        let ax = tokio::task::spawn_blocking(move || ax::window_kind(pid, id)).await?;
+        let late = seen.elapsed().as_millis() as u64 >= newwin::CLASSIFY_GRACE_MS;
+        let kind = match (&ax, panel) {
+            (Some(ax), false) => newwin::classify(ax),
+            (_, true) => WindowKind::Dialog,
+            // Popovers and other transient panels have no AX window; keep them with the app.
+            (None, false) if late => WindowKind::Dialog,
+            (None, false) => return Ok(false),
+        };
+        let parent = match kind {
+            WindowKind::Dialog => {
+                let parent = if panel { self.active_root() } else { self.popup_parent(pid) };
+                Some(parent.ok_or_else(|| anyhow!("no parent for dialog {id}"))?)
+            }
+            _ => None,
+        };
+        let template = parent
+            .and_then(|p| self.streams.get(&p))
+            .or_else(|| self.streams.values().find(|s| s.info.pid == pid && s.popup_of.is_none() && s.display.is_none()))
+            .map(|s| s.stream.params())
+            .ok_or_else(|| anyhow!("no stream to copy settings from"))?;
+        let info = self.start_window(StreamParams { window: id, ..template }, kind, parent, true).await?;
+        tracing::info!(window = id, ?kind, ?parent, ?ax, ms = seen.elapsed().as_millis() as u64, "following new window");
+        write_msg(send, &HostMsg::StreamStarted { window: id, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info })
+            .await?;
+        Ok(true)
+    }
+
+    /// The streamed window the user works in (a popup resolves to its parent), for file panels
+    /// that a separate process shows on behalf of the app.
+    fn active_root(&self) -> Option<WindowId> {
+        let usable = |id: &WindowId| self.streams.get(id).is_some_and(|s| s.display.is_none() && s.popup_of.is_none());
+        let active = *self.shared.active.lock().unwrap();
+        let active = active.map(|a| self.streams.get(&a).and_then(|s| s.popup_of).unwrap_or(a));
+        active.filter(usable).or_else(|| self.streams.keys().copied().filter(usable).min())
     }
 
     async fn subscribe_display(&mut self, index: u32, max_fps: u16, bitrate_kbps: u32) -> anyhow::Result<WindowInfo> {
@@ -583,7 +664,7 @@ impl Session {
         tracing::info!(window, display = display_id, size = ?stream.size, ?params, "desktop stream started");
         self.streams.insert(
             window,
-            ActiveStream { stream, info: info.clone(), geometry, inset: 0.0, popup_of: None, display: Some(display_id) },
+            ActiveStream { stream, info: info.clone(), geometry, inset: 0.0, popup_of: None, display: Some(display_id), auto: false },
         );
         Ok(info)
     }
@@ -607,8 +688,12 @@ impl Session {
 
     /// Stops a stream and its popups, telling the client about every window that went away.
     async fn close(&mut self, window: WindowId, send: &mut Ctl) -> anyhow::Result<()> {
-        let mut gone: Vec<WindowId> =
-            self.streams.iter().filter(|(_, s)| s.popup_of == Some(window)).map(|(&id, _)| id).collect();
+        let mut gone: Vec<WindowId> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| s.popup_of == Some(window) || (s.auto && s.info.parent == Some(window)))
+            .map(|(&id, _)| id)
+            .collect();
         gone.push(window);
         for id in gone {
             if self.streams.contains_key(&id) {
@@ -636,8 +721,16 @@ impl Session {
                 self.close(id, send).await?;
                 continue;
             };
+            let s = &self.streams[&id];
+            // Dialogs and sheets move with their parent, which changes the offset too.
+            let offset = s.info.parent.and_then(|p| self.dialog_offset(p, &g, s.inset)).unwrap_or(s.info.offset);
             let s = self.streams.get_mut(&id).unwrap();
+            let moved = offset != s.info.offset;
+            s.info.offset = offset;
             if g == s.geometry {
+                if moved {
+                    write_msg(send, &HostMsg::WindowChanged(s.info.clone())).await?;
+                }
                 continue;
             }
             let scale = s.info.scale as f64;
@@ -657,7 +750,7 @@ impl Session {
             s.geometry = g;
             let (info, geometry, inset) = (s.info.clone(), s.geometry.clone(), s.inset);
             self.set_target(&info, &geometry, inset);
-            if resized || retitled {
+            if resized || retitled || moved {
                 write_msg(send, &HostMsg::WindowChanged(info)).await?;
             }
         }
@@ -693,11 +786,35 @@ impl Session {
         let pids: HashSet<i32> =
             self.streams.values().filter(|s| s.popup_of.is_none() && s.display.is_none()).map(|s| s.info.pid).collect();
         if pids.is_empty() && self.dismissed.is_empty() {
+            // Nothing to follow: start over so windows opened meanwhile do not count as new.
+            self.known = None;
+            self.pending_new.clear();
             return Ok(());
         }
         let now = Instant::now();
         let list: HashMap<WindowId, OnScreen> = windows::on_screen().into_iter().map(|w| (w.id, w)).collect();
         self.dismissed.retain(|id| list.contains_key(id));
+
+        let snapshot: Vec<(WindowId, i32)> = list.values().map(|w| (w.id, w.layer)).collect();
+        for id in newwin::fresh(&mut self.known, &snapshot) {
+            self.pending_new.insert(id, now);
+        }
+        self.pending_new.retain(|id, _| list.contains_key(id) && !self.streams.contains_key(id));
+        if !pids.is_empty() {
+            let pending: Vec<(WindowId, Instant)> = self.pending_new.iter().map(|(&id, &t)| (id, t)).collect();
+            for (id, seen) in pending {
+                let done = match self.follow_new(list[&id], seen, &pids, send).await {
+                    Ok(done) => done,
+                    Err(e) => {
+                        tracing::debug!(window = id, "not following new window: {e:#}");
+                        true
+                    }
+                };
+                if done {
+                    self.pending_new.remove(&id);
+                }
+            }
+        }
 
         let popups: Vec<WindowId> = self.streams.iter().filter(|(_, s)| s.popup_of.is_some()).map(|(&id, _)| id).collect();
         for id in popups {
@@ -781,7 +898,7 @@ impl Session {
         }
         let geometry = Geometry { x: w.x, y: w.y, width: w.width, height: w.height, title: String::new(), on_screen: true };
         self.set_popup_target(&info, &geometry);
-        self.streams.insert(id, ActiveStream { stream, info: info.clone(), geometry, inset: 0.0, popup_of: Some(parent), display: None });
+        self.streams.insert(id, ActiveStream { stream, info: info.clone(), geometry, inset: 0.0, popup_of: Some(parent), display: None, auto: false });
         write_msg(send, &HostMsg::StreamStarted { window: id, codec: self.codec, color: ColorFormat::Yuv420Bt709Limited, info })
             .await?;
         Ok(())

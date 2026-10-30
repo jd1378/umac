@@ -65,6 +65,13 @@ impl App {
             let (dx, dy) = core::popup_offset(&info);
             attrs = attrs.with_decorations(false).with_position(PhysicalPosition::new(origin.x + dx, origin.y + dy));
         }
+        // Dialogs open over their parent where the window manager allows placement (X11).
+        if info.kind == WindowKind::Dialog
+            && let Some(origin) = info.parent.and_then(|p| self.window(p)).and_then(|w| w.inner_position().ok())
+        {
+            let (dx, dy) = core::popup_offset(&info);
+            attrs = attrs.with_position(PhysicalPosition::new(origin.x + dx, origin.y + dy));
+        }
         let window = Arc::new(el.create_window(attrs)?);
         // A desktop stream has the Mac cursor drawn in.
         if info.kind == WindowKind::Desktop {
