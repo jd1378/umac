@@ -29,7 +29,10 @@ jobs:
           persist-credentials: false
       - name: Version
         id: version
-        run: echo "version=$(scripts/release-version.sh)" >> "$GITHUB_OUTPUT"
+        run: |
+          version=$(bash scripts/release-version.sh)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - run: cargo build --locked --release -p umac-host
       - name: Package
         run: |
@@ -77,7 +80,10 @@ jobs:
           fi
       - name: Version
         id: version
-        run: echo "version=$(scripts/release-version.sh)" >> "$GITHUB_OUTPUT"
+        run: |
+          version=$(bash scripts/release-version.sh)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - run: cargo build --locked --release -p umac-client
       - name: Package
         run: |
