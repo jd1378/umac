@@ -9,6 +9,7 @@ mod config;
 mod cursor;
 mod encode;
 mod input_state;
+mod launch;
 mod popup;
 #[cfg(target_os = "macos")]
 mod mac;

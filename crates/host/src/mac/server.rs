@@ -31,6 +31,7 @@ use super::{
     capture::{self, Rect, display_at, find_window},
     cursor as mac_cursor,
     input::{self, ClipboardLink, Command, Reply, Target, Targets},
+    launch,
     pasteboard, permissions,
     stream::{StreamParams, WindowStream},
     windows::{self, Geometry, OnScreen},
@@ -208,10 +209,17 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
     static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
     let (reply_tx, reply_rx) = mpsc::unbounded_channel::<HostMsg>();
-    let input_task = tokio::spawn(read_input(conn.clone(), shared.clone(), id, reply_tx));
+    let input_task = tokio::spawn(read_input(conn.clone(), shared.clone(), id, reply_tx.clone()));
 
-    let mut session =
-        Session { id, shared: shared.clone(), codec, streams: HashMap::new(), dismissed: HashSet::new(), frames_tx };
+    let mut session = Session {
+        id,
+        shared: shared.clone(),
+        codec,
+        streams: HashMap::new(),
+        dismissed: HashSet::new(),
+        frames_tx,
+        replies: reply_tx,
+    };
     let result = session.control_loop(&mut send, recv, reply_rx).await;
 
     let windows: Vec<WindowId> = session.streams.keys().copied().collect();
@@ -321,6 +329,8 @@ struct Session {
     /// Popups the client closed while they are still open on the Mac; not restarted.
     dismissed: HashSet<WindowId>,
     frames_tx: mpsc::Sender<(WindowId, EncodedFrame)>,
+    /// Messages from background work (input thread, launches) to this session's client.
+    replies: Reply,
 }
 
 type Ctl = quinn::SendStream;
@@ -406,6 +416,20 @@ impl Session {
     async fn on_message(&mut self, msg: ClientMsg, send: &mut Ctl) -> anyhow::Result<()> {
         match msg {
             ClientMsg::Ping { nonce } => write_msg(send, &HostMsg::Pong { nonce }).await?,
+            ClientMsg::Launch { nonce, action } => {
+                // Launches wait seconds for a window; run them aside so the session stays live.
+                let replies = self.replies.clone();
+                tokio::spawn(async move {
+                    let result = match tokio::task::spawn_blocking(move || launch::run(action)).await {
+                        Ok(r) => r.map_err(|e| format!("{e:#}")),
+                        Err(e) => Err(format!("launch task: {e}")),
+                    };
+                    if let Err(e) = &result {
+                        tracing::warn!(?action, "launch failed: {e}");
+                    }
+                    let _ = replies.send(HostMsg::Launched { nonce, result });
+                });
+            }
             ClientMsg::ListWindows => {
                 let reply = match tokio::task::spawn_blocking(windows::list).await? {
                     Ok(list) => HostMsg::Windows(list),

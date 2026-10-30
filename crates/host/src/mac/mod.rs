@@ -4,6 +4,7 @@ pub mod capture_test;
 pub mod cursor;
 pub mod ffi;
 pub mod input;
+pub mod launch;
 pub mod pasteboard;
 pub mod permissions;
 pub mod server;
