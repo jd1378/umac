@@ -4,11 +4,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use umac_client::{
-    app::App,
     config::{HostEntry, PairingLink, Store},
-    net::{self, Targets, UiEvent},
+    core::Core,
+    net::{self, Targets},
+    shell::{Backend, Shell},
+    ui::UiEvent,
 };
-use winit::event_loop::EventLoop;
 
 #[derive(Parser)]
 #[command(name = "umac", about = "Show individual Mac windows as native windows on this PC")]
@@ -46,6 +47,9 @@ enum Cmd {
         /// Every normal window of an app, by name or bundle id (repeatable).
         #[arg(long = "app")]
         apps: Vec<String>,
+        /// Windowing backend.
+        #[arg(long, value_enum, default_value_t = Backend::Auto)]
+        backend: Backend,
     },
 }
 
@@ -86,27 +90,25 @@ fn main() -> Result<()> {
                 println!("{:>8}  {:<24} {:>11}  {}", w.id, w.app_name, size, w.title);
             }
         }
-        Cmd::Open { host, windows, apps } => {
+        Cmd::Open { host, windows, apps, backend } => {
             anyhow::ensure!(!windows.is_empty() || !apps.is_empty(), "give at least one --window or --app");
             let entry = store.host(host.as_deref())?;
             let cfg = store.config()?;
-            let event_loop = EventLoop::<UiEvent>::with_user_event().build()?;
-            let proxy = event_loop.create_proxy();
+            let shell = Shell::new(backend)?;
+            let ui = shell.sender();
             let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
             let net_cmd_tx = cmd_tx.clone();
             let net_cfg = cfg.clone();
             rt.spawn(async move {
                 let result = async {
                     let session = net::connect(&store, &entry, None).await?;
-                    net::run_open(session, Targets { windows, apps }, net_cfg, proxy.clone(), net_cmd_tx, cmd_rx).await
+                    net::run_open(session, Targets { windows, apps }, net_cfg, ui.clone(), net_cmd_tx, cmd_rx).await
                 }
                 .await;
                 let reason = result.err().map(|e| format!("{e:#}")).unwrap_or_default();
-                let _ = proxy.send_event(UiEvent::Shutdown(reason));
+                ui.send(UiEvent::Shutdown(reason));
             });
-            let mut app = App::new(cfg, cmd_tx);
-            event_loop.run_app(&mut app).context("event loop")?;
-            if let Some(e) = app.error {
+            if let Some(e) = shell.run(Core::new(cfg, cmd_tx)).context("window system")? {
                 anyhow::bail!(e);
             }
         }

@@ -1,0 +1,175 @@
+//! winit shell: fallback for X11 and non-Linux platforms. Popups become undecorated windows
+//! placed at the parent's position plus the popup offset, which works where clients may
+//! position windows (X11, Windows) and degrades to compositor placement elsewhere.
+
+use std::{collections::HashMap, sync::Arc, time::Instant};
+
+use anyhow::Context;
+use umac_proto::{MouseButton, WindowId, WindowInfo, WindowKind};
+use winit::{
+    application::ApplicationHandler,
+    dpi::{PhysicalPosition, PhysicalSize},
+    event::{ElementState, MouseScrollDelta, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::PhysicalKey,
+    window::{Window, WindowId as LocalId},
+};
+
+use crate::{
+    core::{self, Core, LINE_PX},
+    keymap,
+    ui::{UiEvent, UiSender},
+};
+
+pub struct Shell {
+    event_loop: EventLoop<UiEvent>,
+}
+
+impl Shell {
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self { event_loop: EventLoop::<UiEvent>::with_user_event().build()? })
+    }
+
+    pub fn sender(&self) -> UiSender {
+        let proxy = self.event_loop.create_proxy();
+        UiSender::new(move |ev| proxy.send_event(ev).is_ok())
+    }
+
+    pub fn run(self, core: Core) -> anyhow::Result<Option<String>> {
+        let mut app = App { core, windows: HashMap::new(), by_remote: HashMap::new() };
+        self.event_loop.run_app(&mut app).context("event loop")?;
+        Ok(app.core.error.take())
+    }
+}
+
+struct App {
+    core: Core,
+    windows: HashMap<LocalId, (WindowId, Arc<Window>)>,
+    by_remote: HashMap<WindowId, LocalId>,
+}
+
+impl App {
+    fn window(&self, remote: WindowId) -> Option<&Arc<Window>> {
+        self.windows.get(self.by_remote.get(&remote)?).map(|(_, w)| w)
+    }
+
+    fn open(&mut self, el: &ActiveEventLoop, info: WindowInfo) -> anyhow::Result<()> {
+        let size = PhysicalSize::new(info.width.max(1), info.height.max(1));
+        let mut attrs = Window::default_attributes().with_title(core::title(&info)).with_inner_size(size);
+        if info.kind == WindowKind::Popup {
+            let parent = info.parent.and_then(|p| self.window(p)).context("popup parent is not shown")?;
+            let origin = parent.inner_position().unwrap_or_default();
+            let (dx, dy) = core::popup_offset(&info);
+            attrs = attrs.with_decorations(false).with_position(PhysicalPosition::new(origin.x + dx, origin.y + dy));
+        }
+        let window = Arc::new(el.create_window(attrs)?);
+        let surface = self.core.instance().create_surface(window.clone())?;
+        let size = window.inner_size();
+        let id = info.id;
+        self.core.attach(info, surface, (size.width, size.height))?;
+        self.by_remote.insert(id, window.id());
+        self.windows.insert(window.id(), (id, window));
+        Ok(())
+    }
+
+    fn close(&mut self, el: &ActiveEventLoop, remote: WindowId) {
+        for w in std::iter::once(remote).chain(self.core.descendants(remote)) {
+            self.core.remove(w);
+            if let Some(local) = self.by_remote.remove(&w) {
+                self.windows.remove(&local);
+            }
+        }
+        if self.core.should_exit() {
+            el.exit();
+        }
+    }
+}
+
+impl ApplicationHandler<UiEvent> for App {
+    fn resumed(&mut self, _el: &ActiveEventLoop) {}
+
+    fn user_event(&mut self, el: &ActiveEventLoop, event: UiEvent) {
+        match event {
+            UiEvent::Open(info) => {
+                let (id, popup) = (info.id, info.kind == WindowKind::Popup);
+                if let Err(e) = self.open(el, info) {
+                    tracing::error!("opening window: {e:#}");
+                    if !popup {
+                        self.core.close_requested(id);
+                    }
+                }
+            }
+            UiEvent::Frame { window, frame } => self.core.frame(window, &frame),
+            UiEvent::Changed(info) => {
+                let (id, kind, offset, parent) = (info.id, info.kind, core::popup_offset(&info), info.parent);
+                let Some(change) = self.core.changed(info) else { return };
+                let Some(window) = self.window(id).cloned() else { return };
+                window.set_title(&change.title);
+                if let Some((w, h)) = change.snap {
+                    let _ = window.request_inner_size(PhysicalSize::new(w, h));
+                }
+                if kind == WindowKind::Popup
+                    && change.reposition
+                    && let Some(origin) = parent.and_then(|p| self.window(p)).and_then(|p| p.inner_position().ok())
+                {
+                    window.set_outer_position(PhysicalPosition::new(origin.x + offset.0, origin.y + offset.1));
+                }
+            }
+            UiEvent::Closed(window) => self.close(el, window),
+            UiEvent::Shutdown(reason) => {
+                if !reason.is_empty() {
+                    self.core.error = Some(reason);
+                }
+                el.exit();
+            }
+        }
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, id: LocalId, event: WindowEvent) {
+        let Some(&(remote, _)) = self.windows.get(&id) else { return };
+        let core = &mut self.core;
+        match event {
+            WindowEvent::CloseRequested => {
+                core.close_requested(remote);
+                self.close(el, remote);
+            }
+            WindowEvent::Resized(size) => core.resized(remote, (size.width, size.height)),
+            WindowEvent::RedrawRequested => core.redraw(remote),
+            WindowEvent::CursorMoved { position, .. } => core.pointer_moved(remote, position.x, position.y),
+            WindowEvent::MouseInput { state, button, .. } => {
+                let button = match button {
+                    winit::event::MouseButton::Left => MouseButton::Left,
+                    winit::event::MouseButton::Right => MouseButton::Right,
+                    winit::event::MouseButton::Middle => MouseButton::Middle,
+                    winit::event::MouseButton::Back => MouseButton::Other(3),
+                    winit::event::MouseButton::Forward => MouseButton::Other(4),
+                    winit::event::MouseButton::Other(n) => MouseButton::Other(n.min(255) as u8),
+                };
+                core.button(remote, button, state == ElementState::Pressed);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Positive dy scrolls up (wheel away from the user), as in winit and CGEvent.
+                let (dx, dy, precise) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x * LINE_PX, y * LINE_PX, false),
+                    MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32, true),
+                };
+                core.scroll(remote, dx, dy, precise);
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && !event.repeat
+                    && let Some(keycode) = keymap::to_mac(code, core.swap_ctrl_cmd())
+                {
+                    core.key(remote, keycode, event.state == ElementState::Pressed);
+                }
+            }
+            WindowEvent::Focused(focused) => core.focus(remote, focused),
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        let next = self.core.flush_resizes(Instant::now());
+        el.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+}

@@ -21,4 +21,8 @@ the printed `umac://...` pairing string. On the PC:
     umac list
     umac open --app Safari
 
+The Linux client needs `libxkbcommon` at build and run time (Fedora: `libxkbcommon-devel`)
+and ffmpeg with VA-API (`ffmpeg-devel`, `mesa-va-drivers-freeworld`). On Wayland it uses
+native popups for Mac menus; `umac open --backend winit` selects the fallback shell.
+
 Linux tip: raise `net.core.rmem_max` to 8 MiB or more so keyframe bursts are not dropped.

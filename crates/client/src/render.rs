@@ -1,10 +1,9 @@
 //! wgpu presentation: one surface per window, NV12 uploaded as R8 + RG8 textures and
 //! converted to RGB in the fragment shader.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use winit::window::Window;
 
 use crate::{decode::Nv12Frame, viewport::Viewport};
 
@@ -52,7 +51,6 @@ fn fs_srgb(v: VsOut) -> @location(0) vec4<f32> {
 
 /// GPU objects shared by every window.
 pub struct Gpu {
-    instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -64,15 +62,8 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    /// Creates the device using the first window's surface to pick a compatible adapter.
-    pub fn new(window: Arc<Window>) -> Result<(Self, wgpu::Surface<'static>)> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let surface = instance.create_surface(window).context("creating surface")?;
-        let gpu = Self::with_instance(instance, Some(&surface))?;
-        Ok((gpu, surface))
-    }
-
-    fn with_instance(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Result<Self> {
+    /// Creates the device, picking an adapter that can present to `surface` (the first window's).
+    pub fn with_instance(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Result<Self> {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: surface,
@@ -118,11 +109,7 @@ impl Gpu {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        Ok(Self { instance, adapter, device, queue, layout, pipeline_layout, shader, sampler, pipelines: HashMap::new() })
-    }
-
-    pub fn create_surface(&self, window: Arc<Window>) -> Result<wgpu::Surface<'static>> {
-        Ok(self.instance.create_surface(window)?)
+        Ok(Self { adapter, device, queue, layout, pipeline_layout, shader, sampler, pipelines: HashMap::new() })
     }
 
     fn draw(&mut self, target: &wgpu::TextureView, format: wgpu::TextureFormat, frame: Option<(&FrameTextures, Viewport)>) {
@@ -377,7 +364,7 @@ mod tests {
     #[test]
     fn bt709_limited_conversion() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let Ok(mut gpu) = Gpu::with_instance(instance, None) else {
+        let Ok(mut gpu) = Gpu::with_instance(&instance, None) else {
             eprintln!("no GPU, skipping");
             return;
         };

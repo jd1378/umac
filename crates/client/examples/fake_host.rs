@@ -1,5 +1,7 @@
 //! Minimal stand-in for the Mac host, for testing the client on one machine.
 //! Serves one fake window that streams an HEVC clip in a loop and logs received input.
+//! After subscribing it also opens two popups (one inside the window, one hanging past its
+//! top-right corner) and closes them a few seconds later.
 //!
 //!   cargo run -p umac-client --example fake_host -- <state-dir> [port]
 
@@ -22,6 +24,9 @@ use umac_transport::{
 };
 
 const WINDOW: u32 = 4242;
+const POPUP_IN: u32 = 4243;
+const POPUP_OUT: u32 = 4244;
+const POPUP_SIZE: (u32, u32) = (320, 192);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,15 +40,21 @@ async fn main() -> Result<()> {
         sample::generate_hevc(&clip, 1280, 720, 4)?;
     }
     let packets = Arc::new(sample::read_packets(&clip)?);
+    let popup_clip = dir.join("popup.ts");
+    if !popup_clip.exists() {
+        sample::generate_hevc(&popup_clip, POPUP_SIZE.0, POPUP_SIZE.1, 4)?;
+    }
+    let popup_packets = Arc::new(sample::read_packets(&popup_clip)?);
     let token = random_token();
     let authorized: Arc<Mutex<HashSet<Fingerprint>>> = Default::default();
     println!("umac://127.0.0.1:{port}?fp={}&token={token}", identity.fingerprint());
 
     let ep = server_endpoint(format!("0.0.0.0:{port}").parse()?, &identity)?;
     while let Some(incoming) = ep.accept().await {
-        let (packets, token, authorized) = (packets.clone(), token.clone(), authorized.clone());
+        let (packets, popup_packets, token, authorized) =
+            (packets.clone(), popup_packets.clone(), token.clone(), authorized.clone());
         tokio::spawn(async move {
-            if let Err(e) = serve(incoming, packets, token, authorized).await {
+            if let Err(e) = serve(incoming, packets, popup_packets, token, authorized).await {
                 tracing::warn!("connection ended: {e:#}");
             }
         });
@@ -54,6 +65,7 @@ async fn main() -> Result<()> {
 async fn serve(
     incoming: umac_transport::quinn::Incoming,
     packets: Arc<Vec<sample::SamplePacket>>,
+    popup_packets: Arc<Vec<sample::SamplePacket>>,
     token: String,
     authorized: Arc<Mutex<HashSet<Fingerprint>>>,
 ) -> Result<()> {
@@ -91,9 +103,27 @@ async fn serve(
         offset: (0, 0),
         kind: WindowKind::Normal,
     };
+    let popups = [(POPUP_IN, (100, 80)), (POPUP_OUT, (1280 - POPUP_SIZE.0 as i32 / 2, -60))].map(|(id, offset)| WindowInfo {
+        id,
+        title: String::new(),
+        width: POPUP_SIZE.0,
+        height: POPUP_SIZE.1,
+        parent: Some(WINDOW),
+        offset,
+        kind: WindowKind::Popup,
+        ..info.clone()
+    });
     let restart = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut streaming: Option<tokio::task::JoinHandle<()>> = None;
-    while let Some(msg) = read_msg::<_, ClientMsg>(&mut recv).await? {
+    let mut streaming: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let (popup_tx, mut popup_rx) = tokio::sync::mpsc::channel::<HostMsg>(8);
+    loop {
+        let msg = tokio::select! {
+            m = read_msg::<_, ClientMsg>(&mut recv) => match m? { Some(m) => m, None => break },
+            Some(out) = popup_rx.recv() => {
+                write_msg(&mut send, &out).await?;
+                continue;
+            }
+        };
         tracing::info!(?msg, "control");
         match msg {
             ClientMsg::ListWindows => write_msg(&mut send, &HostMsg::Windows(vec![info.clone()])).await?,
@@ -105,13 +135,39 @@ async fn serve(
                     info: info.clone(),
                 };
                 write_msg(&mut send, &msg).await?;
-                let (conn, packets, restart) = (conn.clone(), packets.clone(), restart.clone());
-                streaming = Some(tokio::spawn(async move {
-                    let _ = stream(conn, packets, restart).await;
+                let (c, p, r) = (conn.clone(), packets.clone(), restart.clone());
+                streaming.push(tokio::spawn(async move {
+                    let _ = stream(c, WINDOW, p, r).await;
+                }));
+                let (conn, popup_packets, restart, popups, tx) =
+                    (conn.clone(), popup_packets.clone(), restart.clone(), popups.clone(), popup_tx.clone());
+                streaming.push(tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let mut tasks = Vec::new();
+                    for p in popups {
+                        let start = HostMsg::StreamStarted {
+                            window: p.id,
+                            codec: Codec::Hevc,
+                            color: ColorFormat::Yuv420Bt709Limited,
+                            info: p.clone(),
+                        };
+                        if tx.send(start).await.is_err() {
+                            return;
+                        }
+                        let (c, pk, r) = (conn.clone(), popup_packets.clone(), restart.clone());
+                        tasks.push(tokio::spawn(async move {
+                            let _ = stream(c, p.id, pk, r).await;
+                        }));
+                    }
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    for (t, id) in tasks.into_iter().zip([POPUP_IN, POPUP_OUT]) {
+                        t.abort();
+                        let _ = tx.send(HostMsg::WindowClosed { window: id }).await;
+                    }
                 }));
             }
-            ClientMsg::Unsubscribe { .. } => {
-                if let Some(s) = streaming.take() {
+            ClientMsg::Unsubscribe { window: WINDOW } => {
+                for s in streaming.drain(..) {
                     s.abort();
                 }
             }
@@ -125,6 +181,7 @@ async fn serve(
 
 async fn stream(
     conn: umac_transport::quinn::Connection,
+    window: u32,
     packets: Arc<Vec<sample::SamplePacket>>,
     restart: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
@@ -139,7 +196,7 @@ async fn stream(
         }
         let p = &packets[i % packets.len()];
         // Looping restarts at a keyframe only at index 0; that is where the clip starts.
-        let meta = FrameMeta { window: WINDOW, seq, keyframe: p.keyframe, capture_us: start.elapsed().as_micros() as u32 };
+        let meta = FrameMeta { window, seq, keyframe: p.keyframe, capture_us: start.elapsed().as_micros() as u32 };
         let max = conn.max_datagram_size().context("datagrams disabled")?;
         for d in shard_frame(meta, &p.data, max, 10)? {
             conn.send_datagram_wait(d.into()).await?;

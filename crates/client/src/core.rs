@@ -1,0 +1,313 @@
+//! Windowing-independent client state: one entry per shown remote window with its renderer,
+//! input translation, resize debounce and size snapping. Shells own the native windows and
+//! feed raw events in; everything that talks to the host goes through here.
+
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+use tokio::sync::mpsc::UnboundedSender;
+use umac_proto::{ClientMsg, InputEvent, MouseButton, WindowId, WindowInfo, WindowKind};
+
+use crate::{
+    config::Config,
+    decode::Nv12Frame,
+    net::NetCmd,
+    render::{Gpu, WindowRenderer},
+};
+
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Pixels per wheel notch sent as a non-precise scroll, roughly one macOS scroll line.
+pub const LINE_PX: f32 = 10.0;
+/// Popups shown at once; more are refused (a misbehaving host could otherwise flood windows).
+pub const MAX_POPUPS: usize = 16;
+/// Popup offsets beyond this are treated as garbage.
+const MAX_OFFSET: i32 = 1 << 14;
+
+struct Remote {
+    info: WindowInfo,
+    renderer: WindowRenderer,
+    cursor: (f64, f64),
+    size: (u32, u32),
+    resize_due: Option<Instant>,
+    presented: u32,
+    stats_since: Instant,
+}
+
+pub struct Core {
+    cfg: Config,
+    net: UnboundedSender<NetCmd>,
+    instance: wgpu::Instance,
+    gpu: Option<Gpu>,
+    remotes: HashMap<WindowId, Remote>,
+    opened_any: bool,
+    pub error: Option<String>,
+}
+
+pub fn title(info: &WindowInfo) -> String {
+    if info.title.is_empty() { info.app_name.clone() } else { format!("{}: {}", info.app_name, info.title) }
+}
+
+/// Popup offset as sent by the host, clamped to a sane range.
+pub fn popup_offset(info: &WindowInfo) -> (i32, i32) {
+    (info.offset.0.clamp(-MAX_OFFSET, MAX_OFFSET), info.offset.1.clamp(-MAX_OFFSET, MAX_OFFSET))
+}
+
+/// What a shell should do after the host changed a window.
+pub struct Changed {
+    pub title: String,
+    /// The host settled on a different size and the user is not resizing: adopt it.
+    pub snap: Option<(u32, u32)>,
+    /// Popup moved or resized relative to its parent.
+    pub reposition: bool,
+}
+
+impl Core {
+    pub fn new(cfg: Config, net: UnboundedSender<NetCmd>) -> Self {
+        Self {
+            cfg,
+            net,
+            instance: wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle()),
+            gpu: None,
+            remotes: HashMap::new(),
+            opened_any: false,
+            error: None,
+        }
+    }
+
+    pub fn swap_ctrl_cmd(&self) -> bool {
+        self.cfg.swap_ctrl_cmd
+    }
+
+    /// Instance shells create their wgpu surfaces from.
+    pub fn instance(&self) -> &wgpu::Instance {
+        &self.instance
+    }
+
+    fn send(&self, cmd: NetCmd) {
+        let _ = self.net.send(cmd);
+    }
+
+    pub fn contains(&self, window: WindowId) -> bool {
+        self.remotes.contains_key(&window)
+    }
+
+    pub fn info(&self, window: WindowId) -> Option<&WindowInfo> {
+        self.remotes.get(&window).map(|r| &r.info)
+    }
+
+    pub fn popup_count(&self) -> usize {
+        self.remotes.values().filter(|r| r.info.kind == WindowKind::Popup).count()
+    }
+
+    /// Starts presenting `info` on `surface`, which must be ready for a first buffer.
+    pub fn attach(&mut self, info: WindowInfo, surface: wgpu::Surface<'static>, size: (u32, u32)) -> anyhow::Result<()> {
+        if self.gpu.is_none() {
+            self.gpu = Some(Gpu::with_instance(&self.instance, Some(&surface))?);
+        }
+        let gpu = self.gpu.as_mut().unwrap();
+        let mut renderer = WindowRenderer::new(gpu, surface, size.0, size.1);
+        // Wayland maps a window only after its first buffer.
+        renderer.render(gpu);
+        if info.kind == WindowKind::Normal {
+            self.opened_any = true;
+        }
+        self.remotes.insert(
+            info.id,
+            Remote { info, renderer, cursor: (0.0, 0.0), size, resize_due: None, presented: 0, stats_since: Instant::now() },
+        );
+        Ok(())
+    }
+
+    /// Drops the window's renderer. Call before destroying the native surface.
+    pub fn remove(&mut self, window: WindowId) {
+        self.remotes.remove(&window);
+    }
+
+    /// Popups whose parent is `window`, directly or through other popups.
+    pub fn descendants(&self, window: WindowId) -> Vec<WindowId> {
+        let mut out = Vec::new();
+        let mut frontier = vec![window];
+        while let Some(p) = frontier.pop() {
+            for r in self.remotes.values() {
+                if r.info.parent == Some(p) && !out.contains(&r.info.id) {
+                    out.push(r.info.id);
+                    frontier.push(r.info.id);
+                }
+            }
+        }
+        out
+    }
+
+    /// True once every normal window that was opened is gone.
+    pub fn should_exit(&self) -> bool {
+        self.opened_any && !self.remotes.values().any(|r| r.info.kind == WindowKind::Normal)
+    }
+
+    pub fn frame(&mut self, window: WindowId, frame: &Nv12Frame) {
+        let (Some(r), Some(gpu)) = (self.remotes.get_mut(&window), self.gpu.as_mut()) else { return };
+        r.renderer.upload(gpu, frame);
+        r.renderer.render(gpu);
+        r.presented += 1;
+        let secs = r.stats_since.elapsed().as_secs_f64();
+        if secs >= 5.0 {
+            tracing::info!(window, fps = format_args!("{:.1}", r.presented as f64 / secs), "present");
+            (r.presented, r.stats_since) = (0, Instant::now());
+        }
+    }
+
+    pub fn redraw(&mut self, window: WindowId) {
+        if let (Some(r), Some(gpu)) = (self.remotes.get_mut(&window), self.gpu.as_mut()) {
+            r.renderer.render(gpu);
+        }
+    }
+
+    fn apply_size(&mut self, window: WindowId, size: (u32, u32)) -> Option<&mut Remote> {
+        let (r, gpu) = (self.remotes.get_mut(&window)?, self.gpu.as_mut()?);
+        r.size = size;
+        r.renderer.resize(gpu, size.0, size.1);
+        r.renderer.render(gpu);
+        Some(r)
+    }
+
+    /// The local window was resized (by the user or compositor). Normal windows ask the host
+    /// to follow once the size has been stable for a moment.
+    pub fn resized(&mut self, window: WindowId, size: (u32, u32)) {
+        let Some(r) = self.apply_size(window, size) else { return };
+        if r.info.kind != WindowKind::Normal {
+            return;
+        }
+        let (fw, fh) = r.renderer.frame_size().unwrap_or((r.info.width, r.info.height));
+        let differs = fw.abs_diff(size.0) > 2 || fh.abs_diff(size.1) > 2;
+        r.resize_due = differs.then(|| Instant::now() + RESIZE_DEBOUNCE);
+    }
+
+    /// Size the shell should use for the window right now.
+    pub fn size(&self, window: WindowId) -> Option<(u32, u32)> {
+        self.remotes.get(&window).map(|r| r.size)
+    }
+
+    pub fn changed(&mut self, info: WindowInfo) -> Option<Changed> {
+        let r = self.remotes.get_mut(&info.id)?;
+        let host_size = (info.width.max(1), info.height.max(1));
+        // Apps snap to their own size steps (Terminal cells, minimum sizes), so adopt the size
+        // the Mac settled on unless the user is still resizing.
+        let snap = (r.resize_due.is_none() && r.size != host_size).then_some(host_size);
+        let reposition = info.kind == WindowKind::Popup
+            && (info.offset != r.info.offset || (info.width, info.height) != (r.info.width, r.info.height));
+        let (title, id) = (title(&info), info.id);
+        r.info = info;
+        if let Some(size) = snap {
+            self.apply_size(id, size);
+        }
+        Some(Changed { title, snap, reposition })
+    }
+
+    /// Sends resize requests whose debounce expired; returns the next deadline, if any.
+    pub fn flush_resizes(&mut self, now: Instant) -> Option<Instant> {
+        let mut next: Option<Instant> = None;
+        let mut due = Vec::new();
+        for r in self.remotes.values_mut() {
+            match r.resize_due {
+                Some(t) if t <= now => {
+                    r.resize_due = None;
+                    due.push(ClientMsg::Resize { window: r.info.id, width: r.size.0, height: r.size.1 });
+                }
+                Some(t) => next = Some(next.map_or(t, |n| n.min(t))),
+                None => {}
+            }
+        }
+        for msg in due {
+            self.send(NetCmd::Control(msg));
+        }
+        next
+    }
+
+    /// The user closed a local window: stop streaming it (the Mac window stays open).
+    pub fn close_requested(&mut self, window: WindowId) {
+        self.send(NetCmd::Control(ClientMsg::Unsubscribe { window }));
+    }
+
+    pub fn pointer_moved(&mut self, window: WindowId, x: f64, y: f64) {
+        let Some(r) = self.remotes.get_mut(&window) else { return };
+        r.cursor = (x, y);
+        if let Some((x, y)) = surface_pos(r) {
+            self.send(NetCmd::Input(InputEvent::MouseMove { window, x, y }));
+        }
+    }
+
+    pub fn button(&mut self, window: WindowId, button: MouseButton, pressed: bool) {
+        if let Some((x, y)) = self.remotes.get(&window).and_then(surface_pos) {
+            self.send(NetCmd::Input(InputEvent::MouseButton { window, x, y, button, pressed }));
+        }
+    }
+
+    /// Positive `dy` scrolls up (wheel away from the user).
+    pub fn scroll(&mut self, window: WindowId, dx: f32, dy: f32, precise: bool) {
+        if self.contains(window) {
+            self.send(NetCmd::Input(InputEvent::Scroll { window, dx, dy, precise }));
+        }
+    }
+
+    /// The normal window a popup belongs to (itself for normal windows).
+    fn root(&self, mut window: WindowId) -> Option<WindowId> {
+        for _ in 0..=MAX_POPUPS {
+            let info = &self.remotes.get(&window)?.info;
+            match (info.kind, info.parent) {
+                (WindowKind::Popup, Some(p)) => window = p,
+                _ => return Some(window),
+            }
+        }
+        None
+    }
+
+    /// Keys always go to the normal window; the Mac routes them to an open menu itself.
+    pub fn key(&mut self, window: WindowId, keycode: u16, pressed: bool) {
+        if let Some(window) = self.root(window) {
+            self.send(NetCmd::Input(InputEvent::Key { window, keycode, pressed }));
+        }
+    }
+
+    /// Focus changes of popups are ignored: raising a menu's owner would dismiss the menu.
+    pub fn focus(&mut self, window: WindowId, focused: bool) {
+        if self.info(window).is_none_or(|i| i.kind != WindowKind::Normal) {
+            return;
+        }
+        if focused {
+            self.send(NetCmd::Control(ClientMsg::Focus { window }));
+        } else {
+            self.send(NetCmd::Input(InputEvent::ReleaseAll));
+        }
+    }
+}
+
+fn surface_pos(r: &Remote) -> Option<(f32, f32)> {
+    Some(r.renderer.viewport()?.to_surface(r.cursor.0, r.cursor.1))
+}
+
+/// Placement of a popup inside its parent for an xdg_positioner: the anchor point must lie
+/// within the parent's geometry, so the offset is split into a clamped anchor plus a
+/// remainder passed as the positioner offset.
+pub fn popup_anchor(offset: (i32, i32), parent: (u32, u32)) -> ((i32, i32), (i32, i32)) {
+    let clamp = |v: i32, len: u32| v.clamp(0, (len.max(1) - 1) as i32);
+    let anchor = (clamp(offset.0, parent.0), clamp(offset.1, parent.1));
+    (anchor, (offset.0 - anchor.0, offset.1 - anchor.1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popup_anchor_inside_parent() {
+        assert_eq!(popup_anchor((100, 80), (800, 600)), ((100, 80), (0, 0)));
+    }
+
+    #[test]
+    fn popup_anchor_outside_parent_moves_remainder_to_offset() {
+        assert_eq!(popup_anchor((-30, 20), (800, 600)), ((0, 20), (-30, 0)));
+        assert_eq!(popup_anchor((900, 650), (800, 600)), ((799, 599), (101, 51)));
+        assert_eq!(popup_anchor((5, 5), (0, 0)), ((0, 0), (5, 5)));
+    }
+}

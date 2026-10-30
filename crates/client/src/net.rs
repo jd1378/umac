@@ -1,6 +1,6 @@
 //! Connection to the host: handshake, control and input streams, video datagram routing and
 //! one decode thread per window. Runs on the tokio runtime; talks to the UI via [`UiEvent`]
-//! (through the winit proxy) and [`NetCmd`].
+//! (through a [`UiSender`]) and [`NetCmd`].
 
 use std::{
     collections::{HashMap, HashSet},
@@ -21,12 +21,12 @@ use umac_transport::{
     framing::{read_msg, write_msg},
     quinn,
 };
-use winit::event_loop::EventLoopProxy;
-
 use crate::{
     config::{Config, HostEntry, Store},
-    decode::{self, Nv12Frame},
+    core::MAX_POPUPS,
+    decode,
     gate::KeyframeGate,
+    ui::{UiEvent, UiSender},
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,14 +34,6 @@ const TICK: Duration = Duration::from_millis(20);
 const STATS_EVERY: Duration = Duration::from_secs(5);
 /// Encoded frames queued for a decode thread. More means the decoder is behind; drop instead.
 const DECODE_QUEUE: usize = 3;
-
-pub enum UiEvent {
-    Open(WindowInfo),
-    Frame { window: WindowId, frame: Nv12Frame },
-    Changed(WindowInfo),
-    Closed(WindowId),
-    Shutdown(String),
-}
 
 pub enum NetCmd {
     Control(ClientMsg),
@@ -138,6 +130,8 @@ impl Targets {
 }
 
 struct Stream {
+    /// Set for popups; they close together with their parent.
+    parent: Option<WindowId>,
     reassembler: Reassembler,
     gate: KeyframeGate,
     decode_tx: SyncSender<fec::Frame>,
@@ -150,7 +144,7 @@ pub async fn run_open(
     mut session: Session,
     targets: Targets,
     cfg: Config,
-    proxy: EventLoopProxy<UiEvent>,
+    ui: UiSender,
     cmd_tx: mpsc::UnboundedSender<NetCmd>,
     mut cmd_rx: mpsc::UnboundedReceiver<NetCmd>,
 ) -> Result<()> {
@@ -232,10 +226,21 @@ pub async fn run_open(
             msg = host_rx.recv() => {
                 let Some(msg) = msg else { bail!("host closed the control stream") };
                 match msg {
-                    HostMsg::StreamStarted { window, codec, color, info } if pending.remove(&window) => {
-                        tracing::info!(window, ?codec, w = info.width, h = info.height, "stream started: {}", info.title);
-                        let decode_tx = spawn_decoder(window, codec, color, proxy.clone(), cmd_tx.clone())?;
+                    HostMsg::StreamStarted { window, codec, color, info } => {
+                        let requested = pending.remove(&window);
+                        if !requested && !accept_popup(&info, &streams) {
+                            tracing::debug!(window, parent = ?info.parent, "refusing unsolicited stream");
+                            write_msg(&mut ctrl_send, &ClientMsg::Unsubscribe { window }).await?;
+                            continue;
+                        }
+                        if streams.contains_key(&window) {
+                            continue;
+                        }
+                        tracing::info!(window, ?codec, kind = ?info.kind, w = info.width, h = info.height, "stream started: {}", info.title);
+                        let decode_tx = spawn_decoder(window, codec, color, ui.clone(), cmd_tx.clone())?;
+                        let parent = if requested { None } else { info.parent };
                         streams.insert(window, Stream {
+                            parent,
                             reassembler: Reassembler::default(),
                             gate: KeyframeGate::new(Instant::now()),
                             decode_tx,
@@ -243,15 +248,15 @@ pub async fn run_open(
                             bytes: 0,
                             losses: 0,
                         });
-                        let _ = proxy.send_event(UiEvent::Open(info));
+                        ui.send(UiEvent::Open(info));
                     }
                     HostMsg::WindowChanged(info) if streams.contains_key(&info.id) => {
-                        let _ = proxy.send_event(UiEvent::Changed(info));
+                        ui.send(UiEvent::Changed(info));
                     }
                     HostMsg::WindowClosed { window } => {
                         pending.remove(&window);
-                        if streams.remove(&window).is_some() {
-                            let _ = proxy.send_event(UiEvent::Closed(window));
+                        for w in remove_with_popups(&mut streams, window) {
+                            ui.send(UiEvent::Closed(w));
                         }
                     }
                     HostMsg::Error { window, message } => {
@@ -259,7 +264,7 @@ pub async fn run_open(
                         if let Some(w) = window
                             && pending.remove(&w)
                         {
-                            let _ = proxy.send_event(UiEvent::Closed(w));
+                            ui.send(UiEvent::Closed(w));
                         }
                     }
                     other => tracing::debug!(?other, "ignored host message"),
@@ -270,8 +275,12 @@ pub async fn run_open(
                 match cmd {
                     NetCmd::Control(msg) => {
                         if let ClientMsg::Unsubscribe { window } = msg {
-                            streams.remove(&window);
                             pending.remove(&window);
+                            write_msg(&mut ctrl_send, &msg).await?;
+                            for w in remove_with_popups(&mut streams, window).into_iter().filter(|&w| w != window) {
+                                write_msg(&mut ctrl_send, &ClientMsg::Unsubscribe { window: w }).await?;
+                            }
+                            continue;
                         }
                         write_msg(&mut ctrl_send, &msg).await?;
                     }
@@ -315,7 +324,7 @@ pub async fn run_open(
                 }
             }
         }
-        if streams.is_empty() && pending.is_empty() {
+        if pending.is_empty() && streams.values().all(|s| s.parent.is_some()) {
             break;
         }
     }
@@ -323,11 +332,31 @@ pub async fn run_open(
     Ok(())
 }
 
+/// Popups are accepted only as children of a window being streamed, and only up to a cap.
+fn accept_popup(info: &WindowInfo, streams: &HashMap<WindowId, Stream>) -> bool {
+    info.kind == WindowKind::Popup
+        && info.parent.is_some_and(|p| streams.contains_key(&p))
+        && streams.values().filter(|s| s.parent.is_some()).count() < MAX_POPUPS
+}
+
+/// Removes `window` and every popup below it; returns the ids that were streaming.
+fn remove_with_popups(streams: &mut HashMap<WindowId, Stream>, window: WindowId) -> Vec<WindowId> {
+    let mut removed = Vec::new();
+    let mut frontier = vec![window];
+    while let Some(w) = frontier.pop() {
+        if streams.remove(&w).is_some() {
+            removed.push(w);
+        }
+        frontier.extend(streams.iter().filter(|(_, s)| s.parent == Some(w)).map(|(&id, _)| id));
+    }
+    removed
+}
+
 fn spawn_decoder(
     window: WindowId,
     codec: Codec,
     color: ColorFormat,
-    proxy: EventLoopProxy<UiEvent>,
+    ui: UiSender,
     cmd_tx: mpsc::UnboundedSender<NetCmd>,
 ) -> Result<SyncSender<fec::Frame>> {
     let mut decoder = decode::create(codec, color)?;
@@ -341,7 +370,7 @@ fn spawn_decoder(
                 Ok(Some(frame)) => {
                     total += t.elapsed();
                     n += 1;
-                    if proxy.send_event(UiEvent::Frame { window, frame }).is_err() {
+                    if !ui.send(UiEvent::Frame { window, frame }) {
                         break;
                     }
                 }
@@ -378,6 +407,47 @@ mod tests {
             offset: (0, 0),
             kind,
         }
+    }
+
+    fn stream(parent: Option<WindowId>) -> Stream {
+        Stream {
+            parent,
+            reassembler: Reassembler::default(),
+            gate: KeyframeGate::new(Instant::now()),
+            decode_tx: sync_channel(1).0,
+            frames: 0,
+            bytes: 0,
+            losses: 0,
+        }
+    }
+
+    #[test]
+    fn popups_need_a_streamed_parent_and_close_with_it() {
+        let mut streams = HashMap::from([(1, stream(None)), (2, stream(Some(1))), (3, stream(Some(2))), (9, stream(None))]);
+        let mut popup = win(4, "Safari", WindowKind::Popup);
+        popup.parent = Some(1);
+        assert!(accept_popup(&popup, &streams));
+        popup.parent = Some(77);
+        assert!(!accept_popup(&popup, &streams));
+        popup.parent = None;
+        assert!(!accept_popup(&popup, &streams));
+        assert!(!accept_popup(&win(5, "Safari", WindowKind::Normal), &streams));
+
+        let mut removed = remove_with_popups(&mut streams, 1);
+        removed.sort();
+        assert_eq!(removed, vec![1, 2, 3]);
+        assert_eq!(streams.keys().copied().collect::<Vec<_>>(), vec![9]);
+    }
+
+    #[test]
+    fn popup_cap() {
+        let mut streams: HashMap<WindowId, Stream> = HashMap::from([(1, stream(None))]);
+        for i in 0..MAX_POPUPS as u32 {
+            streams.insert(100 + i, stream(Some(1)));
+        }
+        let mut popup = win(4, "Safari", WindowKind::Popup);
+        popup.parent = Some(1);
+        assert!(!accept_popup(&popup, &streams));
     }
 
     #[test]

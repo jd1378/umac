@@ -4,6 +4,17 @@
 use umac_proto::keys::*;
 use winit::keyboard::KeyCode;
 
+/// Linux evdev keycode (as sent by `wl_keyboard`, without the xkb +8 offset). Goes through
+/// winit's evdev table so both shells share one mapping.
+#[cfg(target_os = "linux")]
+pub fn evdev_to_mac(code: u32, swap_ctrl_cmd: bool) -> Option<u16> {
+    use winit::{keyboard::PhysicalKey, platform::scancode::PhysicalKeyExtScancode};
+    match PhysicalKey::from_scancode(code) {
+        PhysicalKey::Code(k) => to_mac(k, swap_ctrl_cmd),
+        PhysicalKey::Unidentified(_) => None,
+    }
+}
+
 pub fn to_mac(code: KeyCode, swap_ctrl_cmd: bool) -> Option<u16> {
     use KeyCode as K;
     let (ctrl_l, ctrl_r, super_l, super_r) = if swap_ctrl_cmd {
@@ -143,6 +154,32 @@ mod tests {
         assert_eq!(to_mac(KeyCode::NumpadEnter, false), Some(kVK_ANSI_KeypadEnter));
         assert_eq!(to_mac(KeyCode::F12, false), Some(kVK_F12));
         assert_eq!(to_mac(KeyCode::PrintScreen, false), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn evdev_codes() {
+        // Values from linux/input-event-codes.h.
+        let cases = [
+            (30, kVK_ANSI_A),
+            (16, kVK_ANSI_Q),
+            (28, kVK_Return),
+            (14, kVK_Delete),
+            (111, kVK_ForwardDelete),
+            (96, kVK_ANSI_KeypadEnter),
+            (88, kVK_F12),
+            (103, kVK_UpArrow),
+            (42, kVK_Shift),
+            (56, kVK_Option),
+            (86, kVK_ISO_Section),
+        ];
+        for (code, mac) in cases {
+            assert_eq!(evdev_to_mac(code, false), Some(mac), "evdev {code}");
+        }
+        assert_eq!(evdev_to_mac(29, true), Some(kVK_Command));
+        assert_eq!(evdev_to_mac(125, true), Some(kVK_Control));
+        assert_eq!(evdev_to_mac(29, false), Some(kVK_Control));
+        assert_eq!(evdev_to_mac(0, false), None);
     }
 
     #[test]
