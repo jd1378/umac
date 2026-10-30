@@ -133,6 +133,9 @@ pub enum ClientMsg {
     /// Stream a whole display. The host replies with `StreamStarted` (kind `Desktop`, id from
     /// [`desktop_id`]) or `Error`; all other messages then use that id.
     SubscribeDisplay { index: u32, max_fps: u16, bitrate_kbps: u32 },
+    /// Runs one of a fixed set of Mac actions and reports the window it opened, which the
+    /// client then subscribes to. Never arbitrary commands.
+    Launch { nonce: u64, action: LaunchAction },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,6 +165,8 @@ pub enum HostMsg {
     Cursor(Cursor),
     /// Switch back to a cursor image sent earlier with this id (the client caches a few).
     CursorKnown { id: u64 },
+    /// Answer to `Launch`: the new (or reused) window to stream, or why it failed.
+    Launched { nonce: u64, result: Result<WindowInfo, String> },
 }
 
 /// Largest cursor image accepted, per side, in pixels.
@@ -212,6 +217,17 @@ pub enum NamedCursor {
     NwseResize,
     ZoomIn,
     ZoomOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaunchAction {
+    /// The macOS Apps launcher.
+    Apps,
+    /// A new Terminal window in the home directory.
+    Terminal,
+    ActivityMonitor,
+    /// A Finder window on /Applications (fallback launcher).
+    FinderApplications,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
