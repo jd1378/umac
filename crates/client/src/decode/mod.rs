@@ -92,7 +92,16 @@ pub fn codecs() -> Vec<Codec> {
         }
     }
     c.push(Codec::Mjpeg);
-    c
+    match std::env::var("UMAC_CODECS") {
+        Ok(only) => restrict(c, &only),
+        Err(_) => c,
+    }
+}
+
+/// `UMAC_CODECS=mjpeg,h264` keeps only those codecs (in their usual order), for testing a path.
+fn restrict(codecs: Vec<Codec>, only: &str) -> Vec<Codec> {
+    let wanted: Vec<String> = only.split(',').map(|s| s.trim().to_ascii_lowercase()).collect();
+    codecs.into_iter().filter(|c| wanted.iter().any(|w| *w == format!("{c:?}").to_ascii_lowercase())).collect()
 }
 
 /// Whether the GPU decodes H.264 with Vulkan Video (checked once). Fedora's stock Mesa leaves
@@ -218,5 +227,17 @@ mod tests {
             let junk: Vec<u8> = (0..len).map(|i| (i * 37 % 251) as u8).collect();
             let _ = dec.decode(&junk);
         }
+    }
+}
+
+#[cfg(test)]
+mod restrict_tests {
+    use super::*;
+
+    #[test]
+    fn codec_restriction() {
+        let all = vec![Codec::PyroWave, Codec::H264, Codec::Hevc, Codec::Mjpeg];
+        assert_eq!(restrict(all.clone(), "mjpeg, H264"), vec![Codec::H264, Codec::Mjpeg]);
+        assert!(restrict(all, "nope").is_empty());
     }
 }
