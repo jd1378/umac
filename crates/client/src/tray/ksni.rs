@@ -43,7 +43,11 @@ impl ksni::Tray for UmacTray {
     fn tool_tip(&self) -> ToolTip {
         ToolTip {
             title: "umac".into(),
-            description: self.menu.selected_label().map_or("No Mac selected".into(), |h| format!("Mac: {h}")),
+            description: match (self.menu.selected_label(), &self.menu.screen) {
+                (None, _) => "No Mac selected".into(),
+                (Some(h), None) => format!("Mac: {h}"),
+                (Some(h), Some(screen)) => format!("Mac: {h}\n{screen}"),
+            },
             ..Default::default()
         }
     }
@@ -63,6 +67,9 @@ impl ksni::Tray for UmacTray {
             item("Show settings", Action::Settings),
             MenuItem::Separator,
         ];
+        if let Some(line) = &self.menu.screen {
+            items.push(StandardItem { label: line.clone(), enabled: false, ..Default::default() }.into());
+        }
         if !hosts.is_empty() {
             let group = RadioGroup {
                 selected: self.menu.selected.unwrap_or(usize::MAX),
@@ -75,6 +82,20 @@ impl ksni::Tray for UmacTray {
                 options: self.menu.hosts.iter().map(|h| RadioItem { label: h.label.clone(), ..Default::default() }).collect(),
             };
             items.push(SubMenu { label: "Paired hosts".into(), submenu: vec![group.into()], ..Default::default() }.into());
+            if !self.menu.users.is_empty() {
+                let users = self.menu.users.clone();
+                let group = RadioGroup {
+                    selected: self.menu.selected_user.unwrap_or(usize::MAX),
+                    select: Box::new(move |t: &mut Self, i| {
+                        if let Some(u) = users.get(i) {
+                            t.menu.selected_user = Some(i);
+                            let _ = t.actions.send(Action::SelectHost(u.fingerprint.clone()));
+                        }
+                    }),
+                    options: self.menu.users.iter().map(|u| RadioItem { label: u.label.clone(), ..Default::default() }).collect(),
+                };
+                items.push(SubMenu { label: "Mac user".into(), submenu: vec![group.into()], ..Default::default() }.into());
+            }
             items.push(MenuItem::Separator);
         }
         items.push(item("Exit", Action::Exit));

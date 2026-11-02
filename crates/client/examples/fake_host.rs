@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use umac_client::sample;
-use umac_proto::{ClientMsg, Codec, ColorFormat, Hello, HelloReply, HostMsg, InputEvent, WindowInfo, WindowKind};
+use umac_proto::{ClientMsg, Codec, ColorFormat, Hello, HelloReply, HostMsg, InputEvent, MacSession, WindowInfo, WindowKind};
 use umac_transport::{
     Fingerprint, Identity,
     fec::{FrameMeta, shard_frame},
@@ -106,6 +106,8 @@ async fn serve(
     }
     authorized.lock().unwrap().insert(fp);
     write_msg(&mut send, &HelloReply::Accepted { host_name: "fake-host".into() }).await?;
+    let mac = MacSession { user: "fake".into(), machine: "fake-machine".into(), on_screen: true };
+    write_msg(&mut send, &HostMsg::Session(mac)).await?;
     tracing::info!(client = hello.client_name, "client accepted");
 
     let (clip_w, clip_h) = clip_size();

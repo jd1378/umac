@@ -14,7 +14,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tokio::sync::{mpsc, oneshot};
 use umac_proto::{
-    ClientMsg, Codec, ColorFormat, DisplayInfo, Hello, HelloReply, HostMsg, InputEvent, LaunchAction, PROTOCOL_VERSION, WindowId,
+    ClientMsg, Codec, ColorFormat, DisplayInfo, Hello, HelloReply, HostMsg, InputEvent, LaunchAction, MacSession, PROTOCOL_VERSION,
+    WindowId,
     WindowInfo, WindowKind,
     video::{self, HEADER_LEN, PYRO_HEADER_LEN, PyroHeader, ShardHeader},
 };
@@ -70,6 +71,8 @@ pub struct Session {
     ctrl_send: quinn::SendStream,
     ctrl_recv: quinn::RecvStream,
     pub host_name: String,
+    /// The agent's Mac user and whether they were on screen when we connected.
+    pub mac: MacSession,
 }
 
 fn client_name() -> String {
@@ -111,7 +114,11 @@ pub async fn connect(store: &Store, host: &HostEntry, pairing_token: Option<Stri
             .context("host dropped the connection during handshake (is this client paired?)")?;
     match reply {
         Some(HelloReply::Accepted { host_name }) => {
-            Ok(Session { _endpoint: endpoint, conn, ctrl_send, ctrl_recv, host_name })
+            let first: Option<HostMsg> = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_msg(&mut ctrl_recv))
+                .await
+                .context("the host did not say which Mac user it runs for")??;
+            let Some(HostMsg::Session(mac)) = first else { bail!("the host did not say which Mac user it runs for") };
+            Ok(Session { _endpoint: endpoint, conn, ctrl_send, ctrl_recv, host_name, mac })
         }
         Some(HelloReply::Rejected { reason }) => bail!("host rejected us: {reason}"),
         None => bail!("host closed the connection during handshake"),
@@ -184,6 +191,8 @@ pub struct HostCtx {
     pub ids: Arc<Mutex<IdMap>>,
     pub ui: UiSender,
     pub cfg: Config,
+    /// Called when the agent's user switches away from (false) or back to (true) the screen.
+    pub screen: Box<dyn Fn(bool) + Send + Sync>,
 }
 
 struct Stream {
@@ -273,6 +282,8 @@ async fn host_loop(
     let mut clock = ClockSync::default();
     let mut probe = tokio::time::interval(PROBE_EVERY);
     let mut probe_nonce = 0u64;
+    // Before any request, so every stream is captured at it.
+    write_msg(&mut ctrl_send, &ClientMsg::ViewScale { scale: cfg.view_scale }).await?;
     if cfg.show_stats {
         write_msg(&mut ctrl_send, &ClientMsg::WantStats { on: true }).await?;
     }
@@ -542,6 +553,8 @@ async fn host_loop(
                     HostMsg::CursorKnown { id } => {
                         ui.send(UiEvent::Cursor { id, shape: None });
                     }
+                    // The host already closed every stream when its user left the screen.
+                    HostMsg::Session(mac) => (ctx.screen)(mac.on_screen),
                     other => tracing::debug!(?other, "ignored host message"),
                 }
             }

@@ -64,13 +64,18 @@ pub fn setup() -> anyhow::Result<()> {
     step(1, "Checking user session");
     let me = std::env::var("USER").unwrap_or_default();
     let console = console_user();
-    if me != console {
+    if me == console {
+        println!("    ok: {me} owns the desktop session");
+    } else if run("launchctl", &["print", &format!("gui/{}", uid())]).is_ok() {
+        // Fast user switching: the agent runs in the background and streams once {me} is on screen.
+        println!("    {me} is logged in but {console} is on the screen. Installing anyway: umac streams {me}'s");
+        println!("    windows while {me} is on screen. Grant permissions then (re-run setup as {me}).");
+    } else {
         bail!(
-            "run setup as the user logged in on the Mac's screen ({console}), not {me}.\n\
-             Windows can only be captured from the logged-in desktop session."
+            "{me} is not logged in on the Mac. Log in as {me} (at the Mac or over Screen Sharing; fast\n\
+             user switching keeps others logged in), then run setup again."
         );
     }
-    println!("    ok: {me} owns the desktop session");
 
     step(2, "Installing the agent binary");
     let installed = install_binary()?;
@@ -99,9 +104,13 @@ pub fn setup() -> anyhow::Result<()> {
     ensure_permissions()?;
 
     step(6, "Checking power and login settings");
-    check_auto_login();
-    check_sleep();
-    check_display();
+    if me == console {
+        check_auto_login();
+        check_sleep();
+        check_display();
+    } else {
+        println!("    skipped: checked when {me} is on screen");
+    }
 
     step(7, "Pairing");
     print_pairing()?;
@@ -224,8 +233,34 @@ fn install_launch_agent(binary: &Path) -> anyhow::Result<()> {
     // Restart unconditionally so a freshly installed binary is the one running.
     let _ = run("launchctl", &["bootout", &service]);
     std::thread::sleep(Duration::from_millis(500));
+    // With our agent stopped, a port in use belongs to someone else (often another Mac user's
+    // agent), so the port is chosen now.
+    pick_port()?;
     run("launchctl", &["bootstrap", &domain, path.to_str().unwrap()]).context("launchctl bootstrap")?;
     Ok(())
+}
+
+fn port_free(port: u16) -> bool {
+    std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port)).is_ok()
+}
+
+/// Keeps the saved port while it is free, else takes this user's own one or the next free
+/// one, and saves it so the agent and pairing links agree.
+fn pick_port() -> anyhow::Result<u16> {
+    let saved = config::Settings::saved_port();
+    let uid: u32 = uid().parse().context("reading the user id")?;
+    let port = config::choose_port(saved, uid, port_free)
+        .ok_or_else(|| anyhow!("no free UDP port near {}; set \"port\" in {}", config::preferred_port(uid), config::settings_path().display()))?;
+    if saved != Some(port) {
+        config::Settings::save_port(port).context("saving the port")?;
+    }
+    match saved {
+        Some(old) if old != port => println!(
+            "    port {old} is taken (another user's agent?); now using {port}.\n    Clients paired before must pair again."
+        ),
+        _ => println!("    listening on UDP port {port}"),
+    }
+    Ok(port)
 }
 
 fn restart_agent() -> anyhow::Result<()> {

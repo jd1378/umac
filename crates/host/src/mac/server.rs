@@ -17,8 +17,8 @@ use tokio::{
     time::timeout,
 };
 use umac_proto::{
-    ClientMsg, Codec, ColorFormat, Cursor, Hello, HelloReply, HostMsg, InputEvent, MAX_CLIPBOARD_BYTES, PROTOCOL_VERSION,
-    WindowId, WindowInfo, WindowKind, desktop_id,
+    ClientMsg, Codec, ColorFormat, Cursor, Hello, HelloReply, HostMsg, InputEvent, MAX_CLIPBOARD_BYTES, MacSession,
+    PROTOCOL_VERSION, WindowId, WindowInfo, WindowKind, desktop_id,
     video::{PYRO_HEADER_LEN, PyroHeader, pyro_flags},
 };
 use umac_transport::{
@@ -33,7 +33,7 @@ use super::{
     cursor as mac_cursor,
     input::{self, ClipboardLink, Command, Reply, Target, Targets},
     launch,
-    pasteboard, permissions,
+    pasteboard, permissions, session,
     stream::{self, StreamParams, WindowStream},
     windows::{self, Geometry, OnScreen},
     ax::{self, AxWindow},
@@ -60,6 +60,11 @@ const POLL: Duration = Duration::from_millis(250);
 const POPUP_POLL: Duration = Duration::from_millis(40);
 /// Encoded frames waiting for the network. Small on purpose: a backlog means stale video.
 const FRAME_QUEUE: usize = 6;
+/// Range accepted for `ClientMsg::ViewScale`; captures never exceed the display's own scale.
+const MIN_VIEW_SCALE: f32 = 0.5;
+const MAX_VIEW_SCALE: f32 = 4.0;
+/// How often the agent checks whether its user's desktop is on screen.
+const SCREEN_POLL: Duration = Duration::from_secs(1);
 
 struct Shared {
     settings: Settings,
@@ -74,10 +79,20 @@ struct Shared {
     /// The Mac cursor shape over streamed windows; each session forwards changes.
     cursor: watch::Receiver<Option<Arc<Cursor>>>,
     host_name: String,
+    /// This agent's user and Mac; `on_screen` below is the live state.
+    mac: MacSession,
+    /// Whether this agent's user is on the Mac's screen. Only then can it capture or inject.
+    on_screen: watch::Receiver<bool>,
     /// Which session shows each window, so a client never gets the same window twice.
     owners: Mutex<Owners>,
     /// Lets a session take a window over from another one.
     sessions: Mutex<HashMap<u64, mpsc::UnboundedSender<SessionCmd>>>,
+}
+
+impl Shared {
+    fn mac_session(&self) -> MacSession {
+        MacSession { on_screen: *self.on_screen.borrow(), ..self.mac.clone() }
+    }
 }
 
 /// Work one session asks of another.
@@ -123,6 +138,20 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         }
     });
 
+    let mac = session::describe();
+    tracing::info!(user = %mac.user, on_screen = mac.on_screen, "Mac session");
+    tracing::debug!(details = %session::details(), "window server session");
+    let (screen_tx, on_screen) = watch::channel(mac.on_screen);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(SCREEN_POLL).await;
+            let now = session::on_screen();
+            if screen_tx.send_if_modified(|v| std::mem::replace(v, now) != now) {
+                tracing::info!(on_screen = now, "this user's desktop {}", if now { "is on screen" } else { "left the screen" });
+            }
+        }
+    });
+
     let targets = Targets::default();
     let clip = ClipboardLink::default();
     let (clipboard_tx, _) = broadcast::channel(4);
@@ -138,6 +167,8 @@ pub async fn run(settings: Settings) -> anyhow::Result<()> {
         clipboard: clipboard_tx,
         auth: AuthStore::new(&config::support_dir()),
         host_name: host_name(),
+        mac,
+        on_screen,
         owners: Mutex::default(),
         sessions: Mutex::default(),
         settings,
@@ -231,6 +262,7 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
         return Ok(());
     };
     write_msg(&mut send, &HelloReply::Accepted { host_name: shared.host_name.clone() }).await?;
+    write_msg(&mut send, &HostMsg::Session(shared.mac_session())).await?;
     tracing::info!(client = %hello.client_name, remote = %conn.remote_address(), ?codec, "client connected");
 
     let (frames_tx, frames_rx) = mpsc::channel::<(WindowId, EncodedFrame)>(FRAME_QUEUE);
@@ -262,6 +294,7 @@ async fn handle(incoming: quinn::Incoming, shared: Arc<Shared>) -> anyhow::Resul
         rate: pyro::Rate::new(shared.settings.pyrowave_bpp),
         loss: LossCounters::default(),
         conn: conn.clone(),
+        view_scale: f32::INFINITY,
     };
     let result = session.control_loop(&mut send, recv, reply_rx, cmd_rx).await;
 
@@ -386,11 +419,28 @@ async fn send_pyro(conn: &quinn::Connection, window: WindowId, frame_seq: u32, f
     true
 }
 
+/// What to answer a request that needs the screen while another user has it; `None` for
+/// requests that work regardless.
+fn off_screen_reply(msg: &ClientMsg, user: &str) -> Option<HostMsg> {
+    let message = format!("{user} is not on the Mac's screen; switch to {user} at the Mac or log in as {user} with Screen Sharing");
+    match *msg {
+        ClientMsg::ListWindows | ClientMsg::ListDisplays => Some(HostMsg::Error { window: None, message }),
+        ClientMsg::Subscribe { window, .. } => Some(HostMsg::Error { window: Some(window), message }),
+        ClientMsg::SubscribeDisplay { index, .. } => Some(HostMsg::Error { window: Some(desktop_id(index)), message }),
+        ClientMsg::Launch { nonce, .. } => Some(HostMsg::Launched { nonce, result: Err(message) }),
+        _ => None,
+    }
+}
+
 async fn read_input(conn: quinn::Connection, shared: Arc<Shared>, client: ClientId, session: u64, reply: Reply) {
     while let Ok(mut recv) = conn.accept_uni().await {
         let (shared, reply) = (shared.clone(), reply.clone());
         tokio::spawn(async move {
             while let Ok(Some(ev)) = read_msg::<_, InputEvent>(&mut recv).await {
+                // Another user's desktop is on screen; nothing here may reach it.
+                if !*shared.on_screen.borrow() {
+                    continue;
+                }
                 match ev {
                     InputEvent::MouseButton { window, pressed: true, .. } | InputEvent::Key { window, pressed: true, .. } => {
                         *shared.active.lock().unwrap() = Some(window);
@@ -447,6 +497,8 @@ struct Session {
     rate: pyro::Rate,
     loss: LossCounters,
     conn: quinn::Connection,
+    /// Pixels per point the client shows (`ClientMsg::ViewScale`); caps new captures.
+    view_scale: f32,
 }
 
 /// Loss evidence for PyroWave rate control since the last evaluation.
@@ -473,6 +525,8 @@ impl Session {
     ) -> anyhow::Result<()> {
         let mut clipboard = self.shared.clipboard.subscribe();
         let mut cursor = self.shared.cursor.clone();
+        let mut on_screen = self.shared.on_screen.clone();
+        on_screen.borrow_and_update();
         let mut cursor_sent = crate::cursor::SessionCursor::default();
         // The watcher only reports changes, so a new client starts from the current shape.
         let initial = cursor.borrow_and_update().as_ref().and_then(|c| cursor_sent.message(c));
@@ -511,6 +565,12 @@ impl Session {
                     Some(Ok(None)) | None => break Ok(()),
                     Some(Err(e)) => break Err(e),
                 },
+                Ok(()) = on_screen.changed() => {
+                    let now = *on_screen.borrow_and_update();
+                    if let Err(e) = self.screen_changed(now, send).await {
+                        break Err(e);
+                    }
+                }
                 _ = poll.tick() => {
                     if let Err(e) = self.poll_windows(send).await {
                         break Err(e);
@@ -547,7 +607,7 @@ impl Session {
                         break Err(e.into());
                     }
                 }
-                _ = popup_poll.tick() => {
+                _ = popup_poll.tick(), if *on_screen.borrow() => {
                     if let Err(e) = self.poll_popups(send).await {
                         break Err(e);
                     }
@@ -646,9 +706,18 @@ impl Session {
     }
 
     async fn on_message(&mut self, msg: ClientMsg, send: &mut Ctl) -> anyhow::Result<()> {
+        if !*self.shared.on_screen.borrow()
+            && let Some(reply) = off_screen_reply(&msg, &self.shared.mac.user)
+        {
+            return Ok(write_msg(send, &reply).await?);
+        }
         match msg {
             ClientMsg::Ping { nonce } => write_msg(send, &HostMsg::Pong { nonce }).await?,
             ClientMsg::WantStats { on } => self.want_stats = on,
+            ClientMsg::ViewScale { scale } => {
+                self.view_scale = if scale.is_finite() { scale.clamp(MIN_VIEW_SCALE, MAX_VIEW_SCALE) } else { f32::INFINITY };
+                tracing::info!(scale = self.view_scale, "client view scale");
+            }
             ClientMsg::VideoFeedback { received, lost, .. } => {
                 self.loss.received += received as u64;
                 self.loss.lost += lost as u64;
@@ -785,6 +854,7 @@ impl Session {
             pyro_cap_bytes: self.pyro_cap_bytes(max_fps as u32),
             pyro_changed_only: self.shared.settings.pyrowave_changed_only,
             max_datagram: self.pyro_params().1,
+            max_scale: self.view_scale,
         };
         self.start_window(params, WindowKind::Normal, None, false, send).await.map(|_| ())
     }
@@ -820,7 +890,7 @@ impl Session {
         auto: bool,
         send: &mut Ctl,
     ) -> anyhow::Result<WindowInfo> {
-        let window = params.window;
+        let (window, max_scale) = (params.window, params.max_scale);
         let started = Instant::now();
         let (sc, app, inset, (scale, size), resizable) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let sc = find_window(window)?;
@@ -829,7 +899,7 @@ impl Session {
             let ax = AxWindow::find(app.0, window).ok();
             let inset = ax.as_ref().map_or(0.0, |w| w.titlebar_inset());
             let resizable = ax.as_ref().is_some_and(|w| w.resizable());
-            let size = capture::window_size(&sc, inset)?;
+            let size = capture::window_size(&sc, inset, max_scale)?;
             Ok((sc, app, inset, size, resizable))
         })
         .await??;
@@ -938,7 +1008,7 @@ impl Session {
             .or_else(|| self.streams.values().find(|s| s.info.pid == pid && s.popup_of.is_none() && s.display.is_none()))
             .map(|s| s.stream.params())
             .ok_or_else(|| anyhow!("no stream to copy settings from"))?;
-        self.start_window(StreamParams { window: id, ..template }, kind, parent, true, send).await?;
+        self.start_window(StreamParams { window: id, max_scale: self.view_scale, ..template }, kind, parent, true, send).await?;
         tracing::info!(window = id, ?kind, ?parent, ?ax, ms = seen.elapsed().as_millis() as u64, "following new window");
         Ok(true)
     }
@@ -1002,7 +1072,7 @@ impl Session {
             .find(|s| s.popup_of.is_none() && s.display.is_none())
             .map(|s| s.stream.params())
             .ok_or_else(|| anyhow!("no stream to copy settings from"))?;
-        let info = self.start_window(StreamParams { window: id, ..template }, kind, parent, true, send).await?;
+        let info = self.start_window(StreamParams { window: id, max_scale: self.view_scale, ..template }, kind, parent, true, send).await?;
         tracing::info!(app = %info.app_name, pid = w.pid, window = id, ?kind, ?parent, "following the focused window");
         Ok(())
     }
@@ -1031,6 +1101,7 @@ impl Session {
             pyro_cap_bytes: self.pyro_cap_bytes(max_fps as u32),
             pyro_changed_only: self.shared.settings.pyrowave_changed_only,
             max_datagram: self.pyro_params().1,
+            max_scale: self.view_scale,
         };
         let tx = self.frames_tx.clone();
         let on_encoded = Arc::new(move |w: WindowId, f: EncodedFrame| tx.try_send((w, f)).is_ok());
@@ -1072,6 +1143,24 @@ impl Session {
             let parent_pid = info.parent.and_then(|p| self.streams.get(&p)).map(|s| s.info.pid).filter(|&p| p != info.pid);
             t.insert(info.id, Target { pid: info.pid, placement: g.placement(info.scale as f64, inset), popup: false, desktop, parent_pid });
         }
+    }
+
+    /// The user switched away from or back to this agent's desktop. Leaving ends every
+    /// stream: their capture shows nothing and input would go nowhere.
+    async fn screen_changed(&mut self, on_screen: bool, send: &mut Ctl) -> anyhow::Result<()> {
+        if !on_screen {
+            let windows: Vec<WindowId> = self.streams.keys().copied().collect();
+            for id in windows {
+                self.close(id, send).await?;
+            }
+            self.dismissed.clear();
+            self.known = None;
+            self.pending_new.clear();
+            self.focus = newwin::FocusFollower::default();
+            self.shared.clip.with_focus(|f| f.unfocus(self.id));
+        }
+        write_msg(send, &HostMsg::Session(MacSession { on_screen, ..self.shared.mac.clone() })).await?;
+        Ok(())
     }
 
     fn remove(&mut self, window: WindowId) {

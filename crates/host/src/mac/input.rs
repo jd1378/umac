@@ -12,7 +12,7 @@ use std::{
 };
 
 use core_graphics::{
-    event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField, ScrollEventUnit},
+    event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, EventField, ScrollEventUnit},
     event_source::{CGEventSource, CGEventSourceStateID},
     geometry::CGPoint,
 };
@@ -180,7 +180,7 @@ impl Injector {
         if let Some(c) = clicks {
             ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, c);
         }
-        ev.post(CGEventTapLocation::HID);
+        ev.post(super::session::event_tap());
     }
 
     /// Routes one client event: holds it behind a pending paste, starts a paste hold when it
@@ -333,7 +333,7 @@ impl Injector {
                 if precise {
                     ev.set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1);
                 }
-                ev.post(CGEventTapLocation::HID);
+                ev.post(super::session::event_tap());
             }
             InputEvent::Key { window, keycode, pressed } => {
                 // Releases and modifiers always pass so nothing stays held; a press only goes
@@ -374,7 +374,7 @@ impl Injector {
             ev.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
         }
         ev.set_flags(CGEventFlags::from_bits_retain(flags));
-        ev.post(CGEventTapLocation::HID);
+        ev.post(super::session::event_tap());
     }
 
     fn release_all(&mut self) {
@@ -383,7 +383,7 @@ impl Injector {
         for k in keys {
             if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), k, false) {
                 ev.set_flags(self.flags());
-                ev.post(CGEventTapLocation::HID);
+                ev.post(super::session::event_tap());
             }
         }
         let pos = self.last_pos.values().next().copied().unwrap_or((0.0, 0.0));
@@ -395,7 +395,7 @@ impl Injector {
             if let Ok(ev) = CGEvent::new_keyboard_event(self.source.clone(), m, false) {
                 ev.set_type(CGEventType::FlagsChanged);
                 ev.set_flags(self.flags());
-                ev.post(CGEventTapLocation::HID);
+                ev.post(super::session::event_tap());
             }
         }
     }

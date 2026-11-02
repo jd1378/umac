@@ -41,6 +41,8 @@ pub struct StreamParams {
     pub pyro_changed_only: bool,
     /// Largest datagram the connection carries, for PyroWave packet sizes.
     pub max_datagram: u32,
+    /// Capture at most this many pixels per point (the client's `ViewScale`).
+    pub max_scale: f32,
 }
 
 /// Receives encoded frames; returns false if the frame had to be dropped, which forces the
@@ -186,7 +188,7 @@ impl WindowStream {
     pub fn start(window: &SCWindow, params: StreamParams, inset: f64, on_encoded: OnEncoded) -> anyhow::Result<Self> {
         let shared = Shared::new(params, on_encoded);
         let s = shared.clone();
-        let (capture, size) = WindowCapture::start(window, params.fps, inset, Box::new(move |buf, t, dirty| s.captured(buf, t, dirty)))?;
+        let (capture, size) = WindowCapture::start(window, params.fps, inset, params.max_scale, Box::new(move |buf, t, dirty| s.captured(buf, t, dirty)))?;
         Ok(Self { capture, shared, size })
     }
 
@@ -194,7 +196,7 @@ impl WindowStream {
     pub fn start_region(display: &SCDisplay, rect: Rect, params: StreamParams, on_encoded: OnEncoded) -> anyhow::Result<Self> {
         let shared = Shared::new(params, on_encoded);
         let s = shared.clone();
-        let (capture, size) = WindowCapture::start_region(display, rect, params.fps, Box::new(move |buf, t, dirty| s.captured(buf, t, dirty)))?;
+        let (capture, size) = WindowCapture::start_region(display, rect, params.fps, params.max_scale, Box::new(move |buf, t, dirty| s.captured(buf, t, dirty)))?;
         Ok(Self { capture, shared, size })
     }
 
@@ -202,7 +204,7 @@ impl WindowStream {
     pub fn start_display(display: &SCDisplay, params: StreamParams, on_encoded: OnEncoded) -> anyhow::Result<Self> {
         let shared = Shared::new(params, on_encoded);
         let s = shared.clone();
-        let (capture, size) = WindowCapture::start_display(display, params.fps, Box::new(move |buf, t, dirty| s.captured(buf, t, dirty)))?;
+        let (capture, size) = WindowCapture::start_display(display, params.fps, params.max_scale, Box::new(move |buf, t, dirty| s.captured(buf, t, dirty)))?;
         Ok(Self { capture, shared, size })
     }
 

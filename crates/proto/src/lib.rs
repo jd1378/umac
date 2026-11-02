@@ -9,15 +9,15 @@ pub mod video;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible wire change. Peers with different versions refuse to talk.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// ALPN advertised on the QUIC handshake.
-pub const ALPN: &[u8] = b"umac/3";
+pub const ALPN: &[u8] = b"umac/4";
 
 /// Older protocols still accepted at the TLS layer, only so a peer of another version gets a
 /// readable "update the other side" message instead of a handshake failure. `Hello` and
 /// `HelloReply` keep their layout across versions for exactly this.
-pub const LEGACY_ALPNS: &[&[u8]] = &[b"umac/2"];
+pub const LEGACY_ALPNS: &[&[u8]] = &[b"umac/3", b"umac/2"];
 
 /// What both sides say when the Mac and the PC speak different protocol versions.
 pub fn version_mismatch(mac: u32, pc: u32) -> String {
@@ -75,6 +75,18 @@ pub enum HelloReply {
     Rejected { reason: String },
 }
 
+/// The Mac user an agent runs for. Each user who ran setup has an agent of their own, but only
+/// the one whose desktop is on the Mac's screen can capture and inject input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacSession {
+    /// Login name of the agent's user.
+    pub user: String,
+    /// Same for every agent on one Mac and different between Macs (a hash of its hardware
+    /// UUID), so a client can group the users of one Mac.
+    pub machine: String,
+    pub on_screen: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowInfo {
     pub id: WindowId,
@@ -85,7 +97,8 @@ pub struct WindowInfo {
     /// Size of the captured surface in pixels.
     pub width: u32,
     pub height: u32,
-    /// Backing scale of the window's display (2.0 on retina, 1.0 on a 1080p dummy).
+    /// Surface pixels per Mac point: the display's backing scale (2.0 on Retina), or lower
+    /// when the client asked for less with `ClientMsg::ViewScale`.
     pub scale: f32,
     /// Window that owns this one (sheets, menus, popovers), if known.
     pub parent: Option<WindowId>,
@@ -170,6 +183,11 @@ pub enum ClientMsg {
     /// is active): datagrams received and datagrams missing from completed frames. The host
     /// lowers the per frame budget on loss.
     VideoFeedback { window: WindowId, received: u32, lost: u32 },
+    /// Pixels per Mac point the client wants (what it shows a Mac point as), sent before
+    /// anything else. Streams started after it are captured at the lower of this and the Mac
+    /// display's own scale, so a Retina or 4K Mac does not arrive at double size; `WindowInfo::
+    /// scale` reports the scale a stream uses. Without it the Mac display's scale is used.
+    ViewScale { scale: f32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -206,6 +224,10 @@ pub enum HostMsg {
     /// Host side latency of one stream over the last interval, in microseconds:
     /// capture to encoded, and encoded to the last datagram queued.
     StreamStats { window: WindowId, encode_p50_us: u32, encode_p95_us: u32, send_p50_us: u32, frames: u32 },
+    /// First message after `HelloReply::Accepted`, and again whenever `on_screen` changes.
+    /// Leaving the screen closes every stream first (`WindowClosed`); until the user is back,
+    /// requests that need the screen are answered with errors.
+    Session(MacSession),
 }
 
 /// Largest cursor image accepted, per side, in pixels.

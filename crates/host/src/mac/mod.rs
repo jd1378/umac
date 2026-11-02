@@ -11,6 +11,7 @@ pub mod permissions;
 #[cfg(feature = "pyrowave")]
 pub mod pyrowave;
 pub mod server;
+pub mod session;
 pub mod setup;
 pub mod stream;
 #[cfg(any(feature = "h264", feature = "hevc", feature = "mjpeg"))]

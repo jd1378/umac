@@ -17,7 +17,7 @@ use crate::{
     config::Store,
     core::Core,
     ipc::{self, Reply, Request},
-    manager::Manager,
+    manager::{Manager, ScreenUser},
     shell::{Backend, Shell},
     tray::{self, Action, Menu, Tray},
     ui::{UiEvent, UiSender},
@@ -115,10 +115,30 @@ pub async fn shutdown_on_signal(ui: UiSender) {
     ui.send(UiEvent::Shutdown(String::new()));
 }
 
-fn menu(store: &Store) -> Menu {
+/// Who is on the selected Mac's screen.
+fn screen_user(store: &Store, manager: &Manager) -> ScreenUser {
+    store.host(None).map_or(ScreenUser::Unknown, |h| manager.screen_user(&h))
+}
+
+fn menu(store: &Store, manager: &Manager, screen: &ScreenUser) -> Menu {
     let hosts = store.hosts().unwrap_or_default();
     let selected = store.host(None).ok();
-    Menu::new(&hosts, selected.as_ref())
+    let line = match screen {
+        ScreenUser::Unknown => None,
+        ScreenUser::Nobody => Some("Mac user: none on screen".into()),
+        ScreenUser::User(u) => Some(format!("Mac user: {u}")),
+    };
+    let streamable = selected.as_ref().map(|h| manager.streamable(h)).unwrap_or_default();
+    Menu::new(&hosts, selected.as_ref(), line, &streamable)
+}
+
+/// What to tell the user when the selected Mac's screen changed hands, if anything.
+fn switch_notice(before: &ScreenUser, now: &ScreenUser) -> Option<String> {
+    match (before, now) {
+        (ScreenUser::User(a), ScreenUser::User(b)) if a != b => Some(format!("The Mac switched from {a} to {b}; {a}'s windows were closed.")),
+        (ScreenUser::User(a), ScreenUser::Nobody) => Some(format!("{a} left the Mac's screen; their windows were closed.")),
+        _ => None,
+    }
 }
 
 /// Runs the daemon on this thread (the Wayland event loop) until Exit, `umac quit` or a signal.
@@ -181,7 +201,12 @@ async fn tray_loop(store: Store, color: crate::config::TrayIconColor, manager: M
     let kdeglobals = dirs::config_dir().and_then(|d| std::fs::read_to_string(d.join("kdeglobals")).ok());
     let icon = tray::icon::pixmaps(tray::icon::line_color(color, kdeglobals.as_deref()));
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut shown = menu(&store);
+    tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.probe().await }
+    });
+    let mut screen = screen_user(&store, &manager);
+    let mut shown = menu(&store, &manager, &screen);
     let tray = match Tray::spawn(icon, shown.clone(), tx).await {
         Ok(t) => t,
         Err(e) => {
@@ -202,8 +227,13 @@ async fn tray_loop(store: Store, color: crate::config::TrayIconColor, manager: M
                     if let Err(e) = store.select_host(&fp) {
                         tracing::warn!("saving the selected host: {e:#}");
                     }
-                    shown = menu(&store);
+                    screen = screen_user(&store, &manager);
+                    shown = menu(&store, &manager, &screen);
                     tray.set_menu(shown.clone()).await;
+                    tokio::spawn({
+                        let manager = manager.clone();
+                        async move { manager.probe().await }
+                    });
                 }
                 action => {
                     // Any process on the session bus can trigger tray actions; ignore bursts.
@@ -231,7 +261,12 @@ async fn tray_loop(store: Store, color: crate::config::TrayIconColor, manager: M
                 }
             },
             _ = tick.tick() => {
-                let fresh = menu(&store);
+                let now = screen_user(&store, &manager);
+                if let Some(notice) = switch_notice(&screen, &now) {
+                    notify("umac", &notice).await;
+                }
+                screen = now;
+                let fresh = menu(&store, &manager, &screen);
                 if fresh != shown {
                     shown = fresh;
                     tray.set_menu(shown.clone()).await;
@@ -267,6 +302,18 @@ pub async fn notify(summary: &str, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switch_notices() {
+        let user = |u: &str| ScreenUser::User(u.into());
+        assert!(switch_notice(&user("ana"), &user("bo")).unwrap().contains("from ana to bo"));
+        assert!(switch_notice(&user("ana"), &ScreenUser::Nobody).unwrap().contains("ana left"));
+        assert_eq!(switch_notice(&user("ana"), &user("ana")), None);
+        // Connecting or disconnecting is not a switch.
+        assert_eq!(switch_notice(&ScreenUser::Unknown, &user("ana")), None);
+        assert_eq!(switch_notice(&user("ana"), &ScreenUser::Unknown), None);
+        assert_eq!(switch_notice(&ScreenUser::Nobody, &user("bo")), None);
+    }
 
     #[test]
     fn single_instance_lock() {

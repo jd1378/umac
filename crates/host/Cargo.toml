@@ -20,6 +20,7 @@ clap = { version = "=4.6.7", features = ["derive"] }
 hex = "=0.4.3"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
+sha2 = "=0.11.1"
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal", "fs"] }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }

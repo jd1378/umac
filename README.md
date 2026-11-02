@@ -17,7 +17,8 @@ decoded on the PC's GPU, over an encrypted, certificate-pinned QUIC link on your
   dummy plug if it runs headless.
 - **PC:** Linux (x86_64 or aarch64) with a Wayland desktop (developed on Fedora with KDE
   Plasma) and a Vulkan GPU.
-- Both on the same network; UDP port 47810 must reach the Mac.
+- Both on the same network; UDP port 47810 must reach the Mac (47811 and up for its other
+  users, see [Several Mac users](#several-mac-users)).
 
 ## 1. Install on the Mac
 
@@ -85,6 +86,25 @@ umac pair 'umac://192.0.2.10:47810?fp=...&token=...'
 The link pins the Mac's certificate fingerprint, so the client only talks to that Mac, and the
 Mac only accepts clients it paired. Pairing starts the tray.
 
+`umac hosts` lists paired hosts with a short id; `--host <id>` picks one for a command and
+`umac unpair <id>` forgets one (`umac-host unpair` on the Mac makes the Mac forget this PC).
+
+### Several Mac users
+
+Every Mac user who should be streamed runs setup (and pairs) once, as that user. Each user's
+agent listens on its own UDP port: setup keeps the user's saved port while it is free, else
+takes 47810 plus the user's offset from uid 501, or the next free port, and saves it in
+`~/Library/Application Support/umac/settings.json` (`"port"`). A user who is logged in but
+switched out (fast user switching) can run setup over SSH; permissions are granted later,
+while that user is on screen.
+
+A user can be streamed while their desktop is on screen: at the Mac itself, or in a Screen
+Sharing session logged in as that user (macOS gives it a display of its own, so one user can
+be at the Mac while another is streamed). The tray treats a Mac's users as one Mac: "Mac user"
+picks whom actions go to, falling back to another paired user who is on screen. When a user
+leaves the screen, their windows close here and a notification says so. umac cannot switch
+users or log them in itself: do that at the Mac or with Screen Sharing.
+
 ## Use
 
 - `umac` starts the tray if it is not running. Left click: Apps. Right click: Apps, Open a
@@ -94,6 +114,7 @@ Mac only accepts clients it paired. Pairing starts the tray.
   here. `umac launch terminal|finder|activity-monitor|settings` opens something new.
 - `umac desktop` shows a whole Mac display (F11 for fullscreen).
 - `umac status`, `umac close --window <id>`, `umac quit`.
+- `umac hosts`, `umac unpair <id>`.
 
 Closing a window here closes it on the Mac too (an unsaved document asks first).
 Ctrl+Alt+Shift+S shows live latency in window titles; `umac latency` measures it.
@@ -128,6 +149,7 @@ you paste into a Mac window (Cmd+V or a Paste menu item), never in the backgroun
 | `close_on_mac` | true | Closing a window here closes it on the Mac |
 | `tray_icon_color` | `auto` | `auto`, `black` or `white` |
 | `show_stats` | false | Log per-window latency stages |
+| `view_scale` | 1 | Pixels per Mac point: 1 shows Mac windows at their natural size even when the Mac runs Retina or 4K; up to 2 makes them larger and sharper |
 
 ## Security
 

@@ -52,10 +52,16 @@ fn window_pixels(width: f64, height: f64, scale: f32) -> (u32, u32) {
     (pixels(width, scale as f64), pixels(height, scale as f64))
 }
 
-/// Backing scale and pixel size a capture of `window` with `inset` will have, without
+/// Pixels per point a capture uses: the display's backing scale, capped at what the client
+/// shows. ScreenCaptureKit scales down on the Mac, which keeps text clean and saves bandwidth.
+fn capture_scale(backing: f32, max_scale: f32) -> f32 {
+    backing.max(1.0).min(max_scale)
+}
+
+/// Scale and pixel size a capture of `window` with `inset` will have, without
 /// starting it, so the client can open the window before capture runs.
-pub fn window_size(window: &SCWindow, inset: f64) -> anyhow::Result<(f32, (u32, u32))> {
-    let scale = window_filter(window)?.point_pixel_scale().max(1.0);
+pub fn window_size(window: &SCWindow, inset: f64, max_scale: f32) -> anyhow::Result<(f32, (u32, u32))> {
+    let scale = capture_scale(window_filter(window)?.point_pixel_scale(), max_scale);
     let frame = window.frame();
     Ok((scale, window_pixels(frame.size.width, (frame.size.height - inset).max(1.0), scale)))
 }
@@ -197,9 +203,9 @@ fn open_stream(filter: &SCContentFilter, config: &SCStreamConfiguration, on_fram
 impl WindowCapture {
     /// Starts capturing `window` at its native pixel size, minus `inset` points at the top.
     /// Returns the capture and the pixel size it was configured for.
-    pub fn start(window: &SCWindow, fps: u32, inset: f64, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
+    pub fn start(window: &SCWindow, fps: u32, inset: f64, max_scale: f32, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
         let filter = window_filter(window)?;
-        let scale = filter.point_pixel_scale().max(1.0);
+        let scale = capture_scale(filter.point_pixel_scale(), max_scale);
         let frame = window.frame();
         let (w, h) = (frame.size.width, (frame.size.height - inset).max(1.0));
         let size = window_pixels(w, h, scale);
@@ -213,20 +219,20 @@ impl WindowCapture {
     /// Used for menus and other popups: a window filter on them returns the parent window's
     /// pixels instead of the menu. Popups sit on top, so the region shows the popup, with the
     /// real backdrop behind its rounded corners.
-    pub fn start_region(display: &SCDisplay, rect: Rect, fps: u32, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
-        Self::region(display, rect, fps, false, on_frame)
+    pub fn start_region(display: &SCDisplay, rect: Rect, fps: u32, max_scale: f32, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
+        Self::region(display, rect, fps, max_scale, false, on_frame)
     }
 
     /// Captures a whole display with the Mac cursor drawn in (desktop mode).
-    pub fn start_display(display: &SCDisplay, fps: u32, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
+    pub fn start_display(display: &SCDisplay, fps: u32, max_scale: f32, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
         let f = display.frame();
         let rect = Rect { x: f.origin.x, y: f.origin.y, width: f.size.width, height: f.size.height };
-        Self::region(display, rect, fps, true, on_frame)
+        Self::region(display, rect, fps, max_scale, true, on_frame)
     }
 
-    fn region(display: &SCDisplay, rect: Rect, fps: u32, cursor: bool, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
+    fn region(display: &SCDisplay, rect: Rect, fps: u32, max_scale: f32, cursor: bool, on_frame: FrameCallback) -> anyhow::Result<(Self, (u32, u32))> {
         let filter = SCContentFilter::create().with_display(display).build().map_err(|e| anyhow!("content filter: {e}"))?;
-        let scale = filter.point_pixel_scale().max(1.0);
+        let scale = capture_scale(filter.point_pixel_scale(), max_scale);
         let d = display.frame().origin;
         let mut config = stream_config(2, 2, fps)?.with_shows_cursor(cursor);
         let size = apply_region(&mut config, rect, (d.x, d.y), scale as f64);
@@ -269,5 +275,26 @@ fn note_display_offset(us: i64) {
         let (p50, p95) = (v[v.len() / 2], v[v.len() * 95 / 100]);
         tracing::debug!(p50_us = p50, p95_us = p95, "capture delivery relative to display time");
         v.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_scale_never_exceeds_the_display_or_the_client() {
+        assert_eq!(capture_scale(2.0, 1.0), 1.0);
+        assert_eq!(capture_scale(2.0, 1.25), 1.25);
+        assert_eq!(capture_scale(1.0, 2.0), 1.0);
+        assert_eq!(capture_scale(2.0, f32::INFINITY), 2.0);
+        // A missing backing scale (0) counts as 1.
+        assert_eq!(capture_scale(0.0, f32::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn a_point_rect_at_a_lower_scale_halves_the_pixels() {
+        assert_eq!(window_pixels(800.0, 600.0, 2.0), (1600, 1200));
+        assert_eq!(window_pixels(800.0, 600.0, capture_scale(2.0, 1.0)), (800, 600));
     }
 }

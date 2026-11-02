@@ -75,6 +75,9 @@ enum Cmd {
     },
     /// List paired hosts.
     Hosts,
+    /// Forget a paired host by its id or name from `umac hosts`. The Mac keeps trusting this
+    /// PC until `umac-host unpair` runs there.
+    Unpair { host: String },
     /// List windows available on the host.
     List {
         #[arg(long)]
@@ -210,24 +213,36 @@ fn run(rt: &tokio::runtime::Runtime, store: Store, config_dir: Option<PathBuf>, 
     match cmd {
         Cmd::Pair { link, name } => {
             let link: PairingLink = link.parse()?;
-            let mut entry =
-                HostEntry { name: String::new(), addr: link.addr, fingerprint: link.fingerprint.to_string() };
+            let mut entry = HostEntry { addr: link.addr, fingerprint: link.fingerprint.to_string(), ..Default::default() };
             let session = rt.block_on(net::connect(&store, &entry, Some(link.token)))?;
-            entry.name = name.unwrap_or(session.host_name);
-            store.save_host(entry.clone())?;
+            let mac = session.mac;
+            // Each Mac user pairs separately, so the default name says whose agent it is.
+            entry.name = name.unwrap_or_else(|| format!("{}@{}", mac.user, session.host_name));
+            entry.user = Some(mac.user);
+            entry.machine = (!mac.machine.is_empty()).then_some(mac.machine);
+            let entry = store.save_host(entry)?;
             if store.host(None).is_err() {
                 store.select_host(&entry.fingerprint)?;
             }
-            println!("paired with {} at {}", entry.name, entry.addr);
+            println!("paired with {} at {} (id {})", entry.name, entry.addr, entry.id);
             if !daemon::is_running(&daemon::lock_dir(store.dir()))? {
                 daemon::spawn_detached(config_dir.as_deref())?;
                 println!("umac started in the tray.");
             }
         }
         Cmd::Hosts => {
-            for h in store.hosts()? {
-                println!("{}\t{}\t{}", h.name, h.addr, h.fingerprint);
+            let hosts = store.hosts()?;
+            let selected = store.host(None).ok();
+            println!("  {:>3}  {:<28} {:<12} address", "id", "name", "Mac user");
+            for h in &hosts {
+                let mark = if selected.as_ref().is_some_and(|s| s.same_mac(h)) { '*' } else { ' ' };
+                println!("{mark} {:>3}  {:<28} {:<12} {}", h.id, h.name, h.user.as_deref().unwrap_or("-"), h.addr);
             }
+        }
+        Cmd::Unpair { host } => {
+            let removed = store.remove_host(&host)?;
+            println!("forgot {} at {}", removed.name, removed.addr);
+            println!("on the Mac, `umac-host unpair <this PC's fingerprint>` makes it forget this PC too");
         }
         Cmd::List { host, no_daemon } => {
             let windows = if no_daemon {

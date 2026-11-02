@@ -79,13 +79,13 @@ pub fn run(action: LaunchAction) -> anyhow::Result<WindowInfo> {
 /// Escape closes the launcher overlay, which has the keyboard while it is open.
 fn dismiss_overlay() {
     use core_graphics::{
-        event::{CGEvent, CGEventTapLocation},
+        event::CGEvent,
         event_source::{CGEventSource, CGEventSourceStateID},
     };
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else { return };
     for down in [true, false] {
         if let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), umac_proto::keys::kVK_Escape, down) {
-            ev.post(CGEventTapLocation::HID);
+            ev.post(super::session::event_tap());
         }
     }
 }

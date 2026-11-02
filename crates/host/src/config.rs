@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use umac_proto::Codec;
+use sha2::{Digest, Sha256};
+use umac_proto::{Codec, DEFAULT_PORT};
 
 pub const LABEL: &str = "dev.umac.host";
 
@@ -65,7 +66,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            port: umac_proto::DEFAULT_PORT,
+            port: DEFAULT_PORT,
             // The Mac is expected on Wi-Fi, where single datagram losses are common.
             fec_percent: 15,
             default_bitrate_kbps: 25_000,
@@ -85,7 +86,52 @@ pub fn choose_codec(prefs: &[Codec], supported: &[Codec], client: &[Codec]) -> O
     prefs.iter().chain(supported).copied().find(|c| supported.contains(c) && client.contains(c))
 }
 
+/// macOS gives local accounts uids from 501; each gets its own port above the default, so
+/// agents of several users never compete for one, even while some are not running.
+const FIRST_UID: u32 = 501;
+/// How far setup looks past a user's preferred port for a free one.
+const PORT_SEARCH: u16 = 100;
+
+pub fn preferred_port(uid: u32) -> u16 {
+    uid.checked_sub(FIRST_UID)
+        .and_then(|i| u16::try_from(i).ok())
+        .filter(|&i| i < PORT_SEARCH)
+        .map_or(DEFAULT_PORT, |i| DEFAULT_PORT + i)
+}
+
+/// The port the agent should listen on: the saved one while it is free, else the first free
+/// port from the user's preferred one up.
+pub fn choose_port(saved: Option<u16>, uid: u32, is_free: impl Fn(u16) -> bool) -> Option<u16> {
+    if let Some(p) = saved.filter(|&p| is_free(p)) {
+        return Some(p);
+    }
+    let start = preferred_port(uid);
+    (start..=start.saturating_add(PORT_SEARCH)).find(|&p| is_free(p))
+}
+
+/// Stable id of this Mac, the same for every user: a hash of the hardware UUID, so the UUID
+/// itself never leaves the Mac.
+pub fn machine_id(hardware_uuid: &str) -> String {
+    let digest = Sha256::digest(format!("umac machine {}", hardware_uuid.trim().to_ascii_uppercase()));
+    hex::encode(&digest[..16])
+}
+
 impl Settings {
+    /// The port saved in `settings.json`, if one was set there.
+    pub fn saved_port() -> Option<u16> {
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(settings_path()).ok()?).ok()?;
+        json.get("port")?.as_u64()?.try_into().ok()
+    }
+
+    /// Writes `port` into `settings.json`, keeping every other setting as the user wrote it.
+    pub fn save_port(port: u16) -> std::io::Result<()> {
+        let mut json: serde_json::Map<String, serde_json::Value> =
+            std::fs::read(settings_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        json.insert("port".into(), port.into());
+        umac_transport::identity::create_private_dir(&support_dir())?;
+        umac_transport::identity::write_private(&settings_path(), &serde_json::to_vec_pretty(&json).unwrap_or_default())
+    }
+
     pub fn load() -> Self {
         std::fs::read(settings_path())
             .ok()
@@ -117,6 +163,34 @@ mod tests {
         assert_eq!(choose_codec(&[], &supported, &[Codec::H264, Codec::PyroWave]), Some(Codec::PyroWave));
         assert_eq!(choose_codec(&prefs, &supported, &[]), None);
         assert_eq!(choose_codec(&prefs, &[Codec::PyroWave], &[Codec::Hevc]), None);
+    }
+
+    #[test]
+    fn each_user_prefers_their_own_port() {
+        assert_eq!(preferred_port(501), DEFAULT_PORT);
+        assert_eq!(preferred_port(502), DEFAULT_PORT + 1);
+        // System and directory accounts share the default.
+        assert_eq!(preferred_port(0), DEFAULT_PORT);
+        assert_eq!(preferred_port(1_000_000), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn port_choice_keeps_a_free_saved_port_and_skips_taken_ones() {
+        let all_free = |_| true;
+        assert_eq!(choose_port(Some(50_000), 502, all_free), Some(50_000));
+        assert_eq!(choose_port(None, 502, all_free), Some(DEFAULT_PORT + 1));
+        let taken = |p| p != DEFAULT_PORT && p != DEFAULT_PORT + 1;
+        assert_eq!(choose_port(Some(DEFAULT_PORT), 501, taken), Some(DEFAULT_PORT + 2));
+        assert_eq!(choose_port(None, 501, |_| false), None);
+    }
+
+    #[test]
+    fn machine_id_ignores_case_and_hides_the_uuid() {
+        let uuid = "0A1B2C3D-0000-1111-2222-333344445555";
+        assert_eq!(machine_id(uuid), machine_id(&uuid.to_ascii_lowercase()));
+        assert_eq!(machine_id(uuid).len(), 32);
+        assert!(!machine_id(uuid).contains("0A1B"));
+        assert_ne!(machine_id(uuid), machine_id("0A1B2C3D-0000-1111-2222-333344445556"));
     }
 
     #[test]
