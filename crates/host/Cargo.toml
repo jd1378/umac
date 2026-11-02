@@ -24,9 +24,9 @@ sha2 = "=0.11.1"
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal", "fs"] }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
-umac-proto = { version = "=0.2.0", path = "../proto" }
-umac-pyrowave-decode = { version = "=0.2.0", path = "../pyrowave-decode", default-features = false }
-umac-transport = { version = "=0.2.0", path = "../transport" }
+umac-proto = { version = "=1.0.0", path = "../proto" }
+umac-pyrowave-decode = { version = "=1.0.0", path = "../pyrowave-decode", default-features = false }
+umac-transport = { version = "=1.0.0", path = "../transport" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "=0.10.1"

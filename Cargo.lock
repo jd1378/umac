@@ -3287,7 +3287,7 @@ dependencies = [
 
 [[package]]
 name = "umac-client"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "ash",
@@ -3319,14 +3319,14 @@ dependencies = [
 
 [[package]]
 name = "umac-h264"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "umac-host"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -3348,7 +3348,7 @@ dependencies = [
 
 [[package]]
 name = "umac-proto"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "postcard",
  "serde",
@@ -3357,7 +3357,7 @@ dependencies = [
 
 [[package]]
 name = "umac-pyrowave-decode"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "pollster",
@@ -3367,7 +3367,7 @@ dependencies = [
 
 [[package]]
 name = "umac-transport"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "hex",
  "postcard",

@@ -35,7 +35,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/jd1378/umac/main/scripts
 2. runs `umac-host setup`, which installs the agent as a LaunchAgent and signs it locally so
    macOS keeps its permissions across updates.
 
-`UMAC_VERSION=v0.2.0` installs a specific release. `UMAC_FROM_SOURCE=1` builds from source
+`UMAC_VERSION=v1.0.0` installs a specific release. `UMAC_FROM_SOURCE=1` builds from source
 instead (Command Line Tools and Rust, offered if missing).
 
 The wizard asks you to allow **Screen & System Audio Recording** and **Accessibility** for

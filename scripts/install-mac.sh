@@ -9,7 +9,7 @@
 # repeat.
 #
 # Optional:
-#   UMAC_VERSION=v0.2.0   install that release instead of the latest
+#   UMAC_VERSION=v1.0.0   install that release instead of the latest
 #   UMAC_FROM_SOURCE=1    build from source instead (needs the Command Line Tools and Rust;
 #                         UMAC_FEATURES=h264,hevc,mjpeg adds codecs to the default PyroWave;
 #                         UMAC_REF, UMAC_REPO, UMAC_SRC pick the source)

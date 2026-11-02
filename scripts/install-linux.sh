@@ -8,7 +8,7 @@
 # attestation. Asks before anything that needs sudo. Re-running updates.
 #
 # Optional:
-#   UMAC_VERSION=v0.2.0   install that release instead of the latest
+#   UMAC_VERSION=v1.0.0   install that release instead of the latest
 #   UMAC_FROM_SOURCE=1    build from source instead (UMAC_FEATURES=h264,hevc,mjpeg adds codecs
 #                         to the default PyroWave; UMAC_REF, UMAC_REPO, UMAC_SRC pick the source)
 #   UMAC_BIN              install directory (default ~/.local/bin)
