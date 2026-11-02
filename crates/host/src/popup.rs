@@ -5,6 +5,9 @@ use umac_proto::WindowId;
 
 /// `kCGMainMenuWindowLevel` and `kCGStatusWindowLevel`: the menu bar and its extras.
 const MENU_BAR_LAYERS: [i32; 2] = [24, 25];
+/// `kCGDraggingWindowLevel`: a drag in progress. The drag window covers the whole screen, so
+/// capturing it would stream the Mac's entire display.
+const DRAGGING_LAYER: i32 = 500;
 /// Above this are system overlays (screen saver, assistive UI, cursor), never app popups.
 const MAX_LAYER: i32 = 1000;
 const MIN_SIZE: f64 = 4.0;
@@ -12,7 +15,7 @@ const MIN_SIZE: f64 = 4.0;
 /// Whether an app-owned on-screen window at `layer` is a popup. Layer 0 windows are normal
 /// windows, sheets and dialogs; negative layers are desktop elements.
 pub fn is_popup(layer: i32, width: f64, height: f64) -> bool {
-    layer > 0 && layer < MAX_LAYER && !MENU_BAR_LAYERS.contains(&layer) && width >= MIN_SIZE && height >= MIN_SIZE
+    layer > 0 && layer < MAX_LAYER && !MENU_BAR_LAYERS.contains(&layer) && layer != DRAGGING_LAYER && width >= MIN_SIZE && height >= MIN_SIZE
 }
 
 /// Popup top-left relative to the parent's captured surface origin, in parent surface pixels.
@@ -52,6 +55,7 @@ mod tests {
         assert!(!is_popup(0, 800.0, 600.0)); // normal windows and sheets
         assert!(!is_popup(24, 1920.0, 30.0)); // menu bar
         assert!(!is_popup(25, 30.0, 30.0)); // menu bar extras
+        assert!(!is_popup(500, 1920.0, 1080.0)); // drag and drop
         assert!(!is_popup(-2147483601, 180.0, 180.0)); // desktop widgets
         assert!(!is_popup(2147483630, 28.0, 28.0)); // system overlays
         assert!(!is_popup(101, 3.0, 300.0)); // slivers
